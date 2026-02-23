@@ -98,6 +98,7 @@ class SessionManagerApp:
         self.sandbox_var = tk.StringVar(value="default")
         self.search_var = tk.BooleanVar(value=False)
         self.admin_var = tk.BooleanVar(value=True)
+        self.show_last_text_var = tk.BooleanVar(value=True)
 
         ttk.Label(launch, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.model_box = ttk.Combobox(launch, textvariable=self.model_var, state="readonly", width=24)
@@ -117,6 +118,12 @@ class SessionManagerApp:
 
         ttk.Checkbutton(launch, text="Search", variable=self.search_var).grid(row=0, column=6, sticky="w", padx=(0, 10))
         ttk.Checkbutton(launch, text="Admin", variable=self.admin_var).grid(row=0, column=7, sticky="w")
+        ttk.Checkbutton(
+            launch,
+            text="Show Last Text",
+            variable=self.show_last_text_var,
+            command=self._toggle_last_text_column,
+        ).grid(row=0, column=8, sticky="w", padx=(10, 0))
 
         launch.grid_columnconfigure(1, weight=1)
 
@@ -272,10 +279,28 @@ class SessionManagerApp:
         total = max(300, int(getattr(event, "width", 0)))
         fixed = sum(self._col_fixed.values())
         available = max(300, total - fixed - 28)
-        weight_sum = sum(self._col_flex_weight.values())
-        for name, weight in self._col_flex_weight.items():
+        flex_weights = dict(self._col_flex_weight)
+        if not self.show_last_text_var.get():
+            flex_weights["text"] = 0
+        weight_sum = max(1, sum(flex_weights.values()))
+        for name, weight in flex_weights.items():
+            if name == "text" and not self.show_last_text_var.get():
+                self.tree.column("text", width=0, minwidth=0, stretch=False)
+                continue
             width = int(available * (weight / weight_sum))
             self.tree.column(name, width=max(120, width))
+
+    def _toggle_last_text_column(self) -> None:
+        if self.show_last_text_var.get():
+            self.tree.heading("text", text="Last Text")
+            self.tree.column("text", width=360, minwidth=80, stretch=True)
+        else:
+            self.tree.heading("text", text="")
+            self.tree.column("text", width=0, minwidth=0, stretch=False)
+        # Re-run layout after toggling the column.
+        class E:
+            width = self.tree.winfo_width()
+        self._on_tree_resize(E())
 
     def _show_context_menu(self, event: tk.Event) -> None:
         row = self.tree.identify_row(event.y)
