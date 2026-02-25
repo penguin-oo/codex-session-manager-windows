@@ -14,6 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 APP_TITLE = "Codex Session Manager"
 CODEX_HOME = Path(os.environ.get("USERPROFILE", "")) / ".codex"
 HISTORY_FILE = CODEX_HOME / "history.jsonl"
+NOTES_FILE = CODEX_HOME / "session_notes.json"
 SESSIONS_DIR = CODEX_HOME / "sessions"
 CONFIG_FILE = CODEX_HOME / "config.toml"
 MODELS_CACHE_FILE = CODEX_HOME / "models_cache.json"
@@ -26,6 +27,7 @@ class SessionItem:
     session_id: str
     ts: int
     text: str
+    note: str
     history_count: int
     cwd: str
     model: str
@@ -61,6 +63,7 @@ class SessionManagerApp:
 
         self.items: list[SessionItem] = []
         self.item_by_id: dict[str, SessionItem] = {}
+        self.session_notes: dict[str, str] = {}
         self.mcp_items: list[McpItem] = []
         self.skill_items: list[SkillItem] = []
         self.available_models: list[str] = []
@@ -212,6 +215,15 @@ class SessionManagerApp:
         self.details_text = tk.Text(detail_page, height=9, wrap=tk.WORD)
         self.details_text.pack(fill=tk.BOTH, expand=True)
         self.details_text.configure(state=tk.DISABLED)
+        note_row = ttk.Frame(detail_page)
+        note_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(note_row, text="Note").pack(side=tk.LEFT)
+        self.note_var = tk.StringVar(value="")
+        self.note_entry = ttk.Entry(note_row, textvariable=self.note_var)
+        self.note_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
+        ttk.Button(note_row, text="Save Note", command=self.save_selected_note).pack(side=tk.LEFT)
+        ttk.Button(note_row, text="Clear", command=self.clear_selected_note).pack(side=tk.LEFT, padx=(6, 0))
+        self.note_entry.bind("<Return>", lambda _e: self.save_selected_note())
 
         mcp_page = ttk.Frame(self.detail_tabs)
         self.detail_tabs.add(mcp_page, text="MCP")
@@ -344,6 +356,7 @@ class SessionManagerApp:
 
     def refresh(self) -> None:
         try:
+            self.session_notes = self._load_session_notes()
             self.items = self._load_sessions()
             self.item_by_id = {i.session_id: i for i in self.items}
             self.mcp_items = self._load_mcp_items()
@@ -359,6 +372,29 @@ class SessionManagerApp:
         except Exception as exc:
             self.status_var.set("Load failed")
             messagebox.showerror("Error", f"Failed to load data:\n{exc}")
+
+    def _load_session_notes(self) -> dict[str, str]:
+        if not NOTES_FILE.exists():
+            return {}
+        try:
+            raw = NOTES_FILE.read_text(encoding="utf-8-sig", errors="ignore")
+            obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                return {}
+            out: dict[str, str] = {}
+            for k, v in obj.items():
+                key = str(k).strip()
+                if not key:
+                    continue
+                out[key] = str(v)
+            return out
+        except Exception:
+            return {}
+
+    def _save_session_notes(self) -> None:
+        NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(self.session_notes, ensure_ascii=False, indent=2)
+        NOTES_FILE.write_text(content, encoding="utf-8")
 
     def _load_sessions(self) -> list[SessionItem]:
         if not HISTORY_FILE.exists():
@@ -400,6 +436,7 @@ class SessionManagerApp:
                     session_id=sid,
                     ts=ts,
                     text=text,
+                    note=self.session_notes.get(sid, ""),
                     history_count=count,
                     cwd=str(details.get("cwd", "")),
                     model=str(details.get("model", "")),
@@ -734,8 +771,14 @@ class SessionManagerApp:
     def _update_details_panel(self) -> None:
         item = self._selected_session()
         if not item:
+            self.note_entry.configure(state="disabled")
+            self.note_var.set("")
             content = "Select a session to view detailed metadata."
         else:
+            self.note_entry.configure(state="normal")
+            note = self.session_notes.get(item.session_id, item.note)
+            item.note = note
+            self.note_var.set(note)
             time_str = datetime.fromtimestamp(item.ts).strftime("%Y-%m-%d %H:%M:%S") if item.ts else ""
             content = (
                 f"Session ID: {item.session_id}\n"
@@ -746,6 +789,7 @@ class SessionManagerApp:
                 f"Sandbox Mode: {item.sandbox_mode or '-'}\n"
                 f"Turn ID: {item.turn_id or '-'}\n"
                 f"CWD: {item.cwd or '-'}\n"
+                f"Note: {note or '-'}\n"
                 f"Session File: {item.session_file or '-'}\n"
                 f"Last Text:\n{item.text or '-'}\n"
             )
@@ -753,6 +797,35 @@ class SessionManagerApp:
         self.details_text.delete("1.0", tk.END)
         self.details_text.insert("1.0", content)
         self.details_text.configure(state=tk.DISABLED)
+
+    def save_selected_note(self) -> None:
+        item = self._selected_session()
+        if not item:
+            messagebox.showinfo("Info", "Please select a session first.")
+            return
+
+        note = self.note_var.get().strip()
+        if note:
+            self.session_notes[item.session_id] = note
+        else:
+            self.session_notes.pop(item.session_id, None)
+        item.note = note
+        self._save_session_notes()
+        self._update_details_panel()
+        self.status_var.set(f"Saved note for {item.session_id}")
+
+    def clear_selected_note(self) -> None:
+        item = self._selected_session()
+        if not item:
+            messagebox.showinfo("Info", "Please select a session first.")
+            return
+
+        self.note_var.set("")
+        self.session_notes.pop(item.session_id, None)
+        item.note = ""
+        self._save_session_notes()
+        self._update_details_panel()
+        self.status_var.set(f"Cleared note for {item.session_id}")
 
     def _selected_session(self) -> SessionItem | None:
         selected = self.tree.selection()
@@ -972,6 +1045,10 @@ class SessionManagerApp:
             messagebox.showerror("Error", f"Failed to delete session:\n{exc}")
 
     def _delete_session(self, session_id: str) -> None:
+        if session_id in self.session_notes:
+            self.session_notes.pop(session_id, None)
+            self._save_session_notes()
+
         if HISTORY_FILE.exists():
             lines_out: list[str] = []
             with HISTORY_FILE.open("r", encoding="utf-8") as f:
