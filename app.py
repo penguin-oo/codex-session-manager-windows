@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import font
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "Codex Session Manager"
@@ -83,6 +83,7 @@ class SessionManagerApp:
 
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side=tk.LEFT)
         ttk.Button(top, text="Open Terminal", command=self.open_selected_admin).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="New Chat", command=self.open_new_chat).pack(side=tk.LEFT)
         ttk.Button(top, text="Open Folder", command=self.open_selected_folder).pack(side=tk.LEFT)
         ttk.Button(top, text="Open File", command=self.open_selected_file).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Delete", command=self.delete_selected).pack(side=tk.LEFT)
@@ -99,6 +100,11 @@ class SessionManagerApp:
         self.search_var = tk.BooleanVar(value=False)
         self.admin_var = tk.BooleanVar(value=True)
         self.show_last_text_var = tk.BooleanVar(value=True)
+        self.use_global_defaults_var = tk.BooleanVar(value=True)
+        self.use_proxy_var = tk.BooleanVar(value=True)
+        self.proxy_scheme_var = tk.StringVar(value="socks5")
+        self.proxy_host_var = tk.StringVar(value="127.0.0.1")
+        self.proxy_port_var = tk.StringVar(value="7897")
 
         ttk.Label(launch, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.model_box = ttk.Combobox(launch, textvariable=self.model_var, state="readonly", width=24)
@@ -107,16 +113,17 @@ class SessionManagerApp:
         self.model_box.grid(row=0, column=1, sticky="ew", padx=(0, 10))
 
         ttk.Label(launch, text="Approval").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        approval_box = ttk.Combobox(launch, textvariable=self.approval_var, state="readonly", width=12)
-        approval_box["values"] = ("default", "untrusted", "on-request", "never")
-        approval_box.grid(row=0, column=3, sticky="w", padx=(0, 10))
+        self.approval_box = ttk.Combobox(launch, textvariable=self.approval_var, state="readonly", width=12)
+        self.approval_box["values"] = ("default", "untrusted", "on-request", "never")
+        self.approval_box.grid(row=0, column=3, sticky="w", padx=(0, 10))
 
         ttk.Label(launch, text="Sandbox").grid(row=0, column=4, sticky="w", padx=(0, 6))
-        sandbox_box = ttk.Combobox(launch, textvariable=self.sandbox_var, state="readonly", width=14)
-        sandbox_box["values"] = ("default", "read-only", "workspace-write", "danger-full-access")
-        sandbox_box.grid(row=0, column=5, sticky="w", padx=(0, 10))
+        self.sandbox_box = ttk.Combobox(launch, textvariable=self.sandbox_var, state="readonly", width=14)
+        self.sandbox_box["values"] = ("default", "read-only", "workspace-write", "danger-full-access")
+        self.sandbox_box.grid(row=0, column=5, sticky="w", padx=(0, 10))
 
-        ttk.Checkbutton(launch, text="Search", variable=self.search_var).grid(row=0, column=6, sticky="w", padx=(0, 10))
+        self.search_check = ttk.Checkbutton(launch, text="Search", variable=self.search_var)
+        self.search_check.grid(row=0, column=6, sticky="w", padx=(0, 10))
         ttk.Checkbutton(launch, text="Admin", variable=self.admin_var).grid(row=0, column=7, sticky="w")
         ttk.Checkbutton(
             launch,
@@ -124,8 +131,33 @@ class SessionManagerApp:
             variable=self.show_last_text_var,
             command=self._toggle_last_text_column,
         ).grid(row=0, column=8, sticky="w", padx=(10, 0))
+        ttk.Checkbutton(
+            launch,
+            text="Use Global Defaults",
+            variable=self.use_global_defaults_var,
+            command=self._toggle_launch_overrides,
+        ).grid(row=0, column=9, sticky="w", padx=(10, 0))
+
+        self.use_proxy_check = ttk.Checkbutton(
+            launch,
+            text="Use Proxy",
+            variable=self.use_proxy_var,
+            command=self._toggle_proxy_controls,
+        )
+        self.use_proxy_check.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(launch, text="Type").grid(row=1, column=1, sticky="e", padx=(0, 6), pady=(8, 0))
+        self.proxy_scheme_box = ttk.Combobox(launch, textvariable=self.proxy_scheme_var, state="readonly", width=10)
+        self.proxy_scheme_box["values"] = ("http", "socks5")
+        self.proxy_scheme_box.grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(launch, text="Host").grid(row=1, column=3, sticky="e", padx=(0, 6), pady=(8, 0))
+        self.proxy_host_entry = ttk.Entry(launch, textvariable=self.proxy_host_var, width=20)
+        self.proxy_host_entry.grid(row=1, column=4, sticky="ew", pady=(8, 0))
+        ttk.Label(launch, text="Port").grid(row=1, column=5, sticky="e", padx=(0, 6), pady=(8, 0))
+        self.proxy_port_entry = ttk.Entry(launch, textvariable=self.proxy_port_var, width=8)
+        self.proxy_port_entry.grid(row=1, column=6, sticky="w", pady=(8, 0))
 
         launch.grid_columnconfigure(1, weight=1)
+        launch.grid_columnconfigure(4, weight=1)
 
         table_wrap = ttk.Frame(self.root, padding=(8, 0, 8, 0))
         table_wrap.pack(fill=tk.BOTH, expand=True)
@@ -172,6 +204,8 @@ class SessionManagerApp:
 
         self.detail_tabs = ttk.Notebook(detail_frame)
         self.detail_tabs.pack(fill=tk.BOTH, expand=True)
+        self._toggle_launch_overrides()
+        self._toggle_proxy_controls()
 
         detail_page = ttk.Frame(self.detail_tabs)
         self.detail_tabs.add(detail_page, text="Session Details")
@@ -727,10 +761,10 @@ class SessionManagerApp:
         sid = selected[0]
         return self.item_by_id.get(sid)
 
-    def _build_codex_args(self, item: SessionItem) -> list[str]:
-        args: list[str] = ["codex.cmd"]
-        args.extend(["resume", item.session_id])
-
+    def _build_codex_override_args(self) -> list[str]:
+        if self.use_global_defaults_var.get():
+            return []
+        args: list[str] = []
         model = self.model_var.get().strip()
         if model and model != "default":
             args.extend(["-m", model])
@@ -745,14 +779,78 @@ class SessionManagerApp:
 
         if self.search_var.get():
             args.append("--search")
-
         return args
+
+    def _build_codex_resume_args(self, item: SessionItem) -> list[str]:
+        args: list[str] = ["codex.cmd", "resume", item.session_id]
+        args.extend(self._build_codex_override_args())
+        return args
+
+    def _build_codex_new_args(self) -> list[str]:
+        args: list[str] = ["codex.cmd"]
+        args.extend(self._build_codex_override_args())
+        return args
+
+    def _toggle_launch_overrides(self) -> None:
+        if self.use_global_defaults_var.get():
+            state = "disabled"
+        else:
+            state = "readonly"
+        self.model_box.configure(state=state)
+        self.approval_box.configure(state=state)
+        self.sandbox_box.configure(state=state)
+        self.search_check.configure(state="disabled" if self.use_global_defaults_var.get() else "normal")
 
     def _to_ps_arg_string(self, args: list[str]) -> str:
         escaped: list[str] = []
         for a in args:
             escaped.append("'" + a.replace("'", "''") + "'")
         return " ".join(escaped)
+
+    def _build_proxy_ps_prefix(self) -> str:
+        if not self.use_proxy_var.get():
+            return ""
+        scheme = self.proxy_scheme_var.get().strip().lower() or "http"
+        host = self.proxy_host_var.get().strip() or "127.0.0.1"
+        port_text = self.proxy_port_var.get().strip()
+        if not port_text.isdigit():
+            raise ValueError("Proxy port must be an integer.")
+        port = int(port_text)
+        if port < 1 or port > 65535:
+            raise ValueError("Proxy port must be between 1 and 65535.")
+        proxy_url = f"{scheme}://{host}:{port}"
+        proxy_escaped = proxy_url.replace("'", "''")
+        no_proxy = "localhost,127.0.0.1,::1"
+        no_proxy_escaped = no_proxy.replace("'", "''")
+        return (
+            f"$proxy='{proxy_escaped}'; "
+            "$env:HTTP_PROXY=$proxy; $env:HTTPS_PROXY=$proxy; $env:ALL_PROXY=$proxy; "
+            "$env:http_proxy=$proxy; $env:https_proxy=$proxy; $env:all_proxy=$proxy; "
+            f"$env:NO_PROXY='{no_proxy_escaped}'; $env:no_proxy=$env:NO_PROXY; "
+        )
+
+    def _toggle_proxy_controls(self) -> None:
+        proxy_controls_enabled = self.use_proxy_var.get()
+        state = "readonly" if proxy_controls_enabled else "disabled"
+        entry_state = "normal" if proxy_controls_enabled else "disabled"
+        self.proxy_scheme_box.configure(state=state)
+        self.proxy_host_entry.configure(state=entry_state)
+        self.proxy_port_entry.configure(state=entry_state)
+        self.use_proxy_check.configure(state="normal")
+
+    def _build_terminal_ps_command(self, cwd: str, codex_args: list[str]) -> str:
+        cwd_escaped = cwd.replace("'", "''")
+        proxy_prefix = self._build_proxy_ps_prefix()
+        return (
+            "chcp 65001 > $null; "
+            "$utf8 = [System.Text.UTF8Encoding]::new($false); "
+            "[Console]::InputEncoding = $utf8; "
+            "[Console]::OutputEncoding = $utf8; "
+            "$OutputEncoding = $utf8; "
+            f"{proxy_prefix}"
+            f"Set-Location -LiteralPath '{cwd_escaped}'; "
+            f"& {self._to_ps_arg_string(codex_args)}"
+        )
 
     def open_selected_admin(self) -> None:
         item = self._selected_session()
@@ -761,18 +859,13 @@ class SessionManagerApp:
             return
 
         cwd = item.cwd or str(Path.home())
-        cwd_escaped = cwd.replace("'", "''")
 
-        codex_args = self._build_codex_args(item)
-        ps_command = (
-            "chcp 65001 > $null; "
-            "$utf8 = [System.Text.UTF8Encoding]::new($false); "
-            "[Console]::InputEncoding = $utf8; "
-            "[Console]::OutputEncoding = $utf8; "
-            "$OutputEncoding = $utf8; "
-            f"Set-Location -LiteralPath '{cwd_escaped}'; "
-            f"& {self._to_ps_arg_string(codex_args)}"
-        )
+        codex_args = self._build_codex_resume_args(item)
+        try:
+            ps_command = self._build_terminal_ps_command(cwd, codex_args)
+        except ValueError as exc:
+            messagebox.showerror("Invalid Proxy", str(exc))
+            return
 
         args = ["-NoExit", "-Command", ps_command]
         start_process = "Start-Process powershell "
@@ -785,9 +878,47 @@ class SessionManagerApp:
 
         try:
             subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", start_process])
-            self.status_var.set(f"Started codex resume cwd={cwd}")
+            if self.use_proxy_var.get():
+                net_text = "net=proxy"
+            else:
+                net_text = "net=direct"
+            self.status_var.set(f"Started codex resume cwd={cwd} ({net_text})")
         except Exception as exc:
             messagebox.showerror("Error", f"Failed to start terminal:\n{exc}")
+
+    def open_new_chat(self) -> None:
+        target_dir = filedialog.askdirectory(
+            title="Select working folder for new chat",
+            initialdir=str(Path.home()),
+            mustexist=True,
+        )
+        if not target_dir:
+            return
+        codex_args = self._build_codex_new_args()
+        try:
+            ps_command = self._build_terminal_ps_command(target_dir, codex_args)
+        except ValueError as exc:
+            messagebox.showerror("Invalid Proxy", str(exc))
+            return
+        args = ["-NoExit", "-Command", ps_command]
+        start_process = "Start-Process powershell "
+        if self.admin_var.get():
+            start_process += "-Verb RunAs "
+        arg_items: list[str] = []
+        for a in args:
+            arg_items.append("'" + a.replace("'", "''") + "'")
+        start_process += f"-ArgumentList @({','.join(arg_items)})"
+
+        try:
+            subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", start_process])
+            mode_text = "global defaults" if self.use_global_defaults_var.get() else "custom options"
+            if self.use_proxy_var.get():
+                net_text = "net=proxy"
+            else:
+                net_text = "net=direct"
+            self.status_var.set(f"Started new chat in {target_dir} ({mode_text}, {net_text})")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to start new chat:\n{exc}")
 
     def open_selected_file(self) -> None:
         item = self._selected_session()
