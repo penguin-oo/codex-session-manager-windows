@@ -16,6 +16,17 @@ Prebuilt packages are published in GitHub Releases:
 - Windows: `codex-session-manager-windows-x64.zip`
 - macOS: `codex-session-manager-macos-arm64.zip`
 
+## Clone And Run
+```powershell
+git clone https://github.com/penguin-oo/codex-session-manager-windows.git
+cd codex-session-manager-windows
+```
+
+Run app:
+```bat
+run.bat
+```
+
 ## Run From Source
 ```bat
 D:\codex\manger\run.bat
