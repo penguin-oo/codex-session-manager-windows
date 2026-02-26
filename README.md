@@ -28,13 +28,15 @@ run.bat
 ```
 
 ## Run From Source
+From the project root directory:
+
 ```bat
-D:\codex\manger\run.bat
+run.bat
 ```
 
 Or:
 ```powershell
-python D:\codex\manger\app.py
+python app.py
 ```
 
 ## Requirements (Source Mode)
