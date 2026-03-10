@@ -2,13 +2,17 @@
 import os
 import subprocess
 import sys
+import time
 import tomllib
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from tkinter import font
 from tkinter import filedialog, messagebox, ttk
+from urllib import error as url_error
+from urllib import parse as url_parse
+from urllib import request as url_request
 
 
 APP_TITLE = "Codex Session Manager"
@@ -19,7 +23,14 @@ SESSIONS_DIR = CODEX_HOME / "sessions"
 CONFIG_FILE = CODEX_HOME / "config.toml"
 MODELS_CACHE_FILE = CODEX_HOME / "models_cache.json"
 SKILLS_DIR = CODEX_HOME / "skills"
+PORTAL_TOKEN_FILE = CODEX_HOME / "mobile_portal_token.txt"
+DESKTOP_REFRESH_SIGNAL_FILE = CODEX_HOME / "desktop_refresh_signal.json"
+PORTAL_BASE_URL = "http://127.0.0.1:8765"
 APP_DIR = Path(__file__).resolve().parent
+AUTO_REFRESH_MS = 2500
+DESKTOP_SIGNAL_POLL_MS = 500
+PORTAL_TIMEOUT_SECONDS = 0.25
+PORTAL_BACKOFF_SECONDS = 5.0
 
 
 @dataclass
@@ -54,6 +65,38 @@ class SkillItem:
     summary: str
 
 
+def path_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def apply_session_notes(items: list[SessionItem], notes: dict[str, str]) -> list[SessionItem]:
+    return [replace(item, note=notes.get(item.session_id, item.note)) for item in items]
+
+
+def iso_to_ts(value: str) -> int:
+    if not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+def flatten_message_content(content: list[dict[str, object]]) -> str:
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n\n".join(parts).strip()
+
+
 class SessionManagerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -69,6 +112,11 @@ class SessionManagerApp:
         self.available_models: list[str] = []
         self._mcp_item_map: dict[str, McpItem] = {}
         self._skill_item_map: dict[str, SkillItem] = {}
+        self._auto_refresh_id: str | None = None
+        self._portal_retry_after = 0.0
+        self._desktop_signal_id: str | None = None
+        self._desktop_signal_mtime = DESKTOP_REFRESH_SIGNAL_FILE.stat().st_mtime if DESKTOP_REFRESH_SIGNAL_FILE.exists() else 0.0
+        self._history_signature: tuple[int, int] | None = None
 
         self.font_scale = 1.0
         self._base_fonts: dict[str, int] = {}
@@ -79,6 +127,8 @@ class SessionManagerApp:
         self._init_fonts()
         self._bind_shortcuts()
         self.refresh()
+        self._schedule_auto_refresh()
+        self._schedule_desktop_signal_watch()
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -212,9 +262,6 @@ class SessionManagerApp:
 
         detail_page = ttk.Frame(self.detail_tabs)
         self.detail_tabs.add(detail_page, text="Session Details")
-        self.details_text = tk.Text(detail_page, height=9, wrap=tk.WORD)
-        self.details_text.pack(fill=tk.BOTH, expand=True)
-        self.details_text.configure(state=tk.DISABLED)
         note_row = ttk.Frame(detail_page)
         note_row.pack(fill=tk.X, pady=(6, 0))
         ttk.Label(note_row, text="Note").pack(side=tk.LEFT)
@@ -224,6 +271,9 @@ class SessionManagerApp:
         ttk.Button(note_row, text="Save Note", command=self.save_selected_note).pack(side=tk.LEFT)
         ttk.Button(note_row, text="Clear", command=self.clear_selected_note).pack(side=tk.LEFT, padx=(6, 0))
         self.note_entry.bind("<Return>", lambda _e: self.save_selected_note())
+        self.details_text = tk.Text(detail_page, height=16, wrap=tk.WORD)
+        self.details_text.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        self.details_text.configure(state=tk.DISABLED)
 
         mcp_page = ttk.Frame(self.detail_tabs)
         self.detail_tabs.add(mcp_page, text="MCP")
@@ -354,24 +404,59 @@ class SessionManagerApp:
             self.tree.selection_set(row)
             self.menu.tk_popup(event.x_root, event.y_root)
 
-    def refresh(self) -> None:
+    def refresh(self, auto: bool = False) -> None:
+        selected_session_id = self.tree.selection()[0] if self.tree.selection() else ""
+        note_text = self.note_var.get()
+        note_has_focus = self.root.focus_get() == self.note_entry
         try:
             self.session_notes = self._load_session_notes()
-            self.items = self._load_sessions()
+            self.items = self._load_sessions(force=not auto)
             self.item_by_id = {i.session_id: i for i in self.items}
-            self.mcp_items = self._load_mcp_items()
-            self.skill_items = self._load_skill_items()
-            self.available_models = self._load_available_models()
-            self._render_items()
-            self._render_mcp_items()
-            self._render_skill_items()
-            self._render_models()
-            self.status_var.set(
-                f"Loaded sessions={len(self.items)} mcp={len(self.mcp_items)} skills={len(self.skill_items)}"
-            )
+            if not auto or not self.mcp_items:
+                self.mcp_items = self._load_mcp_items()
+                self.skill_items = self._load_skill_items()
+                self.available_models = self._load_available_models()
+                self._render_mcp_items()
+                self._render_skill_items()
+                self._render_models()
+            self._render_items(selected_session_id)
+            if note_has_focus:
+                self.note_var.set(note_text)
+            if not auto:
+                self.status_var.set(
+                    f"Loaded sessions={len(self.items)} mcp={len(self.mcp_items)} skills={len(self.skill_items)}"
+                )
         except Exception as exc:
             self.status_var.set("Load failed")
-            messagebox.showerror("Error", f"Failed to load data:\n{exc}")
+            if not auto:
+                messagebox.showerror("Error", f"Failed to load data:\n{exc}")
+
+    def _schedule_auto_refresh(self) -> None:
+        self._auto_refresh_id = self.root.after(AUTO_REFRESH_MS, self._auto_refresh_tick)
+
+    def _auto_refresh_tick(self) -> None:
+        try:
+            self.refresh(auto=True)
+        finally:
+            if self.root.winfo_exists():
+                self._schedule_auto_refresh()
+
+    def _schedule_desktop_signal_watch(self) -> None:
+        self._desktop_signal_id = self.root.after(DESKTOP_SIGNAL_POLL_MS, self._desktop_signal_tick)
+
+    def _desktop_signal_tick(self) -> None:
+        try:
+            current_mtime = DESKTOP_REFRESH_SIGNAL_FILE.stat().st_mtime if DESKTOP_REFRESH_SIGNAL_FILE.exists() else 0.0
+            if current_mtime and current_mtime > self._desktop_signal_mtime:
+                self._desktop_signal_mtime = current_mtime
+                self.refresh(auto=True)
+            elif current_mtime:
+                self._desktop_signal_mtime = current_mtime
+        except OSError:
+            pass
+        finally:
+            if self.root.winfo_exists():
+                self._schedule_desktop_signal_watch()
 
     def _load_session_notes(self) -> dict[str, str]:
         if not NOTES_FILE.exists():
@@ -396,9 +481,12 @@ class SessionManagerApp:
         content = json.dumps(self.session_notes, ensure_ascii=False, indent=2)
         NOTES_FILE.write_text(content, encoding="utf-8")
 
-    def _load_sessions(self) -> list[SessionItem]:
+    def _load_sessions(self, force: bool = False) -> list[SessionItem]:
         if not HISTORY_FILE.exists():
             raise FileNotFoundError(f"history file not found: {HISTORY_FILE}")
+        current_signature = path_signature(HISTORY_FILE)
+        if not force and self.items and current_signature == self._history_signature:
+            return apply_session_notes(self.items, self.session_notes)
 
         latest: dict[str, dict[str, int | str]] = {}
         with HISTORY_FILE.open("r", encoding="utf-8") as f:
@@ -448,6 +536,7 @@ class SessionManagerApp:
             )
 
         items.sort(key=lambda i: i.ts, reverse=True)
+        self._history_signature = current_signature
         return items
 
     def _load_mcp_items(self) -> list[McpItem]:
@@ -653,7 +742,7 @@ class SessionManagerApp:
             return {}
         return details
 
-    def _render_items(self) -> None:
+    def _render_items(self, selected_session_id: str = "") -> None:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
 
@@ -676,6 +765,10 @@ class SessionManagerApp:
                 ),
                 tags=(tag,),
             )
+        if selected_session_id and selected_session_id in self.item_by_id:
+            self.tree.selection_set(selected_session_id)
+            self.tree.focus(selected_session_id)
+            self.tree.see(selected_session_id)
         self._update_details_panel()
 
     def _render_mcp_items(self) -> None:
@@ -773,26 +866,30 @@ class SessionManagerApp:
         if not item:
             self.note_entry.configure(state="disabled")
             self.note_var.set("")
-            content = "Select a session to view detailed metadata."
-        else:
-            self.note_entry.configure(state="normal")
-            note = self.session_notes.get(item.session_id, item.note)
-            item.note = note
-            self.note_var.set(note)
-            time_str = datetime.fromtimestamp(item.ts).strftime("%Y-%m-%d %H:%M:%S") if item.ts else ""
-            content = (
-                f"Session ID: {item.session_id}\n"
-                f"Last Time: {time_str}\n"
-                f"History Records: {item.history_count}\n"
-                f"Model: {item.model or '-'}\n"
-                f"Approval Policy: {item.approval_policy or '-'}\n"
-                f"Sandbox Mode: {item.sandbox_mode or '-'}\n"
-                f"Turn ID: {item.turn_id or '-'}\n"
-                f"CWD: {item.cwd or '-'}\n"
-                f"Note: {note or '-'}\n"
-                f"Session File: {item.session_file or '-'}\n"
-                f"Last Text:\n{item.text or '-'}\n"
-            )
+            self.details_text.configure(state=tk.NORMAL)
+            self.details_text.delete("1.0", tk.END)
+            self.details_text.insert("1.0", "Select a session to view detailed metadata.")
+            self.details_text.configure(state=tk.DISABLED)
+            return
+
+        self.note_entry.configure(state="normal")
+        note = self.session_notes.get(item.session_id, item.note)
+        item.note = note
+        self.note_var.set(note)
+        time_str = datetime.fromtimestamp(item.ts).strftime("%Y-%m-%d %H:%M:%S") if item.ts else ""
+        content = (
+            f"Session ID: {item.session_id}\n"
+            f"Last Time: {time_str}\n"
+            f"History Records: {item.history_count}\n"
+            f"Model: {item.model or '-'}\n"
+            f"Approval Policy: {item.approval_policy or '-'}\n"
+            f"Sandbox Mode: {item.sandbox_mode or '-'}\n"
+            f"Turn ID: {item.turn_id or '-'}\n"
+            f"CWD: {item.cwd or '-'}\n"
+            f"Note: {note or '-'}\n"
+            f"Session File: {item.session_file or '-'}\n"
+            f"Last Text:\n{item.text or '-'}\n"
+        )
         self.details_text.configure(state=tk.NORMAL)
         self.details_text.delete("1.0", tk.END)
         self.details_text.insert("1.0", content)
@@ -925,10 +1022,52 @@ class SessionManagerApp:
             f"& {self._to_ps_arg_string(codex_args)}"
         )
 
+    def _portal_json(self, path: str) -> dict[str, object] | None:
+        if time.monotonic() < self._portal_retry_after:
+            return None
+        if not PORTAL_TOKEN_FILE.exists():
+            return None
+        token = PORTAL_TOKEN_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+        if not token:
+            return None
+        req = url_request.Request(
+            f"{PORTAL_BASE_URL}{path}",
+            headers={"X-Access-Token": token, "Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with url_request.urlopen(req, timeout=PORTAL_TIMEOUT_SECONDS) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (OSError, ValueError, url_error.URLError):
+            self._portal_retry_after = time.monotonic() + PORTAL_BACKOFF_SECONDS
+            return None
+        self._portal_retry_after = 0.0
+        return payload if isinstance(payload, dict) else None
+
+    def _portal_owner(self, session_id: str) -> dict[str, str] | None:
+        encoded_session_id = url_parse.quote(session_id, safe="")
+        payload = self._portal_json(f"/api/sessions/{encoded_session_id}/owner")
+        if payload is None:
+            return None
+        owner = payload.get("owner")
+        if not isinstance(owner, dict):
+            return None
+        return {str(key): str(value) for key, value in owner.items()}
+
     def open_selected_admin(self) -> None:
         item = self._selected_session()
         if not item:
             messagebox.showinfo("Info", "Please select a session first.")
+            return
+        owner = self._portal_owner(item.session_id)
+        if owner and owner.get("owner_kind") == "mobile":
+            owner_label = owner.get("owner_label") or "Mobile"
+            messagebox.showinfo(
+                "Session Controlled",
+                f"This session is currently controlled by {owner_label}.\n\n"
+                "Wait until the mobile client releases it before opening a writable terminal here.",
+            )
+            self.status_var.set(f"Blocked writable launch for {item.session_id}: owner={owner_label}")
             return
 
         cwd = item.cwd or str(Path.home())

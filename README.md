@@ -1,49 +1,156 @@
-﻿# Codex Session Manager
+# Codex Session Manager
 
-Desktop manager for Codex sessions: browse sessions, launch terminals with per-run options, and inspect MCP/Skills in one UI.
+Desktop and mobile tooling for managing local Codex sessions from Windows, with an optional Android client for phone-first chat control.
 
 ![Codex Session Manager UI](assets/ui-overview.png)
 
-## Highlights
-- Session list with details (`Time`, `Session ID`, `CWD`, `Model`, `Approval`, `Sandbox`)
-- Open selected session in terminal with one click (supports admin + UTF-8 console setup)
-- Built-in MCP tab and Skills tab with selectable row details
-- Safe session deletion from local Codex history files
-- UI quality improvements: adaptive columns, zebra rows, Ctrl+mouse-wheel zoom
+## What This Repository Contains
+- `app.py`: Windows desktop session manager
+- `mobile_portal.py`: local HTTP portal used by browser/mobile clients
+- `android-app/`: native Android client project
+- `run.bat`: desktop launcher
+- `run-mobile.bat`: mobile portal launcher
+- `tests/`: backend regression tests
+- `assets/`: screenshots and bundled app assets
+- `release/`: current packaged artifacts committed to the repo
 
-## Download
-Prebuilt packages are published in GitHub Releases:
-- Windows: `codex-session-manager-windows-x64.zip`
-- macOS: `codex-session-manager-macos-arm64.zip`
+## What Is Not Committed
+Local-only files are ignored on purpose:
+- `logs/`
+- `.mcp_data/`
+- `testchat/`
+- temp files such as `tmp_*`
+- build caches such as `build/`, `dist/`, `android-app/**/build/`
+- shortcuts such as `*.lnk`
 
-## Clone And Run
+## Current Download Options
+### Option 1: Use the tracked release files
+If you clone this repository, the current packaged files in `release/` come down with it:
+- `release/codex-session-manager-windows-x64.zip`
+- `release/codex-mobile-debug.apk`
+
+### Option 2: Use GitHub Releases
+Historical versions should be downloaded from GitHub Releases instead of from git history.
+
+## Quick Start
+### Run the desktop manager
+```bat
+run.bat
+```
+
+### Run the mobile portal
+```bat
+run-mobile.bat
+```
+
+### Connect the Android app
+1. Install `release/codex-mobile-debug.apk`.
+2. Start `run-mobile.bat` on the PC.
+3. Copy the full URL printed in the terminal.
+4. Paste it into the Android app.
+
+## Desktop Manager
+The desktop manager is for session browsing and local launch control.
+
+Main features:
+- browse saved Codex sessions
+- inspect model, approval, sandbox, CWD, notes, MCP, and Skills
+- open a selected session in terminal
+- open the session working directory or history file
+- delete local sessions
+- create a new session with launch settings
+
+## Mobile Portal
+The mobile portal is the backend used by the browser/mobile flows.
+
+It supports:
+- browsing sessions from the phone
+- continuing a session with real `codex exec resume`
+- creating a new session from a chosen folder
+- viewing MCP and Skills
+- session notes
+- reply-stop control
+- reply status monitoring
+
+Keep `run-mobile.bat` open while the phone is connected.
+
+## Android App
+The Android app is a native chat-style client for the local portal.
+
+Supported behavior:
+- session list with replying highlight
+- native chat view
+- top/bottom jump buttons and fast scroll
+- unsent text and selected-image draft restore
+- local notification when a reply completes
+- stop current reply
+- create new chat with folder browsing
+
+## Cross-Network Use With Tailscale
+Use this when the phone and PC are not on the same Wi-Fi.
+
+1. Install Tailscale on the PC and phone.
+2. Sign in with the same account or tailnet.
+3. Start `run-mobile.bat`.
+4. Use the printed `Tailscale (cross-network)` URL in the Android app.
+
+If Tailscale is unavailable, the launcher still prints LAN URLs for same-network use.
+
+## Clone And Run From Source
 ```powershell
 git clone https://github.com/penguin-oo/codex-session-manager-windows.git
 cd codex-session-manager-windows
 ```
 
-Run app:
+Desktop UI:
 ```bat
 run.bat
 ```
 
-## Run From Source
-From the project root directory:
-
+Mobile portal:
 ```bat
-run.bat
+run-mobile.bat
 ```
 
-Or:
+Android project:
 ```powershell
-python app.py
+cd android-app
 ```
 
-## Requirements (Source Mode)
-- Python 3.11+ (Tkinter included in standard installer)
+## Source Requirements
+### Desktop / portal
+- Windows
+- Python 3.11+
+- Tkinter included in the standard Python installer
 
-## Project Files
-- `app.py`: main desktop application
-- `run.bat`: launcher
-- `assets/ui-overview.png`: UI screenshot
-- `.github/workflows/release.yml`: Windows/macOS build + release pipeline
+### Android
+- Android Studio or compatible Gradle/SDK setup if you want to build the APK yourself
+
+## Build Notes
+### Windows desktop zip
+The packaged Windows zip is built from:
+- `dist/codex-session-manager.exe`
+- `run.bat`
+- `README.md`
+- `assets/`
+
+### Android APK
+The tracked APK is the current debug build generated from `android-app/`.
+
+## Recommended GitHub Layout
+- keep source and docs in git
+- keep only the current packaged artifacts in `release/`
+- use GitHub Releases for historical versions
+
+## Troubleshooting
+### Mobile app cannot connect
+- confirm `run-mobile.bat` is still running
+- use the exact URL including `?token=...`
+- if using Tailscale, confirm both devices are connected to the same tailnet
+
+### Desktop manager opens slowly
+- restart the desktop manager after upgrades
+- avoid selecting ignored temp/test folders as working directories
+
+### New chat seems stuck
+The app should now enter the chat page as soon as the new session id exists, instead of waiting for the entire first reply to finish.

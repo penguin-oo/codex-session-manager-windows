@@ -1,0 +1,95 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Codex Mobile</string>
+    <string name="home_subtitle">Chat from your phone</string>
+
+    <string name="hint_portal_url">Portal URL from run-mobile.bat</string>
+    <string name="hint_cwd">Working directory on your computer</string>
+    <string name="hint_opening_message">Start the conversation</string>
+    <string name="hint_note_optional">Optional note</string>
+    <string name="hint_missing_cwd_created">If this folder does not exist yet, it will be created when you start the chat.</string>
+
+    <string name="action_connect">Connect</string>
+    <string name="action_change_connection">Change connection</string>
+    <string name="action_save">Save</string>
+    <string name="action_refresh">Refresh</string>
+    <string name="action_refresh_desktop">Refresh PC</string>
+    <string name="action_settings">Connection</string>
+    <string name="action_clear">Clear saved URL</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_send">Send</string>
+    <string name="action_stop">Stop</string>
+    <string name="action_attach_image">Image</string>
+    <string name="action_jump_to_top">Top</string>
+    <string name="action_jump_to_bottom">Bottom</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_note">Note</string>
+    <string name="action_browse_folders">Browse folders</string>
+    <string name="action_use_folder">Use this folder</string>
+    <string name="action_up">Up</string>
+    <string name="action_recent_chats">Recent Chats</string>
+    <string name="action_recent_chats_summary">Jump straight back into the latest conversation.</string>
+    <string name="action_all_chats">All Chats</string>
+    <string name="action_all_chats_summary">Browse every session on your Codex host.</string>
+    <string name="action_new_chat">New Chat</string>
+    <string name="action_new_chat_summary">Pick launch settings once, then start talking.</string>
+    <string name="action_create_chat">Create Chat</string>
+
+    <string name="label_model">Model</string>
+    <string name="label_approval">Approval</string>
+    <string name="label_sandbox">Sandbox</string>
+    <string name="label_message">Message</string>
+    <string name="label_note">Session note</string>
+    <string name="label_working_directory">Working directory</string>
+    <string name="label_opening_message">Opening message</string>
+    <string name="label_selected_image">Selected image</string>
+    <string name="label_remove_image">Remove image</string>
+    <string name="label_replying">Replying</string>
+    <string name="label_sending">Sending...</string>
+    <string name="label_codex_replying">Codex is replying...</string>
+    <string name="label_image_prefix">[Image] %1$s</string>
+    <string name="label_image_only_message">[Image] %1$s</string>
+
+    <string name="title_quick_start">Quick Start</string>
+    <string name="title_recent_chats">Recent Chats</string>
+    <string name="title_all_chats">All Chats</string>
+    <string name="subtitle_all_chats">Every Codex session from your host</string>
+    <string name="title_new_chat">New Chat</string>
+    <string name="subtitle_new_chat">Choose launch settings once</string>
+    <string name="title_browse_folders">Browse folders</string>
+
+    <string name="connection_needed_title">Connect to your Codex portal</string>
+    <string name="connection_needed_summary">Paste the LAN URL printed by run-mobile.bat. It already includes the access token.</string>
+    <string name="connection_ready_title">Portal connected</string>
+    <string name="connection_ready_summary">%1$d chats are ready on your host.</string>
+
+    <string name="message_no_subfolders">No subfolders here.</string>
+
+    <string name="banner_paste_portal">Paste the full LAN URL printed by run-mobile.bat.</string>
+    <string name="banner_loading_home">Loading chats...</string>
+    <string name="banner_loading_chats">Loading all chats...</string>
+    <string name="banner_connected">Connected.</string>
+    <string name="banner_saved_portal_cleared">Saved portal URL cleared.</string>
+    <string name="banner_no_recent_chats">No recent chats are available yet.</string>
+    <string name="banner_new_chat_incomplete">Working directory and opening message are required.</string>
+    <string name="banner_creating_chat">Creating chat...</string>
+    <string name="banner_create_failed">Unable to create the chat.</string>
+    <string name="banner_loading_image">Loading image...</string>
+    <string name="banner_image_selected">Image ready to send.</string>
+    <string name="banner_image_failed">Unable to load the selected image.</string>
+    <string name="banner_refreshing_desktop">Refreshing desktop status...</string>
+    <string name="banner_desktop_refreshed">Desktop refresh requested.</string>
+    <string name="banner_message_or_image_needed">Type a message or attach an image first.</string>
+    <string name="banner_message_copied">Message copied.</string>
+    <string name="banner_stopping_reply">Stopping reply...</string>
+    <string name="banner_reply_stopped">Reply stopped.</string>
+    <string name="banner_loading_folders">Loading folders...</string>
+    <string name="banner_folder_selected">Folder selected.</string>
+    <string name="notification_reply_channel_name">Reply notifications</string>
+    <string name="notification_reply_channel_description">Alerts when a Codex chat finishes replying.</string>
+    <string name="notification_reply_title">%1$s finished replying</string>
+    <string name="notification_reply_completed_body">Reply completed.</string>
+
+    <string name="empty_recent_chats">Your recent chats will show up here after the first sync.</string>
+    <string name="empty_all_chats">No chats were returned by the portal.</string>
+</resources>

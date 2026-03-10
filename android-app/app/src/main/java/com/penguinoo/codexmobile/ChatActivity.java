@@ -1,0 +1,958 @@
+package com.penguinoo.codexmobile;
+
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.OpenableColumns;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.EditText;
+
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.recyclerview.widget.LinearLayoutManager;
+
+import com.penguinoo.codexmobile.databinding.ActivityChatBinding;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public final class ChatActivity extends AppCompatActivity {
+    public static final String EXTRA_PORTAL_URL = "portal_url";
+    public static final String EXTRA_SESSION_ID = "session_id";
+    private static final long HEARTBEAT_INTERVAL_MS = 10_000L;
+    private static final int MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+    private final ActivityResultLauncher<String[]> pickImageLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), this::handlePickedImage);
+
+    private ActivityChatBinding binding;
+    private PortalApiClient apiClient;
+    private ChatDraftStore draftStore;
+    private ExecutorService executor;
+    private ExecutorService jobExecutor;
+    private ChatMessageAdapter adapter;
+    private PortalEndpoint endpoint;
+    private String sessionId;
+    private SessionSummary currentSession;
+    private SessionLease currentLease;
+    private ChatMessage pendingUserMessage;
+    private ChatImageAttachment selectedImageAttachment;
+    private Uri selectedImageUri;
+    private String selectedImageDisplayName = "";
+    private String attachedJobId = "";
+    private String watchingJobId = "";
+    private int watchGeneration = 0;
+    private int messageListBaseBottomPadding;
+    private int composerBaseBottomMargin;
+    private boolean autoFollowConversation = true;
+    private boolean isActivityVisible = false;
+    private boolean suppressDraftPersistence = false;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final List<ChatMessage> persistedMessages = new ArrayList<>();
+    private String stickyBanner = "";
+    private final Runnable heartbeatRunnable = new Runnable() {
+        @Override
+        public void run() {
+            SessionLease lease = currentLease;
+            if (lease == null) {
+                return;
+            }
+            executor.execute(() -> {
+                try {
+                    currentLease = apiClient.heartbeatSession(endpoint, sessionId, lease.leaseId);
+                } catch (Exception exception) {
+                    runOnUiThread(() -> handlePortalUnavailable(exception.getMessage()));
+                    return;
+                }
+                mainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS);
+            });
+        }
+    };
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        binding = ActivityChatBinding.inflate(getLayoutInflater());
+        setContentView(binding.getRoot());
+
+        apiClient = new PortalApiClient();
+        draftStore = new ChatDraftStore(this);
+        executor = Executors.newSingleThreadExecutor();
+        jobExecutor = Executors.newSingleThreadExecutor();
+
+        String portalUrl = getIntent().getStringExtra(EXTRA_PORTAL_URL);
+        sessionId = getIntent().getStringExtra(EXTRA_SESSION_ID);
+        if (portalUrl == null || sessionId == null || sessionId.isEmpty()) {
+            finish();
+            return;
+        }
+        endpoint = PortalEndpoint.parse(portalUrl);
+        ((CodexMobileApp) getApplication()).getReplyMonitor().start(portalUrl);
+
+        setSupportActionBar(binding.toolbar);
+        if (getSupportActionBar() != null) {
+            getSupportActionBar().setDisplayHomeAsUpEnabled(true);
+            getSupportActionBar().setTitle("Chat");
+        }
+
+        adapter = new ChatMessageAdapter();
+        LinearLayoutManager layoutManager = new LinearLayoutManager(this);
+        binding.messageRecyclerView.setLayoutManager(layoutManager);
+        binding.messageRecyclerView.setAdapter(adapter);
+        binding.messageRecyclerView.addOnScrollListener(new androidx.recyclerview.widget.RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrolled(@NonNull androidx.recyclerview.widget.RecyclerView recyclerView, int dx, int dy) {
+                autoFollowConversation = shouldAutoFollowConversation();
+                updateScrollJumpButtons();
+            }
+        });
+
+        messageListBaseBottomPadding = binding.messageRecyclerView.getPaddingBottom();
+        ViewGroup.MarginLayoutParams composerLayoutParams = (ViewGroup.MarginLayoutParams) binding.composerPanel.getLayoutParams();
+        composerBaseBottomMargin = composerLayoutParams.bottomMargin;
+
+        binding.sendButton.setOnClickListener(view -> sendMessage());
+        binding.stopButton.setOnClickListener(view -> stopReply());
+        binding.attachImageButton.setOnClickListener(view -> pickImageLauncher.launch(new String[]{"image/*"}));
+        binding.clearAttachmentButton.setOnClickListener(view -> clearSelectedImage());
+        binding.jumpToTopButton.setOnClickListener(view -> jumpConversationToTop());
+        binding.jumpToBottomButton.setOnClickListener(view -> jumpConversationToBottom());
+        binding.fastScrollTrackContainer.setOnTouchListener((view, event) -> handleFastScrollTouch(event));
+        binding.messageInput.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (!suppressDraftPersistence) {
+                    persistDraft();
+                }
+            }
+        });
+        binding.composerPanel.addOnLayoutChangeListener((view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
+            if ((bottom - top) != (oldBottom - oldTop)) {
+                scrollConversationToBottom(autoFollowConversation);
+            }
+        });
+
+        setupInsets();
+        updateAttachmentPreview();
+        restoreDraft();
+        updateScrollJumpButtons();
+        claimSessionAndLoad();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        isActivityVisible = true;
+        if (currentLease != null) {
+            startLeaseHeartbeat();
+        }
+        if (ChatResumeState.shouldReloadSessionOnResume(currentSession != null)) {
+            loadSession();
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        isActivityVisible = false;
+        mainHandler.removeCallbacks(heartbeatRunnable);
+        persistDraft();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        mainHandler.removeCallbacks(heartbeatRunnable);
+        SessionLease lease = currentLease;
+        if (lease != null && attachedJobId.isEmpty()) {
+            Executors.newSingleThreadExecutor().execute(() -> {
+                try {
+                    apiClient.releaseSession(endpoint, sessionId, lease.leaseId);
+                } catch (Exception ignored) {
+                }
+            });
+        }
+        executor.shutdownNow();
+        jobExecutor.shutdownNow();
+    }
+
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        getMenuInflater().inflate(R.menu.menu_chat, menu);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(@NonNull MenuItem item) {
+        int itemId = item.getItemId();
+        if (itemId == android.R.id.home) {
+            finish();
+            return true;
+        }
+        if (itemId == R.id.action_refresh) {
+            if (currentLease == null) {
+                claimSessionAndLoad();
+            } else {
+                loadSession();
+            }
+            return true;
+        }
+        if (itemId == R.id.action_refresh_desktop) {
+            requestDesktopRefresh();
+            return true;
+        }
+        if (itemId == R.id.action_edit_note) {
+            editNote();
+            return true;
+        }
+        if (itemId == R.id.action_delete) {
+            confirmDelete();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
+    }
+
+    private void setupInsets() {
+        ViewCompat.setOnApplyWindowInsetsListener(binding.getRoot(), (view, windowInsets) -> {
+            Insets systemBars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());
+            Insets ime = windowInsets.getInsets(WindowInsetsCompat.Type.ime());
+            int extraImeInset = ChatLayoutState.extraImeInset(systemBars.bottom, ime.bottom);
+            view.setPadding(
+                    view.getPaddingLeft(),
+                    ChatLayoutState.contentTopPadding(systemBars.top),
+                    view.getPaddingRight(),
+                    view.getPaddingBottom()
+            );
+            binding.composerPanel.setTranslationY(-extraImeInset);
+            binding.scrollJumpButtons.setTranslationY(-extraImeInset);
+            binding.fastScrollTrackContainer.setTranslationY(-extraImeInset);
+            ViewGroup.MarginLayoutParams composerLayoutParams = (ViewGroup.MarginLayoutParams) binding.composerPanel.getLayoutParams();
+            composerLayoutParams.bottomMargin = composerBaseBottomMargin + systemBars.bottom;
+            binding.composerPanel.setLayoutParams(composerLayoutParams);
+
+            binding.messageRecyclerView.setPadding(
+                    binding.messageRecyclerView.getPaddingLeft(),
+                    binding.messageRecyclerView.getPaddingTop(),
+                    binding.messageRecyclerView.getPaddingRight(),
+                    ChatLayoutState.recyclerBottomPadding(messageListBaseBottomPadding, systemBars.bottom, ime.bottom)
+            );
+            scrollConversationToBottom(autoFollowConversation);
+            updateScrollJumpButtons();
+            return windowInsets;
+        });
+        ViewCompat.requestApplyInsets(binding.getRoot());
+    }
+
+    private void loadSession() {
+        showBanner("Loading conversation...");
+        executor.execute(() -> {
+            try {
+                SessionPayload payload = apiClient.fetchSession(endpoint, sessionId);
+                runOnUiThread(() -> renderPayload(payload));
+            } catch (Exception exception) {
+                runOnUiThread(() -> handlePortalUnavailable(exception.getMessage()));
+            }
+        });
+    }
+
+    private void renderPayload(SessionPayload payload) {
+        currentSession = payload.session;
+        if (payload.session != null && payload.session.sessionId != null && !payload.session.sessionId.isEmpty()) {
+            adoptSessionId(payload.session.sessionId);
+        }
+        if (getSupportActionBar() != null) {
+            getSupportActionBar().setTitle(SessionCollections.displayTitle(payload.session));
+            getSupportActionBar().setSubtitle("");
+        }
+        String metadata = ChatHeaderModel.metadataLine(payload.session);
+        binding.headerMetaText.setText(metadata);
+        binding.headerMetaText.setVisibility(metadata.isEmpty() ? View.GONE : View.VISIBLE);
+        persistedMessages.clear();
+        persistedMessages.addAll(payload.messages);
+        PortalJob activeJob = payload.activeJob;
+        if (activeJob != null && activeJob.isRunning()) {
+            attachedJobId = activeJob.jobId;
+            setComposerEnabled(false);
+            String liveText = ChatStreamingState.resolveLiveText(activeJob);
+            renderConversation(liveText);
+            startWatchingJob(activeJob);
+            showBanner(!liveText.isEmpty()
+                    ? "Codex is replying..."
+                    : "Codex is thinking...");
+            return;
+        }
+        attachedJobId = "";
+        watchingJobId = "";
+        setComposerEnabled(currentLease != null);
+        renderConversation(null);
+        if (stickyBanner != null && !stickyBanner.isEmpty()) {
+            showBanner(stickyBanner);
+        } else {
+            showBanner("Connected.");
+        }
+    }
+
+    private void renderConversation(String liveAssistantText) {
+        List<ChatMessage> displayMessages = ChatConversationState.compose(persistedMessages, pendingUserMessage, liveAssistantText);
+        boolean shouldFollow = autoFollowConversation || adapter.getItemCount() == 0;
+        adapter.submitList(displayMessages);
+        scrollConversationToBottom(shouldFollow);
+        binding.messageRecyclerView.post(this::updateScrollJumpButtons);
+    }
+
+    private void sendMessage() {
+        String prompt = binding.messageInput.getText() == null ? "" : binding.messageInput.getText().toString().trim();
+        ChatImageAttachment imageAttachment = selectedImageAttachment;
+        if (prompt.isEmpty() && imageAttachment == null) {
+            showBanner(getString(R.string.banner_message_or_image_needed));
+            return;
+        }
+        if (selectedImageUri != null && imageAttachment == null) {
+            showBanner("Image is still loading.");
+            return;
+        }
+        if (currentSession == null) {
+            showBanner("Conversation is still loading.");
+            return;
+        }
+        if (currentLease == null || currentLease.leaseId == null || currentLease.leaseId.isEmpty()) {
+            showBanner(stickyBanner == null || stickyBanner.isEmpty() ? "This session is currently read-only." : stickyBanner);
+            return;
+        }
+
+        String draftText = binding.messageInput.getText() == null ? "" : binding.messageInput.getText().toString();
+        Uri draftImageUri = selectedImageUri;
+        ChatImageAttachment draftImageAttachment = selectedImageAttachment;
+        String draftImageDisplayName = selectedImageDisplayName;
+        pendingUserMessage = new ChatMessage("user", buildOutgoingPreviewText(prompt, imageAttachment), nowEpochSeconds(), true);
+        renderConversation(null);
+        setMessageInputSilently("");
+        clearSelectedImage(false);
+        setComposerEnabled(false);
+        showBanner("Codex is thinking...");
+
+        executor.execute(() -> {
+            try {
+                PortalJob queuedJob = apiClient.sendMessage(
+                        endpoint,
+                        sessionId,
+                        prompt,
+                        safeLaunchValue(currentSession.model),
+                        safeLaunchValue(currentSession.approvalPolicy),
+                        safeLaunchValue(currentSession.sandboxMode),
+                        currentLease.leaseId,
+                        imageAttachment
+                );
+                runOnUiThread(() -> {
+                    clearDraft();
+                    attachedJobId = queuedJob.jobId;
+                    renderLiveJob(queuedJob);
+                    startWatchingJob(queuedJob);
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> {
+                    pendingUserMessage = null;
+                    restoreDraftAfterFailedSend(draftText, draftImageUri, draftImageAttachment, draftImageDisplayName);
+                    setComposerEnabled(true);
+                    renderConversation(null);
+                    showBanner(exception.getMessage());
+                });
+            }
+        });
+    }
+
+    private void claimSessionAndLoad() {
+        showBanner("Claiming mobile control...");
+        executor.execute(() -> {
+            try {
+                currentLease = apiClient.claimSession(endpoint, sessionId);
+                stickyBanner = "Mobile is controlling this session.";
+                runOnUiThread(() -> {
+                    setComposerEnabled(true);
+                    startLeaseHeartbeat();
+                    loadSession();
+                });
+            } catch (Exception exception) {
+                currentLease = null;
+                stickyBanner = exception.getMessage();
+                runOnUiThread(() -> {
+                    setComposerEnabled(false);
+                    loadSession();
+                });
+            }
+        });
+    }
+
+    private void startLeaseHeartbeat() {
+        mainHandler.removeCallbacks(heartbeatRunnable);
+        if (currentLease != null) {
+            mainHandler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS);
+        }
+    }
+
+    private void renderLiveJob(PortalJob job) {
+        if (!job.isRunning()) {
+            return;
+        }
+        attachedJobId = job.jobId;
+        String liveText = ChatStreamingState.resolveLiveText(job);
+        renderConversation(liveText);
+        if (!liveText.isEmpty()) {
+            showBanner("Codex is replying...");
+        } else if (job.ownerLabel != null && !job.ownerLabel.isEmpty()) {
+            showBanner(job.ownerLabel + " is controlling this session.");
+        } else {
+            showBanner("Codex is thinking...");
+        }
+    }
+
+    private void startWatchingJob(PortalJob job) {
+        if (job == null || job.jobId == null || job.jobId.isEmpty() || !job.isRunning()) {
+            return;
+        }
+        if (job.jobId.equals(watchingJobId) && watchGeneration > 0) {
+            return;
+        }
+        attachedJobId = job.jobId;
+        watchingJobId = job.jobId;
+        setComposerEnabled(false);
+        int generation = ++watchGeneration;
+        jobExecutor.execute(() -> watchJobLoop(job.jobId, generation));
+    }
+
+    private void watchJobLoop(String jobId, int generation) {
+        try {
+            PortalJob finalJob = apiClient.fetchJob(endpoint, jobId);
+            while (generation == watchGeneration && finalJob.isRunning()) {
+                Thread.sleep(1800L);
+                finalJob = apiClient.fetchJob(endpoint, jobId);
+                PortalJob streamingJob = finalJob;
+                int callbackGeneration = generation;
+                runOnUiThread(() -> {
+                    if (!ChatWatchState.shouldApplyLiveUpdate(watchingJobId, watchGeneration, callbackGeneration, streamingJob)) {
+                        return;
+                    }
+                    renderLiveJob(streamingJob);
+                });
+            }
+            if (generation != watchGeneration) {
+                return;
+            }
+            if (finalJob.isCancelled()) {
+                String cancelledSessionId = finalJob.sessionId == null || finalJob.sessionId.isEmpty() ? sessionId : finalJob.sessionId;
+                SessionPayload payload = apiClient.fetchSession(endpoint, cancelledSessionId);
+                String cancelledText = ChatStreamingState.resolveLiveText(finalJob);
+                watchGeneration++;
+                runOnUiThread(() -> {
+                    attachedJobId = "";
+                    watchingJobId = "";
+                    pendingUserMessage = null;
+                    adoptSessionId(cancelledSessionId);
+                    setComposerEnabled(currentLease != null);
+                    renderPayload(payload);
+                    if (!cancelledText.isEmpty()) {
+                        renderConversation(cancelledText);
+                    }
+                    showBanner(getString(R.string.banner_reply_stopped));
+                });
+                return;
+            }
+            if (!finalJob.isCompleted()) {
+                PortalJob failedJob = finalJob;
+                watchGeneration++;
+                runOnUiThread(() -> {
+                    attachedJobId = "";
+                    watchingJobId = "";
+                    setComposerEnabled(currentLease != null);
+                    renderConversation(ChatStreamingState.resolveLiveText(failedJob));
+                    showBanner(failedJob.error == null || failedJob.error.isEmpty() ? "Job failed." : failedJob.error);
+                });
+                return;
+            }
+
+            String requestedSessionId = finalJob.sessionId == null || finalJob.sessionId.isEmpty() ? sessionId : finalJob.sessionId;
+            SessionPayload payload = apiClient.fetchSession(endpoint, requestedSessionId);
+            String nextSessionId = requestedSessionId;
+            if (payload.session != null && payload.session.sessionId != null && !payload.session.sessionId.isEmpty()) {
+                nextSessionId = payload.session.sessionId;
+            }
+            SessionLease nextLease = currentLease;
+            if (nextSessionId != null && !nextSessionId.isEmpty() && !nextSessionId.equals(sessionId) && currentLease != null) {
+                try {
+                    apiClient.releaseSession(endpoint, sessionId, currentLease.leaseId);
+                } catch (Exception ignored) {
+                }
+                try {
+                    nextLease = apiClient.claimSession(endpoint, nextSessionId);
+                } catch (Exception ignored) {
+                    nextLease = null;
+                }
+            }
+            final SessionLease resolvedLease = nextLease;
+            final String resolvedSessionId = nextSessionId;
+            watchGeneration++;
+            runOnUiThread(() -> {
+                attachedJobId = "";
+                watchingJobId = "";
+                pendingUserMessage = null;
+                currentLease = resolvedLease;
+                adoptSessionId(resolvedSessionId);
+                setComposerEnabled(currentLease != null);
+                renderPayload(payload);
+                showBanner("Reply received.");
+            });
+        } catch (Exception exception) {
+            if (generation != watchGeneration) {
+                return;
+            }
+            watchGeneration++;
+            runOnUiThread(() -> handlePortalUnavailable("Connection lost. Keep run-mobile.bat open, then refresh."));
+        }
+    }
+
+    private void handlePickedImage(Uri uri) {
+        if (uri == null) {
+            return;
+        }
+        try {
+            getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (SecurityException ignored) {
+        }
+        showBanner(getString(R.string.banner_loading_image));
+        executor.execute(() -> {
+            try {
+                ChatImageAttachment imageAttachment = readImageAttachment(uri);
+                runOnUiThread(() -> {
+                    selectedImageUri = uri;
+                    selectedImageAttachment = imageAttachment;
+                    selectedImageDisplayName = imageAttachment.displayName;
+                    updateAttachmentPreview();
+                    persistDraft();
+                    showBanner(getString(R.string.banner_image_selected));
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(getString(R.string.banner_image_failed) + " " + exception.getMessage()));
+            }
+        });
+    }
+
+    private ChatImageAttachment readImageAttachment(Uri uri) throws IOException {
+        String displayName = "image";
+        try (android.database.Cursor cursor = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) {
+                    displayName = cursor.getString(index);
+                }
+            }
+        }
+
+        try (InputStream inputStream = getContentResolver().openInputStream(uri)) {
+            if (inputStream == null) {
+                throw new IOException("Unable to open selected image.");
+            }
+            Bitmap bitmap = BitmapFactory.decodeStream(inputStream);
+            if (bitmap == null) {
+                throw new IOException("Unable to decode selected image.");
+            }
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 92, outputStream);
+            bitmap.recycle();
+            if (!compressed) {
+                throw new IOException("Unable to encode selected image.");
+            }
+            if (outputStream.size() > MAX_IMAGE_BYTES) {
+                throw new IOException("Image is too large.");
+            }
+            String jpegName = displayName.replaceAll("\\.[^.]+$", "") + ".jpg";
+            return new ChatImageAttachment(jpegName, "image/jpeg", outputStream.toByteArray());
+        }
+    }
+
+    private void updateAttachmentPreview() {
+        boolean hasAttachment = selectedImageUri != null || selectedImageAttachment != null;
+        binding.attachmentPreviewContainer.setVisibility(hasAttachment ? View.VISIBLE : View.GONE);
+        if (!hasAttachment) {
+            binding.attachmentPreviewSubtitle.setText("");
+            binding.attachmentPreviewImage.setImageDrawable(null);
+            return;
+        }
+        binding.attachmentPreviewSubtitle.setText(selectedImageDisplayName);
+        binding.attachmentPreviewImage.setImageURI(selectedImageUri);
+    }
+
+    private void clearSelectedImage() {
+        clearSelectedImage(true);
+    }
+
+    private void clearSelectedImage(boolean persist) {
+        selectedImageAttachment = null;
+        selectedImageUri = null;
+        selectedImageDisplayName = "";
+        updateAttachmentPreview();
+        if (persist) {
+            persistDraft();
+        }
+    }
+
+    private String buildOutgoingPreviewText(String prompt, ChatImageAttachment imageAttachment) {
+        String cleanPrompt = prompt == null ? "" : prompt.trim();
+        if (imageAttachment == null) {
+            return cleanPrompt;
+        }
+        String imageLabel = getString(R.string.label_image_prefix, imageAttachment.displayName);
+        if (cleanPrompt.isEmpty()) {
+            return getString(R.string.label_image_only_message, imageAttachment.displayName);
+        }
+        return cleanPrompt + "\n\n" + imageLabel;
+    }
+
+    private long nowEpochSeconds() {
+        return System.currentTimeMillis() / 1000L;
+    }
+
+    private void editNote() {
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        input.setText(currentSession == null ? "" : currentSession.note);
+        input.setSelection(input.getText().length());
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.label_note)
+                .setView(input)
+                .setPositiveButton(R.string.action_save, (dialog, which) -> saveNote(input.getText() == null ? "" : input.getText().toString()))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void saveNote(String note) {
+        showBanner("Saving note...");
+        executor.execute(() -> {
+            try {
+                apiClient.saveNote(endpoint, sessionId, note);
+                SessionPayload payload = apiClient.fetchSession(endpoint, sessionId);
+                runOnUiThread(() -> {
+                    renderPayload(payload);
+                    showBanner("Note saved.");
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void confirmDelete() {
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.action_delete)
+                .setMessage("Delete this session from the local Codex history?")
+                .setPositiveButton(R.string.action_delete, (dialog, which) -> deleteSession())
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void deleteSession() {
+        showBanner("Deleting session...");
+        executor.execute(() -> {
+            try {
+                apiClient.deleteSession(endpoint, sessionId);
+                runOnUiThread(this::finish);
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void requestDesktopRefresh() {
+        showBanner(getString(R.string.banner_refreshing_desktop));
+        executor.execute(() -> {
+            try {
+                apiClient.requestDesktopRefresh(endpoint);
+                runOnUiThread(() -> showBanner(getString(R.string.banner_desktop_refreshed)));
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void stopReply() {
+        if (attachedJobId == null || attachedJobId.isEmpty()) {
+            return;
+        }
+        String jobId = attachedJobId;
+        showBanner(getString(R.string.banner_stopping_reply));
+        executor.execute(() -> {
+            try {
+                apiClient.cancelJob(endpoint, jobId);
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void handlePortalUnavailable(String message) {
+        attachedJobId = "";
+        watchingJobId = "";
+        currentLease = null;
+        setComposerEnabled(false);
+        stickyBanner = (message == null || message.isEmpty())
+                ? "Portal offline. Keep run-mobile.bat open, then refresh."
+                : message;
+        showBanner(stickyBanner);
+    }
+
+    private void setComposerEnabled(boolean enabled) {
+        boolean canStop = attachedJobId != null && !attachedJobId.isEmpty();
+        binding.sendButton.setVisibility(canStop ? View.GONE : View.VISIBLE);
+        binding.stopButton.setVisibility(canStop ? View.VISIBLE : View.GONE);
+        binding.sendButton.setEnabled(enabled && !canStop);
+        binding.stopButton.setEnabled(canStop);
+        binding.attachImageButton.setEnabled(enabled && !canStop);
+        binding.clearAttachmentButton.setEnabled(enabled && !canStop);
+        binding.messageInput.setEnabled(true);
+    }
+
+    private boolean shouldAutoFollowConversation() {
+        return ChatLayoutState.shouldAutoScroll(
+                binding.messageRecyclerView.computeVerticalScrollRange(),
+                binding.messageRecyclerView.computeVerticalScrollOffset(),
+                binding.messageRecyclerView.computeVerticalScrollExtent(),
+                ChatLayoutState.AUTO_SCROLL_THRESHOLD_PX
+        );
+    }
+
+    private void updateScrollJumpButtons() {
+        int scrollOffset = binding.messageRecyclerView.computeVerticalScrollOffset();
+        int scrollRange = binding.messageRecyclerView.computeVerticalScrollRange();
+        int viewportExtent = binding.messageRecyclerView.computeVerticalScrollExtent();
+        binding.jumpToTopButton.setVisibility(
+                ChatScrollButtonsState.shouldShowJumpToTop(scrollOffset) ? View.VISIBLE : View.GONE
+        );
+        binding.jumpToBottomButton.setVisibility(
+                ChatScrollButtonsState.shouldShowJumpToBottom(scrollRange, scrollOffset, viewportExtent) ? View.VISIBLE : View.GONE
+        );
+        updateFastScrollThumb(scrollRange, scrollOffset, viewportExtent);
+    }
+
+    private void updateFastScrollThumb(int scrollRange, int scrollOffset, int viewportExtent) {
+        boolean showThumb = ChatFastScrollState.shouldShowThumb(scrollRange, viewportExtent);
+        binding.fastScrollTrackContainer.setVisibility(showThumb ? View.VISIBLE : View.GONE);
+        if (!showThumb) {
+            binding.fastScrollThumb.setTranslationY(0f);
+            return;
+        }
+        binding.fastScrollTrackContainer.post(() -> {
+            int trackHeight = binding.fastScrollTrackContainer.getHeight()
+                    - binding.fastScrollTrackContainer.getPaddingTop()
+                    - binding.fastScrollTrackContainer.getPaddingBottom();
+            int thumbHeight = binding.fastScrollThumb.getHeight();
+            float offset = ChatFastScrollState.thumbOffsetPx(trackHeight, thumbHeight, scrollRange, scrollOffset, viewportExtent);
+            binding.fastScrollThumb.setTranslationY(binding.fastScrollTrackContainer.getPaddingTop() + offset);
+        });
+    }
+
+    private boolean handleFastScrollTouch(MotionEvent event) {
+        int action = event.getActionMasked();
+        if (action != MotionEvent.ACTION_DOWN && action != MotionEvent.ACTION_MOVE) {
+            return action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL;
+        }
+        int scrollRange = binding.messageRecyclerView.computeVerticalScrollRange();
+        int viewportExtent = binding.messageRecyclerView.computeVerticalScrollExtent();
+        if (!ChatFastScrollState.shouldShowThumb(scrollRange, viewportExtent)) {
+            return false;
+        }
+        int trackHeight = binding.fastScrollTrackContainer.getHeight()
+                - binding.fastScrollTrackContainer.getPaddingTop()
+                - binding.fastScrollTrackContainer.getPaddingBottom();
+        int thumbHeight = Math.max(1, binding.fastScrollThumb.getHeight());
+        float localY = event.getY() - binding.fastScrollTrackContainer.getPaddingTop();
+        int targetOffset = ChatFastScrollState.targetScrollOffset(trackHeight, thumbHeight, localY, scrollRange, viewportExtent);
+        int currentOffset = binding.messageRecyclerView.computeVerticalScrollOffset();
+        binding.messageRecyclerView.scrollBy(0, targetOffset - currentOffset);
+        autoFollowConversation = ChatLayoutState.shouldAutoScroll(
+                scrollRange,
+                targetOffset,
+                viewportExtent,
+                ChatLayoutState.AUTO_SCROLL_THRESHOLD_PX
+        );
+        binding.messageRecyclerView.post(this::updateScrollJumpButtons);
+        return true;
+    }
+
+    private void jumpConversationToTop() {
+        autoFollowConversation = false;
+        binding.messageRecyclerView.scrollToPosition(0);
+        binding.messageRecyclerView.post(this::updateScrollJumpButtons);
+    }
+
+    private void jumpConversationToBottom() {
+        autoFollowConversation = true;
+        scrollConversationToBottom(true);
+        binding.messageRecyclerView.post(this::updateScrollJumpButtons);
+    }
+
+    private void scrollConversationToBottom() {
+        scrollConversationToBottom(true);
+    }
+
+    private void scrollConversationToBottom(boolean force) {
+        if (!force) {
+            return;
+        }
+        int itemCount = adapter.getItemCount();
+        if (itemCount <= 0) {
+            return;
+        }
+        binding.messageRecyclerView.post(() -> {
+            binding.messageRecyclerView.scrollBy(0, binding.messageRecyclerView.computeVerticalScrollRange());
+            autoFollowConversation = true;
+        });
+    }
+
+    private void showBanner(String message) {
+        if (message == null || message.isEmpty()) {
+            binding.statusBanner.setVisibility(View.GONE);
+            binding.statusBanner.setText("");
+            return;
+        }
+        binding.statusBanner.setVisibility(View.VISIBLE);
+        binding.statusBanner.setText(message);
+    }
+
+    private String safeLaunchValue(String value) {
+        return value == null || value.isEmpty() ? "default" : value;
+    }
+
+    private void adoptSessionId(String nextSessionId) {
+        if (nextSessionId == null || nextSessionId.isEmpty()) {
+            return;
+        }
+        migrateDraftToSession(nextSessionId);
+        sessionId = nextSessionId;
+        getIntent().putExtra(EXTRA_SESSION_ID, nextSessionId);
+    }
+
+    private void restoreDraft() {
+        ChatDraftStore.Draft draft = draftStore.loadDraft(sessionId);
+        if (!draft.text.isEmpty()) {
+            setMessageInputSilently(draft.text);
+        }
+        if (draft.hasImage()) {
+            Uri draftUri = Uri.parse(draft.imageUri);
+            selectedImageUri = draftUri;
+            selectedImageDisplayName = draft.imageName;
+            updateAttachmentPreview();
+            restoreDraftAttachment(draftUri);
+        }
+    }
+
+    private void restoreDraftAttachment(Uri draftUri) {
+        executor.execute(() -> {
+            try {
+                ChatImageAttachment imageAttachment = readImageAttachment(draftUri);
+                runOnUiThread(() -> {
+                    if (!draftUri.equals(selectedImageUri)) {
+                        return;
+                    }
+                    selectedImageAttachment = imageAttachment;
+                    selectedImageDisplayName = imageAttachment.displayName;
+                    updateAttachmentPreview();
+                    persistDraft();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> {
+                    if (!draftUri.equals(selectedImageUri)) {
+                        return;
+                    }
+                    clearSelectedImage();
+                    showBanner("Saved image is no longer available.");
+                });
+            }
+        });
+    }
+
+    private void persistDraft() {
+        if (draftStore == null || sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+        String text = binding.messageInput.getText() == null ? "" : binding.messageInput.getText().toString();
+        String imageUri = selectedImageUri == null ? "" : selectedImageUri.toString();
+        if (text.isEmpty() && imageUri.isEmpty()) {
+            draftStore.clearDraft(sessionId);
+            return;
+        }
+        draftStore.saveDraft(sessionId, text, imageUri, selectedImageDisplayName);
+    }
+
+    private void clearDraft() {
+        if (draftStore == null || sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+        draftStore.clearDraft(sessionId);
+    }
+
+    private void setMessageInputSilently(String text) {
+        suppressDraftPersistence = true;
+        binding.messageInput.setText(text);
+        if (binding.messageInput.getText() != null) {
+            binding.messageInput.setSelection(binding.messageInput.getText().length());
+        }
+        suppressDraftPersistence = false;
+    }
+
+    private void restoreDraftAfterFailedSend(String text, Uri imageUri, ChatImageAttachment imageAttachment, String imageDisplayName) {
+        setMessageInputSilently(text);
+        selectedImageUri = imageUri;
+        selectedImageAttachment = imageAttachment;
+        selectedImageDisplayName = imageDisplayName == null ? "" : imageDisplayName;
+        updateAttachmentPreview();
+        persistDraft();
+    }
+
+    private void migrateDraftToSession(String nextSessionId) {
+        if (draftStore == null || sessionId == null || sessionId.isEmpty() || sessionId.equals(nextSessionId)) {
+            return;
+        }
+        ChatDraftStore.Draft storedDraft = draftStore.loadDraft(sessionId);
+        String currentText = binding != null && binding.messageInput.getText() != null
+                ? binding.messageInput.getText().toString()
+                : "";
+        String currentImageUri = selectedImageUri == null ? "" : selectedImageUri.toString();
+        String currentImageName = selectedImageDisplayName == null ? "" : selectedImageDisplayName;
+        String text = currentText.isEmpty() ? storedDraft.text : currentText;
+        String imageUri = currentImageUri.isEmpty() ? storedDraft.imageUri : currentImageUri;
+        String imageName = currentImageName.isEmpty() ? storedDraft.imageName : currentImageName;
+        if (!text.isEmpty() || !imageUri.isEmpty()) {
+            draftStore.saveDraft(nextSessionId, text, imageUri, imageName);
+        }
+        draftStore.clearDraft(sessionId);
+    }
+}
