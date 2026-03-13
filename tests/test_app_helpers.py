@@ -87,6 +87,21 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertIn("socks5h://127.0.0.1:7897", prefix)
 
+    def test_format_account_status_label_uses_active_slot_name(self) -> None:
+        label = app.format_account_status_label(
+            "account-a",
+            {"email": "a@example.com", "account_id": "acct-a"},
+        )
+
+        self.assertEqual("Auth: Account A | a@example.com", label)
+
+    def test_format_account_slot_summary_marks_unbound_slots(self) -> None:
+        summary = app.format_account_slot_summary("account-b", {}, None)
+
+        self.assertIn("Account B", summary)
+        self.assertIn("Not bound yet.", summary)
+
+
 
 if __name__ == "__main__":
     unittest.main()

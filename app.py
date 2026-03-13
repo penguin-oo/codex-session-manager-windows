@@ -5,6 +5,7 @@ import sys
 import time
 import tomllib
 import tkinter as tk
+import auth_slots
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,10 @@ PORTAL_TIMEOUT_SECONDS = 0.25
 PORTAL_BACKOFF_SECONDS = 5.0
 TERMINAL_PROXY_SCHEMES = ("http", "socks5", "socks5h")
 DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1,.local,.ts.net"
+ACCOUNT_SLOT_NAMES = {
+    "account-a": "Account A",
+    "account-b": "Account B",
+}
 
 
 @dataclass
@@ -134,6 +139,30 @@ def build_proxy_environment_ps_prefix(enabled: bool, scheme: str, host: str, por
     )
 
 
+def format_account_slot_name(slot_id: str | None) -> str:
+    if not slot_id:
+        return "Unbound"
+    return ACCOUNT_SLOT_NAMES.get(slot_id, slot_id)
+
+
+def format_account_status_label(active_slot: str | None, auth_info: dict[str, str]) -> str:
+    email = auth_info.get("email", "").strip()
+    account_id = auth_info.get("account_id", "").strip()
+    if not email and not account_id:
+        return "Auth: not logged in"
+    identity = email or account_id or "logged in"
+    return f"Auth: {format_account_slot_name(active_slot)} | {identity}"
+
+
+def format_account_slot_summary(slot_id: str, slot_info: dict[str, str], active_slot: str | None) -> str:
+    if not slot_info.get("fingerprint"):
+        return f"{format_account_slot_name(slot_id)}\nNot bound yet."
+    identity = slot_info.get("email", "").strip() or slot_info.get("account_id", "").strip() or "saved login"
+    mode = slot_info.get("auth_mode", "").strip() or "unknown"
+    active_text = "Active now" if slot_id == active_slot else "Inactive"
+    return f"{format_account_slot_name(slot_id)}\n{identity}\nMode: {mode}\n{active_text}"
+
+
 class SessionManagerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -154,6 +183,7 @@ class SessionManagerApp:
         self._desktop_signal_id: str | None = None
         self._desktop_signal_mtime = DESKTOP_REFRESH_SIGNAL_FILE.stat().st_mtime if DESKTOP_REFRESH_SIGNAL_FILE.exists() else 0.0
         self._history_signature: tuple[int, int] | None = None
+        self.account_var = tk.StringVar(value="Auth: checking...")
 
         self.font_scale = 1.0
         self._base_fonts: dict[str, int] = {}
@@ -162,6 +192,7 @@ class SessionManagerApp:
 
         self._build_ui()
         self._init_fonts()
+        self._refresh_account_status()
         self._bind_shortcuts()
         self.refresh()
         self._schedule_auto_refresh()
@@ -180,6 +211,8 @@ class SessionManagerApp:
 
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.RIGHT)
+        ttk.Button(top, text="Accounts", command=self.open_accounts_dialog).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Label(top, textvariable=self.account_var).pack(side=tk.RIGHT)
 
         launch = ttk.LabelFrame(self.root, text="Launch Options (Only This Terminal)", padding=8)
         launch.pack(fill=tk.X, padx=8, pady=(0, 8))
@@ -457,6 +490,7 @@ class SessionManagerApp:
                 self._render_skill_items()
                 self._render_models()
             self._render_items(selected_session_id)
+            self._refresh_account_status()
             if note_has_focus:
                 self.note_var.set(note_text)
             if not auto:
@@ -1044,6 +1078,104 @@ class SessionManagerApp:
             f"Set-Location -LiteralPath '{cwd_escaped}'; "
             f"& {self._to_ps_arg_string(codex_args)}"
         )
+
+    def _refresh_account_status(self) -> None:
+        auth_info = auth_slots.current_auth_info()
+        active_slot = auth_slots.detect_active_slot()
+        self.account_var.set(format_account_status_label(active_slot, auth_info))
+
+    def open_accounts_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Accounts")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        current_var = tk.StringVar(value="")
+        ttk.Label(container, text="Current login", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(container, textvariable=current_var, justify=tk.LEFT).pack(anchor="w", pady=(4, 10))
+        ttk.Label(
+            container,
+            text=(
+                "Bind each slot once, then switch with one click. Only future requests use the new account. "
+                "Running Codex terminals or replies keep their current auth until restarted."
+            ),
+            wraplength=560,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 10))
+
+        slots_frame = ttk.Frame(container)
+        slots_frame.pack(fill=tk.BOTH, expand=True)
+        slot_vars: dict[str, tk.StringVar] = {}
+        switch_buttons: dict[str, ttk.Button] = {}
+
+        def refresh_dialog() -> None:
+            auth_info = auth_slots.current_auth_info()
+            active_slot = auth_slots.detect_active_slot()
+            identity = auth_info.get("email", "").strip() or auth_info.get("account_id", "").strip() or "Not logged in"
+            mode = auth_info.get("auth_mode", "").strip() or "unknown"
+            current_var.set(
+                f"{identity}\nMode: {mode}\nActive slot: {format_account_slot_name(active_slot)}"
+            )
+            for slot_id in auth_slots.STANDARD_SLOT_IDS:
+                slot_info = auth_slots.get_slot_info(slot_id)
+                slot_vars[slot_id].set(format_account_slot_summary(slot_id, slot_info, active_slot))
+                switch_buttons[slot_id].configure(state=("normal" if slot_info.get("fingerprint") else "disabled"))
+
+        def bind_slot(slot_id: str) -> None:
+            try:
+                auth_slots.save_current_auth_to_slot(slot_id)
+            except FileNotFoundError as exc:
+                messagebox.showerror("Bind Account", str(exc), parent=dialog)
+                return
+            refresh_dialog()
+            self._refresh_account_status()
+            self.status_var.set(f"Saved current login to {format_account_slot_name(slot_id)}")
+
+        def switch_slot(slot_id: str) -> None:
+            slot_info = auth_slots.get_slot_info(slot_id)
+            if not slot_info.get("fingerprint"):
+                messagebox.showinfo("Switch Account", f"{format_account_slot_name(slot_id)} is not bound yet.", parent=dialog)
+                return
+            ok = messagebox.askyesno(
+                "Switch Account",
+                f"Switch future requests to {format_account_slot_name(slot_id)}?\n\n"
+                "Existing running Codex terminals or replies keep their current auth until restarted.",
+                parent=dialog,
+            )
+            if not ok:
+                return
+            auth_slots.switch_to_auth_slot(slot_id)
+            refresh_dialog()
+            self._refresh_account_status()
+            self.status_var.set(f"Switched future requests to {format_account_slot_name(slot_id)}")
+            messagebox.showinfo(
+                "Account Switched",
+                f"Future requests now use {format_account_slot_name(slot_id)}.\n\n"
+                "For a clean cutover, stop any running Codex replies and reopen existing Codex terminals.",
+                parent=dialog,
+            )
+
+        for index, slot_id in enumerate(auth_slots.STANDARD_SLOT_IDS):
+            card = ttk.LabelFrame(slots_frame, text=format_account_slot_name(slot_id), padding=10)
+            card.grid(row=0, column=index, sticky="nsew", padx=(0, 8 if index == 0 else 0))
+            slot_var = tk.StringVar(value="")
+            slot_vars[slot_id] = slot_var
+            ttk.Label(card, textvariable=slot_var, justify=tk.LEFT, wraplength=240).pack(anchor="w")
+            button_row = ttk.Frame(card)
+            button_row.pack(fill=tk.X, pady=(10, 0))
+            ttk.Button(button_row, text="Bind Current Here", command=lambda value=slot_id: bind_slot(value)).pack(side=tk.LEFT)
+            switch_button = ttk.Button(button_row, text="Switch Here", command=lambda value=slot_id: switch_slot(value))
+            switch_button.pack(side=tk.LEFT, padx=(8, 0))
+            switch_buttons[slot_id] = switch_button
+
+        slots_frame.grid_columnconfigure(0, weight=1)
+        slots_frame.grid_columnconfigure(1, weight=1)
+        ttk.Button(container, text="Close", command=dialog.destroy).pack(anchor="e", pady=(12, 0))
+        refresh_dialog()
 
     def _portal_json(self, path: str) -> dict[str, object] | None:
         if time.monotonic() < self._portal_retry_after:
