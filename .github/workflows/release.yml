@@ -39,7 +39,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release -Force | Out-Null
-          Compress-Archive -Path dist/codex-session-manager.exe, run.bat, README.md, assets -DestinationPath release/codex-session-manager-windows-x64.zip -Force
+          Compress-Archive -Path dist/codex-session-manager.exe, run.bat, run-mobile.bat, mobile_portal.py, README.md, assets -DestinationPath release/codex-session-manager-windows-x64.zip -Force
 
       - name: Package artifact (macOS)
         if: runner.os == 'macOS'

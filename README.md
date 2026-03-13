@@ -33,6 +33,12 @@ If you clone this repository, the current packaged files in `release/` come down
 Historical versions should be downloaded from GitHub Releases instead of from git history.
 
 ## Quick Start
+### Use the Windows deployment zip
+1. Extract `release/codex-session-manager-windows-x64.zip`.
+2. For desktop-only use, run `run.bat`.
+3. For phone access, run `run-mobile.bat`.
+4. Install `release/codex-mobile-debug.apk` onto the phone separately.
+
 ### Run the desktop manager
 ```bat
 run.bat
@@ -131,8 +137,14 @@ cd android-app
 The packaged Windows zip is built from:
 - `dist/codex-session-manager.exe`
 - `run.bat`
+- `run-mobile.bat`
+- `mobile_portal.py`
 - `README.md`
 - `assets/`
+
+This means the Windows zip can be used as a complete PC-side deployment bundle for both:
+- the desktop manager
+- the mobile portal backend used by the Android app
 
 ### Android APK
 The tracked APK is the current debug build generated from `android-app/`.
