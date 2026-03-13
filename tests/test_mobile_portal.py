@@ -52,10 +52,33 @@ class WorkingDirectoryTests(unittest.TestCase):
 class _FakeStore:
     def __init__(self, sessions: list[mobile_portal.SessionItem] | None = None) -> None:
         self._sessions = sessions or []
+        self._settings: dict[str, dict[str, str]] = {}
         self.append_history_calls: list[tuple[str, str, int | None]] = []
 
     def load_sessions(self) -> list[mobile_portal.SessionItem]:
-        return list(self._sessions)
+        return mobile_portal.apply_session_overrides(list(self._sessions), self._settings)
+
+    def session_payload(self, session_id: str) -> dict[str, object] | None:
+        for item in self.load_sessions():
+            if item.session_id == session_id:
+                return {"session": mobile_portal.asdict(item), "messages": []}
+        return None
+
+    def set_session_settings(self, session_id: str, model: str, approval_policy: str, sandbox_mode: str) -> dict[str, str]:
+        cleaned = {
+            key: value
+            for key, value in {
+                "model": model.strip(),
+                "approval_policy": approval_policy.strip(),
+                "sandbox_mode": sandbox_mode.strip(),
+            }.items()
+            if value and value != "default"
+        }
+        if cleaned:
+            self._settings[session_id] = cleaned
+        else:
+            self._settings.pop(session_id, None)
+        return cleaned
 
     def append_history_entry(self, session_id: str, text: str, ts: int | None = None, history_file: Path | None = None) -> None:
         self.append_history_calls.append((session_id, text, ts))
@@ -385,6 +408,129 @@ class PortalServiceBootstrapTests(unittest.TestCase):
         payload = service.bootstrap_payload()
 
         self.assertTrue(payload["sessions"][0]["is_replying"])
+        self.assertEqual(mobile_portal.current_proxy_summary(), payload["proxy_summary"])
+
+    def test_update_session_settings_changes_follow_up_defaults(self) -> None:
+        session = mobile_portal.SessionItem(
+            session_id="session-1",
+            ts=1,
+            text="hello",
+            note="",
+            history_count=1,
+            cwd=str(Path.cwd()),
+            model="gpt-5",
+            approval_policy="default",
+            sandbox_mode="workspace-write",
+            turn_id="turn-1",
+            session_file="",
+        )
+        fake_store = _FakeStore([session])
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+        service.data_store = fake_store
+        service.jobs = mobile_portal.JobRunner(fake_store)
+
+        payload = service.update_session_settings("session-1", "gpt-5.4", "never", "danger-full-access")
+
+        session_payload = payload["session"]
+        self.assertEqual("gpt-5.4", session_payload["model"])
+        self.assertEqual("never", session_payload["approval_policy"])
+        self.assertEqual("danger-full-access", session_payload["sandbox_mode"])
+
+
+class PortalFileShareTests(unittest.TestCase):
+    def test_create_file_share_allows_supported_file_under_session_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cwd = Path(temp_dir)
+            target = cwd / "preview.png"
+            target.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+            session = mobile_portal.SessionItem(
+                session_id="session-1",
+                ts=1,
+                text="hello",
+                note="",
+                history_count=1,
+                cwd=str(cwd),
+                model="gpt-5",
+                approval_policy="default",
+                sandbox_mode="workspace-write",
+                turn_id="turn-1",
+                session_file="",
+            )
+            fake_store = _FakeStore([session])
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            service.data_store = fake_store
+            service.jobs = mobile_portal.JobRunner(fake_store)
+
+            share = service.create_file_share("session-1", str(target))
+
+            self.assertIn("/files/", share["relative_url"])
+            entry = service.resolve_file_share(str(share["share_id"]))
+            self.assertEqual(target.resolve(), entry["path"])
+            self.assertEqual("image/png", entry["content_type"])
+
+    def test_create_file_share_rejects_file_outside_allowed_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            cwd = base / "project"
+            outside = base / "outside.png"
+            cwd.mkdir()
+            outside.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+            session = mobile_portal.SessionItem(
+                session_id="session-1",
+                ts=1,
+                text="hello",
+                note="",
+                history_count=1,
+                cwd=str(cwd),
+                model="gpt-5",
+                approval_policy="default",
+                sandbox_mode="workspace-write",
+                turn_id="turn-1",
+                session_file="",
+            )
+            fake_store = _FakeStore([session])
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            service.data_store = fake_store
+            service.jobs = mobile_portal.JobRunner(fake_store)
+
+            with self.assertRaisesRegex(PermissionError, "allowed"):
+                service.create_file_share("session-1", str(outside))
+
+    def test_create_file_share_rejects_unsupported_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cwd = Path(temp_dir)
+            target = cwd / "notes.txt"
+            target.write_text("not supported", encoding="utf-8")
+            session = mobile_portal.SessionItem(
+                session_id="session-1",
+                ts=1,
+                text="hello",
+                note="",
+                history_count=1,
+                cwd=str(cwd),
+                model="gpt-5",
+                approval_policy="default",
+                sandbox_mode="workspace-write",
+                turn_id="turn-1",
+                session_file="",
+            )
+            fake_store = _FakeStore([session])
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            service.data_store = fake_store
+            service.jobs = mobile_portal.JobRunner(fake_store)
+
+            with self.assertRaisesRegex(ValueError, "Unsupported"):
+                service.create_file_share("session-1", str(target))
+
+
+class PortalDownloadsTests(unittest.TestCase):
+    def test_download_page_includes_release_links(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "verify-token")
+
+        html = service.download_page_html()
+
+        self.assertIn("/downloads/codex-mobile-debug.apk?token=verify-token", html)
+        self.assertIn("/downloads/codex-session-manager-windows-x64.zip?token=verify-token", html)
 
 
 class ResumeArgsTests(unittest.TestCase):

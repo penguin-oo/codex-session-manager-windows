@@ -1,9 +1,5 @@
 package com.penguinoo.codexmobile;
 
-import android.content.ClipData;
-import android.content.ClipboardManager;
-import android.content.Context;
-import android.widget.Toast;
 import android.view.LayoutInflater;
 import android.view.ViewGroup;
 
@@ -24,6 +20,15 @@ public final class ChatMessageAdapter extends RecyclerView.Adapter<RecyclerView.
 
     private final List<ChatMessage> items = new ArrayList<>();
     private final DateFormat dateFormat = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT);
+    private final LocalFileActionListener localFileActionListener;
+
+    public interface LocalFileActionListener {
+        void onOpenLocalPathsRequested(List<String> paths);
+    }
+
+    public ChatMessageAdapter(LocalFileActionListener localFileActionListener) {
+        this.localFileActionListener = localFileActionListener;
+    }
 
     public void submitList(List<ChatMessage> messages) {
         items.clear();
@@ -78,23 +83,11 @@ public final class ChatMessageAdapter extends RecyclerView.Adapter<RecyclerView.
 
         void bind(ChatMessage message) {
             binding.messageText.setText(message.text);
+            ChatTextSelectionSupport.configure(binding.messageText, binding.getRoot());
             binding.timeText.setText(message.isEphemeral
                     ? binding.getRoot().getContext().getString(R.string.label_sending)
                     : formatTime(message.timestamp));
-            binding.getRoot().setOnLongClickListener(view -> {
-                copyMessageText(message.text);
-                return true;
-            });
-        }
-
-        private void copyMessageText(String text) {
-            Context context = binding.getRoot().getContext();
-            ClipboardManager clipboardManager = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
-            if (clipboardManager == null) {
-                return;
-            }
-            clipboardManager.setPrimaryClip(ClipData.newPlainText("Codex chat", text));
-            Toast.makeText(context, R.string.banner_message_copied, Toast.LENGTH_SHORT).show();
+            bindLocalFileAction(message, binding.openLocalFileText);
         }
     }
 
@@ -108,23 +101,27 @@ public final class ChatMessageAdapter extends RecyclerView.Adapter<RecyclerView.
 
         void bind(ChatMessage message) {
             binding.messageText.setText(message.text);
+            ChatTextSelectionSupport.configure(binding.messageText, binding.getRoot());
             binding.timeText.setText(message.isEphemeral
                     ? binding.getRoot().getContext().getString(R.string.label_codex_replying)
                     : formatTime(message.timestamp));
-            binding.getRoot().setOnLongClickListener(view -> {
-                copyMessageText(message.text);
-                return true;
-            });
+            bindLocalFileAction(message, binding.openLocalFileText);
         }
+    }
 
-        private void copyMessageText(String text) {
-            Context context = binding.getRoot().getContext();
-            ClipboardManager clipboardManager = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
-            if (clipboardManager == null) {
-                return;
-            }
-            clipboardManager.setPrimaryClip(ClipData.newPlainText("Codex chat", text));
-            Toast.makeText(context, R.string.banner_message_copied, Toast.LENGTH_SHORT).show();
+    private void bindLocalFileAction(ChatMessage message, android.widget.TextView actionView) {
+        List<String> supportedPaths = LocalFilePathDetector.extractSupportedPaths(message.text);
+        if (supportedPaths.isEmpty() || localFileActionListener == null) {
+            actionView.setVisibility(android.view.View.GONE);
+            actionView.setOnClickListener(null);
+            return;
         }
+        if (supportedPaths.size() == 1) {
+            actionView.setText(R.string.action_open_on_phone);
+        } else {
+            actionView.setText(actionView.getContext().getString(R.string.action_open_multiple_on_phone, supportedPaths.size()));
+        }
+        actionView.setVisibility(android.view.View.VISIBLE);
+        actionView.setOnClickListener(view -> localFileActionListener.onOpenLocalPathsRequested(supportedPaths));
     }
 }

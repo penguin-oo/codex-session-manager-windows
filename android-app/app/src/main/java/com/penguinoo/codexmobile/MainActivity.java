@@ -6,7 +6,9 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.view.LayoutInflater;
 import android.view.View;
+import android.widget.TextView;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -64,6 +66,7 @@ public final class MainActivity extends AppCompatActivity {
         binding.actionNewChatCard.setOnClickListener(view -> openNewChat());
 
         binding.portalUrlInput.setText(configStore.getPortalUrl());
+        refreshPortalHistorySuggestions();
         if (configStore.getPortalUrl().isEmpty()) {
             showDisconnectedState();
             showBanner(getString(R.string.banner_paste_portal));
@@ -121,8 +124,10 @@ public final class MainActivity extends AppCompatActivity {
         }
         if (itemId == R.id.action_clear_saved) {
             configStore.clearPortalUrl();
+            configStore.clearRecentPortalUrls();
             app().getReplyMonitor().stop();
             binding.portalUrlInput.setText("");
+            refreshPortalHistorySuggestions();
             bootstrap = null;
             recentAdapter.submitList(Collections.emptyList());
             showDisconnectedState();
@@ -141,9 +146,11 @@ public final class MainActivity extends AppCompatActivity {
             return;
         }
         if (saveConfig) {
-            configStore.savePortalUrl(rawUrl);
+            configStore.rememberPortalUrl(rawUrl);
+            refreshPortalHistorySuggestions();
         }
         startReplyMonitor();
+        binding.portalUrlInput.clearFocus();
         showConnectionEditor(false);
         loadBootstrap();
     }
@@ -199,9 +206,38 @@ public final class MainActivity extends AppCompatActivity {
     private void showConnectionEditor(boolean editing) {
         binding.connectionFormGroup.setVisibility(editing ? View.VISIBLE : View.GONE);
         binding.manageConnectionButton.setVisibility(editing ? View.GONE : View.VISIBLE);
+        boolean hasRecentConnections = !PortalConnectionHistoryState.suggestions(
+                configStore.getPortalUrl(),
+                configStore.getRecentPortalUrls()
+        ).isEmpty();
+        binding.recentConnectionsGroup.setVisibility(editing && hasRecentConnections ? View.VISIBLE : View.GONE);
         if (editing) {
             binding.portalUrlInput.requestFocus();
         }
+    }
+
+    private void refreshPortalHistorySuggestions() {
+        List<String> suggestions = PortalConnectionHistoryState.suggestions(
+                configStore.getPortalUrl(),
+                configStore.getRecentPortalUrls()
+        );
+        binding.recentConnectionsContainer.removeAllViews();
+        LayoutInflater inflater = LayoutInflater.from(this);
+        for (String suggestion : suggestions) {
+            TextView itemView = (TextView) inflater.inflate(
+                    R.layout.item_portal_history,
+                    binding.recentConnectionsContainer,
+                    false
+            );
+            itemView.setText(suggestion);
+            itemView.setOnClickListener(view -> {
+                binding.portalUrlInput.setText(suggestion);
+                connectAndLoad(true);
+            });
+            binding.recentConnectionsContainer.addView(itemView);
+        }
+        boolean editing = binding.connectionFormGroup.getVisibility() == View.VISIBLE;
+        binding.recentConnectionsGroup.setVisibility(editing && !suggestions.isEmpty() ? View.VISIBLE : View.GONE);
     }
 
     private void openLatestChat() {

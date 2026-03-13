@@ -158,6 +158,25 @@ public final class PortalApiClient {
         postJson(endpoint, "/api/sessions/" + sessionId + "/note", body);
     }
 
+    public SessionPayload saveSessionSettings(
+            PortalEndpoint endpoint,
+            String sessionId,
+            String model,
+            String approvalPolicy,
+            String sandboxMode
+    ) throws IOException {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("model", model);
+            body.put("approval_policy", approvalPolicy);
+            body.put("sandbox_mode", sandboxMode);
+        } catch (JSONException exception) {
+            throw new IOException("Failed to build session-settings request.", exception);
+        }
+        JSONObject json = postJson(endpoint, "/api/sessions/" + sessionId + "/settings", body);
+        return parseSessionPayload(json);
+    }
+
     public void requestDesktopRefresh(PortalEndpoint endpoint) throws IOException {
         JSONObject body = new JSONObject();
         try {
@@ -188,6 +207,24 @@ public final class PortalApiClient {
         return parseDirectoryListing(json);
     }
 
+    public PortalSharedFileLink createFileShare(PortalEndpoint endpoint, String sessionId, String path) throws IOException {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("session_id", sessionId);
+            body.put("path", path);
+        } catch (JSONException exception) {
+            throw new IOException("Failed to build file-share request.", exception);
+        }
+        JSONObject json = postJson(endpoint, "/api/files/share", body);
+        return new PortalSharedFileLink(
+                json.optString("share_id"),
+                json.optString("relative_url"),
+                json.optString("file_name"),
+                json.optString("content_type"),
+                json.optLong("expires_at", 0L)
+        );
+    }
+
     private JSONObject getJson(PortalEndpoint endpoint, String path) throws IOException {
         return openConnection(endpoint, path, "GET", null);
     }
@@ -214,7 +251,11 @@ public final class PortalApiClient {
         return new SessionPayload(
                 parseSession(json.optJSONObject("session")),
                 parseMessages(json.optJSONArray("messages")),
-                parseNullableJob(json.optJSONObject("active_job"))
+                parseNullableJob(json.optJSONObject("active_job")),
+                parseStringList(json.optJSONArray("models")),
+                parseStringList(json.optJSONArray("approval_options")),
+                parseStringList(json.optJSONArray("sandbox_options")),
+                json.optString("proxy_summary")
         );
     }
 
@@ -300,7 +341,7 @@ public final class PortalApiClient {
         return builder.toString();
     }
 
-    private List<String> parseStringList(JSONArray array) {
+    private static List<String> parseStringList(JSONArray array) {
         List<String> values = new ArrayList<>();
         if (array == null) {
             return values;

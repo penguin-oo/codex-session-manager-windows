@@ -52,6 +52,41 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual("keep", updated[1].note)
         self.assertEqual("old", items[0].note)
 
+    def test_terminal_proxy_schemes_include_socks5h(self) -> None:
+        self.assertIn("socks5h", app.TERMINAL_PROXY_SCHEMES)
+
+    def test_build_start_process_command_uses_no_profile(self) -> None:
+        command = app.build_start_process_command(
+            ps_command="Write-Host 'hello'",
+            run_as_admin=True,
+        )
+
+        self.assertIn("-Verb RunAs", command)
+        self.assertIn("'-NoProfile'", command)
+        self.assertIn("'-NoExit'", command)
+        self.assertIn("'-Command'", command)
+
+    def test_build_proxy_environment_ps_prefix_clears_proxy_when_disabled(self) -> None:
+        prefix = app.build_proxy_environment_ps_prefix(
+            enabled=False,
+            scheme="socks5h",
+            host="127.0.0.1",
+            port_text="7897",
+        )
+
+        self.assertIn("$env:HTTP_PROXY=$null", prefix)
+        self.assertIn("$env:ALL_PROXY=$null", prefix)
+
+    def test_build_proxy_environment_ps_prefix_supports_socks5h(self) -> None:
+        prefix = app.build_proxy_environment_ps_prefix(
+            enabled=True,
+            scheme="socks5h",
+            host="127.0.0.1",
+            port_text="7897",
+        )
+
+        self.assertIn("socks5h://127.0.0.1:7897", prefix)
+
 
 if __name__ == "__main__":
     unittest.main()

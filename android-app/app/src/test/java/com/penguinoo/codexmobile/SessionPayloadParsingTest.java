@@ -31,7 +31,11 @@ public final class SessionPayloadParsingTest {
                         .put("live_text", "partial")
                         .put("live_chunks_version", 2)
                         .put("owner_kind", "mobile")
-                        .put("owner_label", "Mobile"));
+                        .put("owner_label", "Mobile"))
+                .put("models", new JSONArray().put("default").put("gpt-5").put("gpt-5.4"))
+                .put("approval_options", new JSONArray().put("default").put("never"))
+                .put("sandbox_options", new JSONArray().put("default").put("danger-full-access"))
+                .put("proxy_summary", "socks5h://127.0.0.1:7897");
 
         SessionPayload payload = PortalApiClient.parseSessionPayload(json);
 
@@ -39,5 +43,9 @@ public final class SessionPayloadParsingTest {
         assertEquals("job-1", payload.activeJob.jobId);
         assertEquals("partial", payload.activeJob.liveText);
         assertEquals(true, payload.session.isReplying);
+        assertEquals("gpt-5.4", payload.modelOptions.get(2));
+        assertEquals("never", payload.approvalOptions.get(1));
+        assertEquals("danger-full-access", payload.sandboxOptions.get(1));
+        assertEquals("socks5h://127.0.0.1:7897", payload.proxySummary);
     }
 }

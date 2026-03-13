@@ -20,6 +20,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:maxWidth="280dp"
+            android:textIsSelectable="true"
             android:textColor="@color/white"
             android:textSize="15sp" />
 
@@ -30,6 +31,18 @@
             android:layout_marginTop="8dp"
             android:textColor="@color/text_muted"
             android:textSize="11sp" />
+
+        <TextView
+            android:id="@+id/openLocalFileText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:background="@drawable/bg_replying_badge"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="4dp"
+            android:textColor="@color/white"
+            android:textSize="12sp"
+            android:visibility="gone" />
     </LinearLayout>
 
 </FrameLayout>

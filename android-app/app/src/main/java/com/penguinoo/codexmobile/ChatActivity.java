@@ -1,5 +1,6 @@
 package com.penguinoo.codexmobile;
 
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -16,7 +17,11 @@ import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ArrayAdapter;
 import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.Spinner;
+import android.widget.TextView;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -69,6 +74,11 @@ public final class ChatActivity extends AppCompatActivity {
     private boolean autoFollowConversation = true;
     private boolean isActivityVisible = false;
     private boolean suppressDraftPersistence = false;
+    private int heartbeatFailureCount = 0;
+    private List<String> sessionModelOptions = new ArrayList<>();
+    private List<String> sessionApprovalOptions = new ArrayList<>();
+    private List<String> sessionSandboxOptions = new ArrayList<>();
+    private String currentProxySummary = "";
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final List<ChatMessage> persistedMessages = new ArrayList<>();
     private String stickyBanner = "";
@@ -82,8 +92,15 @@ public final class ChatActivity extends AppCompatActivity {
             executor.execute(() -> {
                 try {
                     currentLease = apiClient.heartbeatSession(endpoint, sessionId, lease.leaseId);
+                    heartbeatFailureCount = ChatHeartbeatState.nextFailureCount(true, heartbeatFailureCount);
                 } catch (Exception exception) {
-                    runOnUiThread(() -> handlePortalUnavailable(exception.getMessage()));
+                    heartbeatFailureCount = ChatHeartbeatState.nextFailureCount(false, heartbeatFailureCount);
+                    if (ChatHeartbeatState.shouldInvalidateLease(heartbeatFailureCount)) {
+                        runOnUiThread(() -> handlePortalUnavailable(exception.getMessage()));
+                        return;
+                    }
+                    runOnUiThread(() -> showBanner("Lease heartbeat missed. Retrying..."));
+                    mainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS);
                     return;
                 }
                 mainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS);
@@ -117,7 +134,7 @@ public final class ChatActivity extends AppCompatActivity {
             getSupportActionBar().setTitle("Chat");
         }
 
-        adapter = new ChatMessageAdapter();
+        adapter = new ChatMessageAdapter(this::openLocalPathsOnPhone);
         LinearLayoutManager layoutManager = new LinearLayoutManager(this);
         binding.messageRecyclerView.setLayoutManager(layoutManager);
         binding.messageRecyclerView.setAdapter(adapter);
@@ -231,6 +248,10 @@ public final class ChatActivity extends AppCompatActivity {
             requestDesktopRefresh();
             return true;
         }
+        if (itemId == R.id.action_session_settings) {
+            editSessionSettings();
+            return true;
+        }
         if (itemId == R.id.action_edit_note) {
             editNote();
             return true;
@@ -287,6 +308,10 @@ public final class ChatActivity extends AppCompatActivity {
 
     private void renderPayload(SessionPayload payload) {
         currentSession = payload.session;
+        sessionModelOptions = new ArrayList<>(payload.modelOptions);
+        sessionApprovalOptions = new ArrayList<>(payload.approvalOptions);
+        sessionSandboxOptions = new ArrayList<>(payload.sandboxOptions);
+        currentProxySummary = payload.proxySummary == null ? "" : payload.proxySummary;
         if (payload.session != null && payload.session.sessionId != null && !payload.session.sessionId.isEmpty()) {
             adoptSessionId(payload.session.sessionId);
         }
@@ -294,7 +319,7 @@ public final class ChatActivity extends AppCompatActivity {
             getSupportActionBar().setTitle(SessionCollections.displayTitle(payload.session));
             getSupportActionBar().setSubtitle("");
         }
-        String metadata = ChatHeaderModel.metadataLine(payload.session);
+        String metadata = ChatHeaderModel.metadataLine(payload.session, payload.proxySummary);
         binding.headerMetaText.setText(metadata);
         binding.headerMetaText.setVisibility(metadata.isEmpty() ? View.GONE : View.VISIBLE);
         persistedMessages.clear();
@@ -346,7 +371,7 @@ public final class ChatActivity extends AppCompatActivity {
             return;
         }
         if (currentLease == null || currentLease.leaseId == null || currentLease.leaseId.isEmpty()) {
-            showBanner(stickyBanner == null || stickyBanner.isEmpty() ? "This session is currently read-only." : stickyBanner);
+            attemptLeaseRecoveryAndSend();
             return;
         }
 
@@ -396,6 +421,7 @@ public final class ChatActivity extends AppCompatActivity {
         executor.execute(() -> {
             try {
                 currentLease = apiClient.claimSession(endpoint, sessionId);
+                heartbeatFailureCount = 0;
                 stickyBanner = "Mobile is controlling this session.";
                 runOnUiThread(() -> {
                     setComposerEnabled(true);
@@ -418,6 +444,23 @@ public final class ChatActivity extends AppCompatActivity {
         if (currentLease != null) {
             mainHandler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS);
         }
+    }
+
+    private void attemptLeaseRecoveryAndSend() {
+        showBanner("Reclaiming mobile control...");
+        executor.execute(() -> {
+            try {
+                currentLease = apiClient.claimSession(endpoint, sessionId);
+                heartbeatFailureCount = 0;
+                stickyBanner = "Mobile is controlling this session.";
+                runOnUiThread(() -> {
+                    startLeaseHeartbeat();
+                    sendMessage();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
     }
 
     private void renderLiveJob(PortalJob job) {
@@ -654,6 +697,93 @@ public final class ChatActivity extends AppCompatActivity {
                 .show();
     }
 
+    private void editSessionSettings() {
+        if (currentSession == null) {
+            showBanner("Conversation is still loading.");
+            return;
+        }
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        int padding = dpToPx(18);
+        container.setPadding(padding, padding, padding, 0);
+
+        Spinner modelSpinner = buildSettingsSpinner(sessionModelOptions, effectiveSessionValue(currentSession.model));
+        Spinner approvalSpinner = buildSettingsSpinner(sessionApprovalOptions, effectiveSessionValue(currentSession.approvalPolicy));
+        Spinner sandboxSpinner = buildSettingsSpinner(sessionSandboxOptions, effectiveSessionValue(currentSession.sandboxMode));
+
+        container.addView(buildSettingsLabel(R.string.label_model));
+        container.addView(modelSpinner);
+        container.addView(buildSettingsLabel(R.string.label_approval));
+        container.addView(approvalSpinner);
+        container.addView(buildSettingsLabel(R.string.label_sandbox));
+        container.addView(sandboxSpinner);
+
+        TextView proxyText = buildSettingsLabelText(getString(R.string.label_proxy_summary, currentProxySummary.isEmpty() ? "direct" : currentProxySummary));
+        proxyText.setPadding(0, dpToPx(16), 0, 0);
+        container.addView(proxyText);
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.title_session_settings)
+                .setView(container)
+                .setPositiveButton(R.string.action_save, (dialog, which) -> saveSessionSettings(
+                        selectedSpinnerValue(modelSpinner),
+                        selectedSpinnerValue(approvalSpinner),
+                        selectedSpinnerValue(sandboxSpinner)
+                ))
+                .setNeutralButton(R.string.action_reset_defaults, (dialog, which) -> saveSessionSettings("default", "default", "default"))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private Spinner buildSettingsSpinner(List<String> options, String currentValue) {
+        Spinner spinner = new Spinner(this);
+        List<String> values = new ArrayList<>();
+        values.add("default");
+        for (String option : options) {
+            if (option == null || option.isEmpty() || values.contains(option)) {
+                continue;
+            }
+            values.add(option);
+        }
+        if (currentValue != null && !currentValue.isEmpty() && !values.contains(currentValue)) {
+            values.add(currentValue);
+        }
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, values);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+        spinner.setSelection(values.indexOf(currentValue));
+        return spinner;
+    }
+
+    private TextView buildSettingsLabel(int resId) {
+        TextView textView = buildSettingsLabelText(getString(resId));
+        textView.setPadding(0, dpToPx(12), 0, dpToPx(6));
+        return textView;
+    }
+
+    private TextView buildSettingsLabelText(String text) {
+        TextView textView = new TextView(this);
+        textView.setText(text);
+        return textView;
+    }
+
+    private String selectedSpinnerValue(Spinner spinner) {
+        Object selectedItem = spinner.getSelectedItem();
+        if (selectedItem == null) {
+            return "default";
+        }
+        String value = selectedItem.toString().trim();
+        return value.isEmpty() ? "default" : value;
+    }
+
+    private String effectiveSessionValue(String value) {
+        return value == null || value.isEmpty() ? "default" : value;
+    }
+
+    private int dpToPx(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
     private void saveNote(String note) {
         showBanner("Saving note...");
         executor.execute(() -> {
@@ -663,6 +793,21 @@ public final class ChatActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     renderPayload(payload);
                     showBanner("Note saved.");
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void saveSessionSettings(String model, String approvalPolicy, String sandboxMode) {
+        showBanner(getString(R.string.banner_saving_session_settings));
+        executor.execute(() -> {
+            try {
+                SessionPayload payload = apiClient.saveSessionSettings(endpoint, sessionId, model, approvalPolicy, sandboxMode);
+                runOnUiThread(() -> {
+                    renderPayload(payload);
+                    showBanner(getString(R.string.banner_session_settings_saved));
                 });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
@@ -703,6 +848,45 @@ public final class ChatActivity extends AppCompatActivity {
         });
     }
 
+    private void openLocalPathsOnPhone(List<String> paths) {
+        if (paths == null || paths.isEmpty()) {
+            return;
+        }
+        if (paths.size() == 1) {
+            openLocalPathOnPhone(paths.get(0));
+            return;
+        }
+        CharSequence[] labels = paths.toArray(new CharSequence[0]);
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.dialog_choose_file_title)
+                .setItems(labels, (dialog, which) -> openLocalPathOnPhone(paths.get(which)))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void openLocalPathOnPhone(String path) {
+        showBanner(getString(R.string.banner_creating_browser_link));
+        executor.execute(() -> {
+            try {
+                PortalSharedFileLink sharedFileLink = apiClient.createFileShare(endpoint, sessionId, path);
+                String browserUrl = endpoint.browserUrl(sharedFileLink.relativeUrl);
+                runOnUiThread(() -> {
+                    try {
+                        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(browserUrl));
+                        startActivity(intent);
+                        showBanner(getString(R.string.banner_opening_in_browser));
+                    } catch (ActivityNotFoundException exception) {
+                        showBanner(exception.getMessage() == null || exception.getMessage().isEmpty()
+                                ? "No browser is available."
+                                : exception.getMessage());
+                    }
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
     private void stopReply() {
         if (attachedJobId == null || attachedJobId.isEmpty()) {
             return;
@@ -722,6 +906,7 @@ public final class ChatActivity extends AppCompatActivity {
         attachedJobId = "";
         watchingJobId = "";
         currentLease = null;
+        heartbeatFailureCount = 0;
         setComposerEnabled(false);
         stickyBanner = (message == null || message.isEmpty())
                 ? "Portal offline. Keep run-mobile.bat open, then refresh."

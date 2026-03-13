@@ -54,4 +54,17 @@ public final class PortalEndpoint {
     public String apiUrl(String path) {
         return origin + path;
     }
+
+    public String browserUrl(String path) {
+        if (path == null || path.isEmpty()) {
+            return origin;
+        }
+        if (path.startsWith("http://") || path.startsWith("https://")) {
+            return path;
+        }
+        if (path.startsWith("/")) {
+            return origin + path;
+        }
+        return origin + "/" + path;
+    }
 }

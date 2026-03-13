@@ -32,17 +32,22 @@ DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1"
 CODEX_HOME = Path(os.environ.get("USERPROFILE", "")) / ".codex"
 HISTORY_FILE = CODEX_HOME / "history.jsonl"
 NOTES_FILE = CODEX_HOME / "session_notes.json"
+SETTINGS_FILE = CODEX_HOME / "session_settings.json"
 SESSIONS_DIR = CODEX_HOME / "sessions"
 CONFIG_FILE = CODEX_HOME / "config.toml"
 MODELS_CACHE_FILE = CODEX_HOME / "models_cache.json"
 SKILLS_DIR = CODEX_HOME / "skills"
 PORTAL_TOKEN_FILE = CODEX_HOME / "mobile_portal_token.txt"
 DESKTOP_REFRESH_SIGNAL_FILE = CODEX_HOME / "desktop_refresh_signal.json"
+RELEASES_DIR = Path(__file__).resolve().parent / "release"
 CODEX_BIN = "codex.cmd" if os.name == "nt" else "codex"
 RUNNING_JOB_GRACE_SECONDS = 8
 OWNER_HEARTBEAT_TIMEOUT_SECONDS = 30
 PROCESS_EXIT_GRACE_SECONDS = 1.0
 TAILSCALE_WINDOWS_PATH = Path(r"C:\Program Files\Tailscale\tailscale.exe")
+FILE_SHARE_TTL_SECONDS = 30 * 60
+SUPPORTED_SHARED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf"}
+ALLOWED_DOWNLOAD_FILES = {"codex-mobile-debug.apk", "codex-session-manager-windows-x64.zip"}
 
 
 @dataclass
@@ -107,6 +112,21 @@ def apply_session_notes(items: list["SessionItem"], notes: dict[str, str]) -> li
     return [replace(item, note=notes.get(item.session_id, item.note)) for item in items]
 
 
+def apply_session_overrides(items: list["SessionItem"], overrides: dict[str, dict[str, str]]) -> list["SessionItem"]:
+    updated: list[SessionItem] = []
+    for item in items:
+        override = overrides.get(item.session_id, {})
+        updated.append(
+            replace(
+                item,
+                model=str(override.get("model", item.model)),
+                approval_policy=str(override.get("approval_policy", item.approval_policy)),
+                sandbox_mode=str(override.get("sandbox_mode", item.sandbox_mode)),
+            )
+        )
+    return updated
+
+
 def copy_message_list(messages: list[dict[str, object]]) -> list[dict[str, object]]:
     return [dict(item) for item in messages]
 
@@ -127,6 +147,59 @@ def ensure_working_directory(current_path: str) -> Path:
     if not target.is_dir():
         raise NotADirectoryError("Path is not a directory.")
     return target
+
+
+def normalize_existing_file_path(raw_path: str, cwd: str = "") -> Path:
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        clean_cwd = cwd.strip()
+        if not clean_cwd:
+            raise FileNotFoundError("Path not found.")
+        candidate = Path(clean_cwd).expanduser() / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise FileNotFoundError("Path not found.") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError("File not found.")
+    return resolved
+
+
+def path_is_within_root(target: Path, root: Path) -> bool:
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def guess_shared_file_content_type(path: Path) -> str:
+    guessed, _ = mimetypes.guess_type(str(path))
+    if guessed:
+        return guessed
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return "application/pdf"
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".gif":
+        return "image/gif"
+    return "application/octet-stream"
+
+
+def guess_release_file_content_type(path: Path) -> str:
+    guessed, _ = mimetypes.guess_type(str(path))
+    if guessed:
+        return guessed
+    if path.suffix.lower() == ".apk":
+        return "application/vnd.android.package-archive"
+    if path.suffix.lower() == ".zip":
+        return "application/zip"
+    return "application/octet-stream"
 
 
 def flatten_message_content(content: list[dict[str, object]]) -> str:
@@ -329,6 +402,12 @@ def build_codex_subprocess_env(base_env: dict[str, str] | None = None) -> dict[s
     return env
 
 
+def current_proxy_summary(base_env: dict[str, str] | None = None) -> str:
+    env = build_codex_subprocess_env(base_env)
+    proxy_value = str(env.get("ALL_PROXY", "")).strip()
+    return proxy_value or "direct"
+
+
 def list_windows_process_rows() -> list[dict[str, object]]:
     if os.name != "nt":
         return []
@@ -382,8 +461,9 @@ def find_conflicting_interactive_session_pids(session_id: str, processes: list[d
 class CodexDataStore:
     def __init__(self) -> None:
         self.notes_lock = threading.Lock()
+        self.settings_lock = threading.Lock()
         self.cache_lock = threading.Lock()
-        self._sessions_signature: tuple[int, int] | None = None
+        self._sessions_signature: tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[int, int] | None] | None = None
         self._sessions_cache: list[SessionItem] = []
         self._mcp_signature: tuple[int, int] | None = None
         self._mcp_cache: list[McpItem] = []
@@ -414,6 +494,35 @@ class CodexDataStore:
         with self.notes_lock:
             NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
             NOTES_FILE.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_session_settings(self) -> dict[str, dict[str, str]]:
+        if not SETTINGS_FILE.exists():
+            return {}
+        try:
+            raw = SETTINGS_FILE.read_text(encoding="utf-8-sig", errors="ignore")
+            obj = json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(obj, dict):
+            return {}
+        out: dict[str, dict[str, str]] = {}
+        for key, value in obj.items():
+            sid = str(key).strip()
+            if not sid or not isinstance(value, dict):
+                continue
+            entry: dict[str, str] = {}
+            for field_name in ("model", "approval_policy", "sandbox_mode"):
+                field_value = str(value.get(field_name, "")).strip()
+                if field_value:
+                    entry[field_name] = field_value
+            if entry:
+                out[sid] = entry
+        return out
+
+    def save_session_settings(self, settings: dict[str, dict[str, str]]) -> None:
+        with self.settings_lock:
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def append_history_entry(
         self,
@@ -482,12 +591,13 @@ class CodexDataStore:
 
     def load_sessions(self) -> list[SessionItem]:
         notes = self.load_session_notes()
+        overrides = self.load_session_settings()
         if not HISTORY_FILE.exists():
             return []
-        history_signature = path_signature(HISTORY_FILE)
+        history_signature = (path_signature(HISTORY_FILE), path_signature(NOTES_FILE), path_signature(SETTINGS_FILE))
         with self.cache_lock:
             if history_signature == self._sessions_signature and self._sessions_cache:
-                return apply_session_notes(self._sessions_cache, notes)
+                return apply_session_overrides(apply_session_notes(self._sessions_cache, notes), overrides)
 
         latest: dict[str, dict[str, int | str]] = {}
 
@@ -537,7 +647,7 @@ class CodexDataStore:
         with self.cache_lock:
             self._sessions_signature = history_signature
             self._sessions_cache = items
-        return apply_session_notes(items, notes)
+        return apply_session_overrides(apply_session_notes(items, notes), overrides)
 
     def load_messages(self, session_id: str) -> list[dict[str, object]]:
         history_signature = path_signature(HISTORY_FILE)
@@ -795,11 +905,30 @@ class CodexDataStore:
             notes.pop(session_id, None)
         self.save_session_notes(notes)
 
+    def set_session_settings(self, session_id: str, model: str, approval_policy: str, sandbox_mode: str) -> dict[str, str]:
+        settings = self.load_session_settings()
+        payload = {
+            "model": model.strip(),
+            "approval_policy": approval_policy.strip(),
+            "sandbox_mode": sandbox_mode.strip(),
+        }
+        cleaned = {key: value for key, value in payload.items() if value and value != "default"}
+        if cleaned:
+            settings[session_id] = cleaned
+        else:
+            settings.pop(session_id, None)
+        self.save_session_settings(settings)
+        return cleaned
+
     def delete_session(self, session_id: str) -> None:
         notes = self.load_session_notes()
         if session_id in notes:
             notes.pop(session_id, None)
             self.save_session_notes(notes)
+        settings = self.load_session_settings()
+        if session_id in settings:
+            settings.pop(session_id, None)
+            self.save_session_settings(settings)
 
         if HISTORY_FILE.exists():
             lines_out: list[str] = []
@@ -1485,12 +1614,42 @@ class PortalService:
         self.token = token
         self.data_store = CodexDataStore()
         self.jobs = JobRunner(self.data_store)
+        self.shared_files_lock = threading.Lock()
+        self.shared_files: dict[str, dict[str, object]] = {}
 
     def request_desktop_refresh(self, source: str = "mobile") -> dict[str, object]:
         payload = {"ts": now_ts(), "source": source}
         DESKTOP_REFRESH_SIGNAL_FILE.parent.mkdir(parents=True, exist_ok=True)
         DESKTOP_REFRESH_SIGNAL_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return {"ok": True, **payload}
+
+    def download_page_html(self) -> str:
+        token = self.token
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Codex Downloads</title>
+  <style>
+    body {{ font-family: Segoe UI, Arial, sans-serif; background:#0b1220; color:#e8eefc; margin:0; padding:24px; }}
+    .card {{ max-width:720px; margin:0 auto; background:#14213d; border:1px solid #26486f; border-radius:16px; padding:24px; }}
+    h1 {{ margin-top:0; font-size:28px; }}
+    p {{ color:#b8c4e0; line-height:1.5; }}
+    a.btn {{ display:inline-block; margin:12px 12px 0 0; padding:12px 16px; border-radius:10px; background:#79e0d4; color:#0b1220; text-decoration:none; font-weight:600; }}
+    code {{ background:#0f172a; padding:2px 6px; border-radius:6px; color:#d8e4ff; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Codex Downloads</h1>
+    <p>Download the latest build from this computer over Tailscale.</p>
+    <a class="btn" href="/downloads/codex-mobile-debug.apk?token={token}">Download Android APK</a>
+    <a class="btn" href="/downloads/codex-session-manager-windows-x64.zip?token={token}">Download Windows ZIP</a>
+    <p><code>{RELEASES_DIR}</code></p>
+  </div>
+</body>
+</html>"""
 
     def bootstrap_payload(self) -> dict[str, object]:
         sessions: list[dict[str, object]] = []
@@ -1507,6 +1666,7 @@ class PortalService:
             "approval_options": ["default", "untrusted", "on-request", "never"],
             "sandbox_options": ["default", "read-only", "workspace-write", "danger-full-access"],
             "recent_cwds": self.jobs.list_recent_cwds(),
+            "proxy_summary": current_proxy_summary(),
         }
 
     def session_payload(self, session_id: str) -> dict[str, object] | None:
@@ -1518,7 +1678,97 @@ class PortalService:
             session["is_replying"] = self.jobs.active_job_for_session(session_id) is not None
         payload["owner"] = self.jobs.current_owner(session_id)
         payload["active_job"] = self.jobs.active_job_for_session(session_id)
+        payload["proxy_summary"] = current_proxy_summary()
+        payload["models"] = ["default", *self.data_store.load_available_models()]
+        payload["approval_options"] = ["default", "untrusted", "on-request", "never"]
+        payload["sandbox_options"] = ["default", "read-only", "workspace-write", "danger-full-access"]
         return payload
+
+    def update_session_settings(self, session_id: str, model: str, approval_policy: str, sandbox_mode: str) -> dict[str, object]:
+        self.data_store.set_session_settings(session_id, model, approval_policy, sandbox_mode)
+        payload = self.session_payload(session_id)
+        if payload is None:
+            raise FileNotFoundError("Session not found.")
+        return payload
+
+    def create_file_share(self, session_id: str, raw_path: str) -> dict[str, object]:
+        clean_session_id = session_id.strip()
+        clean_path = raw_path.strip()
+        if not clean_session_id:
+            raise ValueError("Session id is required.")
+        if not clean_path:
+            raise ValueError("Path is required.")
+
+        session_payload = self.session_payload(clean_session_id)
+        if session_payload is None:
+            raise FileNotFoundError("Session not found.")
+        session = session_payload.get("session")
+        session_cwd = ""
+        if isinstance(session, dict):
+            session_cwd = str(session.get("cwd", "")).strip()
+
+        resolved_path = normalize_existing_file_path(clean_path, cwd=session_cwd)
+        if resolved_path.suffix.lower() not in SUPPORTED_SHARED_SUFFIXES:
+            raise ValueError("Unsupported file type for browser sharing.")
+
+        allowed_roots: list[Path] = []
+        for root_value in [session_cwd, *self.jobs.list_recent_cwds()]:
+            clean_root = root_value.strip()
+            if not clean_root:
+                continue
+            try:
+                root_path = Path(clean_root).expanduser().resolve(strict=True)
+            except OSError:
+                continue
+            if not root_path.is_dir():
+                continue
+            if all(existing != root_path for existing in allowed_roots):
+                allowed_roots.append(root_path)
+
+        if not any(path_is_within_root(resolved_path, root) for root in allowed_roots):
+            raise PermissionError("File path is outside the allowed shared roots.")
+
+        share_id = secrets.token_urlsafe(18)
+        expires_at = now_ts() + FILE_SHARE_TTL_SECONDS
+        entry = {
+            "share_id": share_id,
+            "path": resolved_path,
+            "content_type": guess_shared_file_content_type(resolved_path),
+            "file_name": resolved_path.name,
+            "expires_at": expires_at,
+            "session_id": clean_session_id,
+        }
+        with self.shared_files_lock:
+            self._prune_expired_shared_files_locked()
+            self.shared_files[share_id] = entry
+        return {
+            "share_id": share_id,
+            "relative_url": f"/files/{share_id}?token={self.token}",
+            "file_name": resolved_path.name,
+            "content_type": entry["content_type"],
+            "expires_at": expires_at,
+        }
+
+    def resolve_file_share(self, share_id: str) -> dict[str, object]:
+        clean_share_id = share_id.strip()
+        if not clean_share_id:
+            raise FileNotFoundError("Shared file link not found.")
+        with self.shared_files_lock:
+            self._prune_expired_shared_files_locked()
+            entry = self.shared_files.get(clean_share_id)
+            if entry is None:
+                raise FileNotFoundError("Shared file link not found.")
+            return dict(entry)
+
+    def _prune_expired_shared_files_locked(self) -> None:
+        current_ts = now_ts()
+        expired_ids = [
+            share_id
+            for share_id, entry in self.shared_files.items()
+            if int(entry.get("expires_at", 0) or 0) <= current_ts
+        ]
+        for share_id in expired_ids:
+            self.shared_files.pop(share_id, None)
 
     def tailscale_urls(self) -> list[str]:
         cli = find_tailscale_cli()
@@ -2089,6 +2339,34 @@ class PortalHandler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
+        if parsed.path == "/downloads":
+            self._send_html(self.portal.download_page_html())
+            return
+        if parsed.path.startswith("/downloads/"):
+            file_name = parsed.path.removeprefix("/downloads/").strip()
+            if file_name not in ALLOWED_DOWNLOAD_FILES:
+                self._send_json({"error": "File not found."}, status=HTTPStatus.NOT_FOUND)
+                return
+            file_path = RELEASES_DIR / file_name
+            self._send_binary_file(
+                file_path=file_path,
+                content_type=guess_release_file_content_type(file_path),
+                file_name=file_name,
+            )
+            return
+        if parsed.path.startswith("/files/"):
+            share_id = parsed.path.removeprefix("/files/")
+            try:
+                share = self.portal.resolve_file_share(share_id)
+            except FileNotFoundError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_binary_file(
+                file_path=Path(str(share["path"])),
+                content_type=str(share["content_type"]),
+                file_name=str(share["file_name"]),
+            )
+            return
         if parsed.path.startswith("/api/sessions/") and parsed.path.endswith("/owner"):
             session_id = parsed.path.split("/")[3]
             self._send_json({"owner": self.portal.jobs.current_owner(session_id)})
@@ -2131,6 +2409,23 @@ class PortalHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         payload = self._read_json_body()
+        if parsed.path == "/api/files/share":
+            try:
+                result = self.portal.create_file_share(
+                    session_id=str(payload.get("session_id", "")),
+                    raw_path=str(payload.get("path", "")),
+                )
+            except FileNotFoundError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+                return
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result, status=HTTPStatus.CREATED)
+            return
         if parsed.path == "/api/fs/mkdir":
             path_value = str(payload.get("path", "")).strip()
             try:
@@ -2144,6 +2439,20 @@ class PortalHandler(BaseHTTPRequestHandler):
             session_id = parsed.path.split("/")[3]
             self.portal.data_store.set_note(session_id, str(payload.get("note", "")))
             self._send_json({"ok": True})
+            return
+        if parsed.path.startswith("/api/sessions/") and parsed.path.endswith("/settings"):
+            session_id = parsed.path.split("/")[3]
+            try:
+                result = self.portal.update_session_settings(
+                    session_id=session_id,
+                    model=str(payload.get("model", "default")),
+                    approval_policy=str(payload.get("approval_policy", "default")),
+                    sandbox_mode=str(payload.get("sandbox_mode", "default")),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
             return
         if parsed.path.startswith("/api/sessions/") and parsed.path.endswith("/claim"):
             session_id = parsed.path.split("/")[3]
@@ -2289,6 +2598,20 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_binary_file(self, file_path: Path, content_type: str, file_name: str) -> None:
+        try:
+            data = file_path.read_bytes()
+        except OSError:
+            self._send_json({"error": "File not found."}, status=HTTPStatus.NOT_FOUND)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'inline; filename="{file_name}"')
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 

@@ -31,6 +31,8 @@ AUTO_REFRESH_MS = 2500
 DESKTOP_SIGNAL_POLL_MS = 500
 PORTAL_TIMEOUT_SECONDS = 0.25
 PORTAL_BACKOFF_SECONDS = 5.0
+TERMINAL_PROXY_SCHEMES = ("http", "socks5", "socks5h")
+DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1,.local,.ts.net"
 
 
 @dataclass
@@ -97,6 +99,41 @@ def flatten_message_content(content: list[dict[str, object]]) -> str:
     return "\n\n".join(parts).strip()
 
 
+def build_start_process_command(ps_command: str, run_as_admin: bool) -> str:
+    args = ["-NoProfile", "-NoExit", "-Command", ps_command]
+    start_process = "Start-Process powershell "
+    if run_as_admin:
+        start_process += "-Verb RunAs "
+    arg_items = ["'" + value.replace("'", "''") + "'" for value in args]
+    start_process += f"-ArgumentList @({','.join(arg_items)})"
+    return start_process
+
+
+def build_proxy_environment_ps_prefix(enabled: bool, scheme: str, host: str, port_text: str) -> str:
+    if not enabled:
+        return (
+            "$env:HTTP_PROXY=$null; $env:HTTPS_PROXY=$null; $env:ALL_PROXY=$null; "
+            "$env:http_proxy=$null; $env:https_proxy=$null; $env:all_proxy=$null; "
+            f"$env:NO_PROXY='{DEFAULT_NO_PROXY}'; $env:no_proxy=$env:NO_PROXY; "
+        )
+    clean_scheme = scheme.strip().lower() or "http"
+    clean_host = host.strip() or "127.0.0.1"
+    if not port_text.isdigit():
+        raise ValueError("Proxy port must be an integer.")
+    port = int(port_text)
+    if port < 1 or port > 65535:
+        raise ValueError("Proxy port must be between 1 and 65535.")
+    proxy_url = f"{clean_scheme}://{clean_host}:{port}"
+    proxy_escaped = proxy_url.replace("'", "''")
+    no_proxy_escaped = DEFAULT_NO_PROXY.replace("'", "''")
+    return (
+        f"$proxy='{proxy_escaped}'; "
+        "$env:HTTP_PROXY=$proxy; $env:HTTPS_PROXY=$proxy; $env:ALL_PROXY=$proxy; "
+        "$env:http_proxy=$proxy; $env:https_proxy=$proxy; $env:all_proxy=$proxy; "
+        f"$env:NO_PROXY='{no_proxy_escaped}'; $env:no_proxy=$env:NO_PROXY; "
+    )
+
+
 class SessionManagerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -155,7 +192,7 @@ class SessionManagerApp:
         self.show_last_text_var = tk.BooleanVar(value=True)
         self.use_global_defaults_var = tk.BooleanVar(value=True)
         self.use_proxy_var = tk.BooleanVar(value=True)
-        self.proxy_scheme_var = tk.StringVar(value="socks5")
+        self.proxy_scheme_var = tk.StringVar(value="socks5h")
         self.proxy_host_var = tk.StringVar(value="127.0.0.1")
         self.proxy_port_var = tk.StringVar(value="7897")
 
@@ -200,7 +237,7 @@ class SessionManagerApp:
         self.use_proxy_check.grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Label(launch, text="Type").grid(row=1, column=1, sticky="e", padx=(0, 6), pady=(8, 0))
         self.proxy_scheme_box = ttk.Combobox(launch, textvariable=self.proxy_scheme_var, state="readonly", width=10)
-        self.proxy_scheme_box["values"] = ("http", "socks5")
+        self.proxy_scheme_box["values"] = TERMINAL_PROXY_SCHEMES
         self.proxy_scheme_box.grid(row=1, column=2, sticky="w", pady=(8, 0))
         ttk.Label(launch, text="Host").grid(row=1, column=3, sticky="e", padx=(0, 6), pady=(8, 0))
         self.proxy_host_entry = ttk.Entry(launch, textvariable=self.proxy_host_var, width=20)
@@ -978,25 +1015,11 @@ class SessionManagerApp:
         return " ".join(escaped)
 
     def _build_proxy_ps_prefix(self) -> str:
-        if not self.use_proxy_var.get():
-            return ""
-        scheme = self.proxy_scheme_var.get().strip().lower() or "http"
-        host = self.proxy_host_var.get().strip() or "127.0.0.1"
-        port_text = self.proxy_port_var.get().strip()
-        if not port_text.isdigit():
-            raise ValueError("Proxy port must be an integer.")
-        port = int(port_text)
-        if port < 1 or port > 65535:
-            raise ValueError("Proxy port must be between 1 and 65535.")
-        proxy_url = f"{scheme}://{host}:{port}"
-        proxy_escaped = proxy_url.replace("'", "''")
-        no_proxy = "localhost,127.0.0.1,::1"
-        no_proxy_escaped = no_proxy.replace("'", "''")
-        return (
-            f"$proxy='{proxy_escaped}'; "
-            "$env:HTTP_PROXY=$proxy; $env:HTTPS_PROXY=$proxy; $env:ALL_PROXY=$proxy; "
-            "$env:http_proxy=$proxy; $env:https_proxy=$proxy; $env:all_proxy=$proxy; "
-            f"$env:NO_PROXY='{no_proxy_escaped}'; $env:no_proxy=$env:NO_PROXY; "
+        return build_proxy_environment_ps_prefix(
+            enabled=self.use_proxy_var.get(),
+            scheme=self.proxy_scheme_var.get(),
+            host=self.proxy_host_var.get(),
+            port_text=self.proxy_port_var.get(),
         )
 
     def _toggle_proxy_controls(self) -> None:
@@ -1079,14 +1102,7 @@ class SessionManagerApp:
             messagebox.showerror("Invalid Proxy", str(exc))
             return
 
-        args = ["-NoExit", "-Command", ps_command]
-        start_process = "Start-Process powershell "
-        if self.admin_var.get():
-            start_process += "-Verb RunAs "
-        arg_items: list[str] = []
-        for a in args:
-            arg_items.append("'" + a.replace("'", "''") + "'")
-        start_process += f"-ArgumentList @({','.join(arg_items)})"
+        start_process = build_start_process_command(ps_command, self.admin_var.get())
 
         try:
             subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", start_process])
@@ -1112,14 +1128,7 @@ class SessionManagerApp:
         except ValueError as exc:
             messagebox.showerror("Invalid Proxy", str(exc))
             return
-        args = ["-NoExit", "-Command", ps_command]
-        start_process = "Start-Process powershell "
-        if self.admin_var.get():
-            start_process += "-Verb RunAs "
-        arg_items: list[str] = []
-        for a in args:
-            arg_items.append("'" + a.replace("'", "''") + "'")
-        start_process += f"-ArgumentList @({','.join(arg_items)})"
+        start_process = build_start_process_command(ps_command, self.admin_var.get())
 
         try:
             subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", start_process])

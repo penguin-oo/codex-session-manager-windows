@@ -10,7 +10,8 @@
         android:id="@+id/toolbar"
         android:layout_width="match_parent"
         android:layout_height="?attr/actionBarSize"
-        android:background="@color/bg_panel" />
+        android:background="@color/bg_panel"
+        app:popupTheme="@style/ThemeOverlay.CodexMobile.PopupMenu" />
 
     <TextView
         android:id="@+id/headerMetaText"
@@ -18,7 +19,7 @@
         android:layout_height="wrap_content"
         android:background="@color/bg_panel"
         android:ellipsize="end"
-        android:maxLines="2"
+        android:maxLines="3"
         android:paddingHorizontal="18dp"
         android:paddingBottom="14dp"
         android:textColor="@color/text_muted"
