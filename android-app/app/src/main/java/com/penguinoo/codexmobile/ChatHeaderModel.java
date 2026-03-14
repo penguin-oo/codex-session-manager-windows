@@ -16,10 +16,12 @@ public final class ChatHeaderModel {
         String model = session == null || session.model == null || session.model.isEmpty() ? "default" : session.model;
         String approval = session == null || session.approvalPolicy == null || session.approvalPolicy.isEmpty() ? "default" : session.approvalPolicy;
         String sandbox = session == null || session.sandboxMode == null || session.sandboxMode.isEmpty() ? "default" : session.sandboxMode;
+        String reasoning = session == null || session.reasoningEffort == null || session.reasoningEffort.isEmpty() ? "default" : session.reasoningEffort;
         String proxy = proxySummary == null || proxySummary.isEmpty() ? "default" : proxySummary;
         String settingsLine = "Model " + model
                 + " | Approval " + approval
                 + " | Sandbox " + sandbox
+                + " | Reasoning " + reasoning
                 + " | Proxy " + proxy;
         if (primaryLine.isEmpty()) {
             return settingsLine;

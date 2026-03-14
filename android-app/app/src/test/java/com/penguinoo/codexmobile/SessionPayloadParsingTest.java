@@ -20,6 +20,7 @@ public final class SessionPayloadParsingTest {
                         .put("model", "gpt-5")
                         .put("approval_policy", "default")
                         .put("sandbox_mode", "workspace-write")
+                        .put("reasoning_effort", "high")
                         .put("is_replying", true))
                 .put("messages", new JSONArray())
                 .put("active_job", new JSONObject()
@@ -35,6 +36,7 @@ public final class SessionPayloadParsingTest {
                 .put("models", new JSONArray().put("default").put("gpt-5").put("gpt-5.4"))
                 .put("approval_options", new JSONArray().put("default").put("never"))
                 .put("sandbox_options", new JSONArray().put("default").put("danger-full-access"))
+                .put("reasoning_options", new JSONArray().put("default").put("high").put("xhigh"))
                 .put("proxy_summary", "socks5h://127.0.0.1:7897");
 
         SessionPayload payload = PortalApiClient.parseSessionPayload(json);
@@ -46,6 +48,8 @@ public final class SessionPayloadParsingTest {
         assertEquals("gpt-5.4", payload.modelOptions.get(2));
         assertEquals("never", payload.approvalOptions.get(1));
         assertEquals("danger-full-access", payload.sandboxOptions.get(1));
+        assertEquals("xhigh", payload.reasoningOptions.get(2));
+        assertEquals("high", payload.session.reasoningEffort);
         assertEquals("socks5h://127.0.0.1:7897", payload.proxySummary);
     }
 }

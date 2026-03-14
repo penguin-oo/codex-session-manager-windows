@@ -9,6 +9,7 @@ public final class SessionPayload {
     public final List<String> modelOptions;
     public final List<String> approvalOptions;
     public final List<String> sandboxOptions;
+    public final List<String> reasoningOptions;
     public final String proxySummary;
 
     public SessionPayload(
@@ -18,6 +19,7 @@ public final class SessionPayload {
             List<String> modelOptions,
             List<String> approvalOptions,
             List<String> sandboxOptions,
+            List<String> reasoningOptions,
             String proxySummary
     ) {
         this.session = session;
@@ -26,6 +28,7 @@ public final class SessionPayload {
         this.modelOptions = modelOptions;
         this.approvalOptions = approvalOptions;
         this.sandboxOptions = sandboxOptions;
+        this.reasoningOptions = reasoningOptions;
         this.proxySummary = proxySummary;
     }
 }

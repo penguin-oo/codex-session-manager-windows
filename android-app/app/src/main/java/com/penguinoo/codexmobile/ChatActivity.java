@@ -78,6 +78,7 @@ public final class ChatActivity extends AppCompatActivity {
     private List<String> sessionModelOptions = new ArrayList<>();
     private List<String> sessionApprovalOptions = new ArrayList<>();
     private List<String> sessionSandboxOptions = new ArrayList<>();
+    private List<String> sessionReasoningOptions = new ArrayList<>();
     private String currentProxySummary = "";
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final List<ChatMessage> persistedMessages = new ArrayList<>();
@@ -311,6 +312,7 @@ public final class ChatActivity extends AppCompatActivity {
         sessionModelOptions = new ArrayList<>(payload.modelOptions);
         sessionApprovalOptions = new ArrayList<>(payload.approvalOptions);
         sessionSandboxOptions = new ArrayList<>(payload.sandboxOptions);
+        sessionReasoningOptions = new ArrayList<>(payload.reasoningOptions);
         currentProxySummary = payload.proxySummary == null ? "" : payload.proxySummary;
         if (payload.session != null && payload.session.sessionId != null && !payload.session.sessionId.isEmpty()) {
             adoptSessionId(payload.session.sessionId);
@@ -395,6 +397,7 @@ public final class ChatActivity extends AppCompatActivity {
                         safeLaunchValue(currentSession.model),
                         safeLaunchValue(currentSession.approvalPolicy),
                         safeLaunchValue(currentSession.sandboxMode),
+                        safeLaunchValue(currentSession.reasoningEffort),
                         currentLease.leaseId,
                         imageAttachment
                 );
@@ -710,6 +713,7 @@ public final class ChatActivity extends AppCompatActivity {
         Spinner modelSpinner = buildSettingsSpinner(sessionModelOptions, effectiveSessionValue(currentSession.model));
         Spinner approvalSpinner = buildSettingsSpinner(sessionApprovalOptions, effectiveSessionValue(currentSession.approvalPolicy));
         Spinner sandboxSpinner = buildSettingsSpinner(sessionSandboxOptions, effectiveSessionValue(currentSession.sandboxMode));
+        Spinner reasoningSpinner = buildSettingsSpinner(sessionReasoningOptions, effectiveSessionValue(currentSession.reasoningEffort));
 
         container.addView(buildSettingsLabel(R.string.label_model));
         container.addView(modelSpinner);
@@ -717,6 +721,8 @@ public final class ChatActivity extends AppCompatActivity {
         container.addView(approvalSpinner);
         container.addView(buildSettingsLabel(R.string.label_sandbox));
         container.addView(sandboxSpinner);
+        container.addView(buildSettingsLabel(R.string.label_reasoning));
+        container.addView(reasoningSpinner);
 
         TextView proxyText = buildSettingsLabelText(getString(R.string.label_proxy_summary, currentProxySummary.isEmpty() ? "direct" : currentProxySummary));
         proxyText.setPadding(0, dpToPx(16), 0, 0);
@@ -728,9 +734,10 @@ public final class ChatActivity extends AppCompatActivity {
                 .setPositiveButton(R.string.action_save, (dialog, which) -> saveSessionSettings(
                         selectedSpinnerValue(modelSpinner),
                         selectedSpinnerValue(approvalSpinner),
-                        selectedSpinnerValue(sandboxSpinner)
+                        selectedSpinnerValue(sandboxSpinner),
+                        selectedSpinnerValue(reasoningSpinner)
                 ))
-                .setNeutralButton(R.string.action_reset_defaults, (dialog, which) -> saveSessionSettings("default", "default", "default"))
+                .setNeutralButton(R.string.action_reset_defaults, (dialog, which) -> saveSessionSettings("default", "default", "default", "default"))
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
     }
@@ -800,11 +807,11 @@ public final class ChatActivity extends AppCompatActivity {
         });
     }
 
-    private void saveSessionSettings(String model, String approvalPolicy, String sandboxMode) {
+    private void saveSessionSettings(String model, String approvalPolicy, String sandboxMode, String reasoningEffort) {
         showBanner(getString(R.string.banner_saving_session_settings));
         executor.execute(() -> {
             try {
-                SessionPayload payload = apiClient.saveSessionSettings(endpoint, sessionId, model, approvalPolicy, sandboxMode);
+                SessionPayload payload = apiClient.saveSessionSettings(endpoint, sessionId, model, approvalPolicy, sandboxMode, reasoningEffort);
                 runOnUiThread(() -> {
                     renderPayload(payload);
                     showBanner(getString(R.string.banner_session_settings_saved));

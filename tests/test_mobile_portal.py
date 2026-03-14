@@ -64,13 +64,21 @@ class _FakeStore:
                 return {"session": mobile_portal.asdict(item), "messages": []}
         return None
 
-    def set_session_settings(self, session_id: str, model: str, approval_policy: str, sandbox_mode: str) -> dict[str, str]:
+    def set_session_settings(
+        self,
+        session_id: str,
+        model: str,
+        approval_policy: str,
+        sandbox_mode: str,
+        reasoning_effort: str,
+    ) -> dict[str, str]:
         cleaned = {
             key: value
             for key, value in {
                 "model": model.strip(),
                 "approval_policy": approval_policy.strip(),
                 "sandbox_mode": sandbox_mode.strip(),
+                "reasoning_effort": reasoning_effort.strip(),
             }.items()
             if value and value != "default"
         }
@@ -135,7 +143,7 @@ class JobRunnerOwnershipTests(unittest.TestCase):
         }
 
         with mock.patch.object(runner, "_run_resume_job"), mock.patch.object(runner, "_is_pid_running", return_value=False):
-            result = runner.start_resume_job("session-1", "hello again", "default", "default", "default")
+            result = runner.start_resume_job("session-1", "hello again", "default", "default", "default", "default")
 
         self.assertIn("job_id", result)
         self.assertIn("session-1", runner.active_sessions)
@@ -206,7 +214,7 @@ class JobRunnerOwnershipTests(unittest.TestCase):
             {"ProcessId": 11, "CommandLine": "codex.exe resume session-1"}
         ]):
             with self.assertRaisesRegex(RuntimeError, "desktop Codex terminal"):
-                runner.start_resume_job("session-1", "hello again", "default", "default", "default")
+                runner.start_resume_job("session-1", "hello again", "default", "default", "default", "default")
 
     def test_run_resume_job_records_user_history_for_forked_session_with_job_created_timestamp(self) -> None:
         runner = mobile_portal.JobRunner(mobile_portal.CodexDataStore())
@@ -235,6 +243,7 @@ class JobRunnerOwnershipTests(unittest.TestCase):
                 "default",
                 "default",
                 "default",
+                "default",
             )
 
         append_history_entry.assert_not_called()
@@ -246,6 +255,7 @@ class JobRunnerOwnershipTests(unittest.TestCase):
                 str(Path.cwd()),
                 "session-1",
                 "hello from mobile",
+                "default",
                 "default",
                 "default",
                 "default",
@@ -331,6 +341,7 @@ class JobRunnerOwnershipTests(unittest.TestCase):
                 "job-1",
                 str(Path.cwd()),
                 "hello from new chat",
+                "default",
                 "default",
                 "default",
                 "default",
@@ -429,12 +440,13 @@ class PortalServiceBootstrapTests(unittest.TestCase):
         service.data_store = fake_store
         service.jobs = mobile_portal.JobRunner(fake_store)
 
-        payload = service.update_session_settings("session-1", "gpt-5.4", "never", "danger-full-access")
+        payload = service.update_session_settings("session-1", "gpt-5.4", "never", "danger-full-access", "high")
 
         session_payload = payload["session"]
         self.assertEqual("gpt-5.4", session_payload["model"])
         self.assertEqual("never", session_payload["approval_policy"])
         self.assertEqual("danger-full-access", session_payload["sandbox_mode"])
+        self.assertEqual("high", session_payload["reasoning_effort"])
 
 
 class PortalFileShareTests(unittest.TestCase):
@@ -545,10 +557,12 @@ class ResumeArgsTests(unittest.TestCase):
             model="gpt-5",
             sandbox="workspace-write",
             approval="never",
+            reasoning_effort="medium",
             image_paths=[image_file],
         )
 
         self.assertEqual(["resume", "-i", str(image_file), "session-1", "describe this"], args[-5:])
+        self.assertIn('model_reasoning_effort="medium"', args)
 
     def test_build_resume_args_omits_blank_prompt_for_image_only_message(self) -> None:
         args = mobile_portal.build_resume_args(
@@ -558,6 +572,7 @@ class ResumeArgsTests(unittest.TestCase):
             model="default",
             sandbox="default",
             approval="default",
+            reasoning_effort="default",
             image_paths=[Path("photo.png")],
         )
 

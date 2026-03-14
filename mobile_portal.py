@@ -29,6 +29,7 @@ except ModuleNotFoundError:
 APP_TITLE = "Codex Mobile Portal"
 DEFAULT_PROXY_URL = "socks5h://127.0.0.1:7897"
 DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1"
+REASONING_EFFORT_OPTIONS = ["default", "low", "medium", "high", "xhigh"]
 CODEX_HOME = Path(os.environ.get("USERPROFILE", "")) / ".codex"
 HISTORY_FILE = CODEX_HOME / "history.jsonl"
 NOTES_FILE = CODEX_HOME / "session_notes.json"
@@ -63,6 +64,7 @@ class SessionItem:
     sandbox_mode: str
     turn_id: str
     session_file: str
+    reasoning_effort: str = ""
 
 
 @dataclass
@@ -122,6 +124,7 @@ def apply_session_overrides(items: list["SessionItem"], overrides: dict[str, dic
                 model=str(override.get("model", item.model)),
                 approval_policy=str(override.get("approval_policy", item.approval_policy)),
                 sandbox_mode=str(override.get("sandbox_mode", item.sandbox_mode)),
+                reasoning_effort=str(override.get("reasoning_effort", item.reasoning_effort)),
             )
         )
     return updated
@@ -238,6 +241,7 @@ def build_resume_args(
     model: str,
     sandbox: str,
     approval: str,
+    reasoning_effort: str,
     image_paths: list[Path] | None = None,
 ) -> list[str]:
     args = [CODEX_BIN, "exec", "--json", "-o", str(output_file), "--skip-git-repo-check"]
@@ -247,6 +251,8 @@ def build_resume_args(
         args.extend(["-s", sandbox])
     if approval and approval != "default":
         args.extend(["-c", f'approval_policy="{approval}"'])
+    if reasoning_effort and reasoning_effort != "default":
+        args.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
     args.append("resume")
     for image_path in image_paths or []:
         args.extend(["-i", str(image_path)])
@@ -511,7 +517,7 @@ class CodexDataStore:
             if not sid or not isinstance(value, dict):
                 continue
             entry: dict[str, str] = {}
-            for field_name in ("model", "approval_policy", "sandbox_mode"):
+            for field_name in ("model", "approval_policy", "sandbox_mode", "reasoning_effort"):
                 field_value = str(value.get(field_name, "")).strip()
                 if field_value:
                     entry[field_name] = field_value
@@ -562,6 +568,7 @@ class CodexDataStore:
             "approval_policy": "",
             "sandbox_mode": "",
             "turn_id": "",
+            "reasoning_effort": "",
         }
         try:
             with open(session_file, "r", encoding="utf-8") as handle:
@@ -581,6 +588,7 @@ class CodexDataStore:
                     details["cwd"] = str(payload.get("cwd", details["cwd"]))
                     details["model"] = str(payload.get("model", details["model"]))
                     details["approval_policy"] = str(payload.get("approval_policy", details["approval_policy"]))
+                    details["reasoning_effort"] = str(payload.get("model_reasoning_effort", details["reasoning_effort"]))
                     sandbox_policy = payload.get("sandbox_policy", {})
                     if isinstance(sandbox_policy, dict):
                         details["sandbox_mode"] = str(sandbox_policy.get("type", details["sandbox_mode"]))
@@ -905,12 +913,20 @@ class CodexDataStore:
             notes.pop(session_id, None)
         self.save_session_notes(notes)
 
-    def set_session_settings(self, session_id: str, model: str, approval_policy: str, sandbox_mode: str) -> dict[str, str]:
+    def set_session_settings(
+        self,
+        session_id: str,
+        model: str,
+        approval_policy: str,
+        sandbox_mode: str,
+        reasoning_effort: str,
+    ) -> dict[str, str]:
         settings = self.load_session_settings()
         payload = {
             "model": model.strip(),
             "approval_policy": approval_policy.strip(),
             "sandbox_mode": sandbox_mode.strip(),
+            "reasoning_effort": reasoning_effort.strip(),
         }
         cleaned = {key: value for key, value in payload.items() if value and value != "default"}
         if cleaned:
@@ -1150,6 +1166,7 @@ class JobRunner:
         model: str,
         sandbox: str,
         approval: str,
+        reasoning_effort: str,
         lease_id: str = "",
         owner_kind: str = "mobile",
         owner_label: str = "Mobile",
@@ -1215,7 +1232,7 @@ class JobRunner:
 
         thread = threading.Thread(
             target=self._run_resume_job,
-            args=(job_id, item.cwd or str(Path.home()), session_id, prompt, model, sandbox, approval, image_paths),
+            args=(job_id, item.cwd or str(Path.home()), session_id, prompt, model, sandbox, approval, reasoning_effort, image_paths),
             daemon=True,
         )
         try:
@@ -1226,7 +1243,16 @@ class JobRunner:
             raise
         return self.get_job(job_id) or {"job_id": job_id, "lease_id": lease_id.strip(), "status": "running"}
 
-    def start_new_chat_job(self, cwd: str, prompt: str, model: str, sandbox: str, approval: str, note: str) -> dict[str, object]:
+    def start_new_chat_job(
+        self,
+        cwd: str,
+        prompt: str,
+        model: str,
+        sandbox: str,
+        approval: str,
+        reasoning_effort: str,
+        note: str,
+    ) -> dict[str, object]:
         if not cwd.strip():
             raise ValueError("Working directory is required.")
         if not prompt.strip():
@@ -1256,7 +1282,7 @@ class JobRunner:
 
         thread = threading.Thread(
             target=self._run_new_chat_job,
-            args=(job_id, str(target), prompt, model, sandbox, approval),
+            args=(job_id, str(target), prompt, model, sandbox, approval, reasoning_effort),
             daemon=True,
         )
         thread.start()
@@ -1339,10 +1365,11 @@ class JobRunner:
         model: str,
         sandbox: str,
         approval: str,
+        reasoning_effort: str,
         image_paths: list[Path] | None = None,
     ) -> None:
         output_file = Path(tempfile.mkstemp(prefix="codex-mobile-out-", suffix=".txt")[1])
-        args = build_resume_args(output_file, session_id, prompt, model, sandbox, approval, image_paths or [])
+        args = build_resume_args(output_file, session_id, prompt, model, sandbox, approval, reasoning_effort, image_paths or [])
         queued_at = now_ts()
         with self.lock:
             job = self.jobs.get(job_id)
@@ -1372,7 +1399,16 @@ class JobRunner:
                 except OSError:
                     pass
 
-    def _run_new_chat_job(self, job_id: str, cwd: str, prompt: str, model: str, sandbox: str, approval: str) -> None:
+    def _run_new_chat_job(
+        self,
+        job_id: str,
+        cwd: str,
+        prompt: str,
+        model: str,
+        sandbox: str,
+        approval: str,
+        reasoning_effort: str,
+    ) -> None:
         output_file = Path(tempfile.mkstemp(prefix="codex-mobile-out-", suffix=".txt")[1])
         args = [CODEX_BIN, "exec", "--json", "-o", str(output_file)]
         if model and model != "default":
@@ -1381,6 +1417,8 @@ class JobRunner:
             args.extend(["-s", sandbox])
         if approval and approval != "default":
             args.extend(["-c", f'approval_policy="{approval}"'])
+        if reasoning_effort and reasoning_effort != "default":
+            args.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
         args.extend(["--skip-git-repo-check", prompt])
         queued_at = now_ts()
         with self.lock:
@@ -1665,6 +1703,7 @@ class PortalService:
             "models": ["default", *self.data_store.load_available_models()],
             "approval_options": ["default", "untrusted", "on-request", "never"],
             "sandbox_options": ["default", "read-only", "workspace-write", "danger-full-access"],
+            "reasoning_options": list(REASONING_EFFORT_OPTIONS),
             "recent_cwds": self.jobs.list_recent_cwds(),
             "proxy_summary": current_proxy_summary(),
         }
@@ -1682,10 +1721,18 @@ class PortalService:
         payload["models"] = ["default", *self.data_store.load_available_models()]
         payload["approval_options"] = ["default", "untrusted", "on-request", "never"]
         payload["sandbox_options"] = ["default", "read-only", "workspace-write", "danger-full-access"]
+        payload["reasoning_options"] = list(REASONING_EFFORT_OPTIONS)
         return payload
 
-    def update_session_settings(self, session_id: str, model: str, approval_policy: str, sandbox_mode: str) -> dict[str, object]:
-        self.data_store.set_session_settings(session_id, model, approval_policy, sandbox_mode)
+    def update_session_settings(
+        self,
+        session_id: str,
+        model: str,
+        approval_policy: str,
+        sandbox_mode: str,
+        reasoning_effort: str,
+    ) -> dict[str, object]:
+        self.data_store.set_session_settings(session_id, model, approval_policy, sandbox_mode, reasoning_effort)
         payload = self.session_payload(session_id)
         if payload is None:
             raise FileNotFoundError("Session not found.")
@@ -2020,6 +2067,7 @@ INDEX_HTML = """<!doctype html>
             <div class="field"><label for="modelSelect">Model</label><select id="modelSelect"></select></div>
             <div class="field"><label for="approvalSelect">Approval</label><select id="approvalSelect"></select></div>
             <div class="field"><label for="sandboxSelect">Sandbox</label><select id="sandboxSelect"></select></div>
+            <div class="field"><label for="reasoningSelect">Reasoning</label><select id="reasoningSelect"></select></div>
             <div class="field"><label>&nbsp;</label><button id="refreshSession">Refresh</button></div>
           </div>
         </div>
@@ -2050,6 +2098,7 @@ INDEX_HTML = """<!doctype html>
         <div class="field"><label for="newModelSelect">Model</label><select id="newModelSelect"></select></div>
         <div class="field"><label for="newApprovalSelect">Approval</label><select id="newApprovalSelect"></select></div>
         <div class="field"><label for="newSandboxSelect">Sandbox</label><select id="newSandboxSelect"></select></div>
+        <div class="field"><label for="newReasoningSelect">Reasoning</label><select id="newReasoningSelect"></select></div>
         <div class="field" style="grid-column:1 / -1;">
           <label for="newPromptInput">First message</label>
           <textarea id="newPromptInput" rows="6" placeholder="Describe what you want Codex to do."></textarea>
@@ -2144,9 +2193,11 @@ INDEX_HTML = """<!doctype html>
       fillSelect("modelSelect", state.bootstrap.models);
       fillSelect("approvalSelect", state.bootstrap.approval_options);
       fillSelect("sandboxSelect", state.bootstrap.sandbox_options);
+      fillSelect("reasoningSelect", state.bootstrap.reasoning_options || ["default"]);
       fillSelect("newModelSelect", state.bootstrap.models);
       fillSelect("newApprovalSelect", state.bootstrap.approval_options);
       fillSelect("newSandboxSelect", state.bootstrap.sandbox_options);
+      fillSelect("newReasoningSelect", state.bootstrap.reasoning_options || ["default"]);
       if (!document.getElementById("cwdInput").value && state.bootstrap.recent_cwds.length) {
         document.getElementById("cwdInput").value = state.bootstrap.recent_cwds[0];
       }
@@ -2176,7 +2227,7 @@ INDEX_HTML = """<!doctype html>
       renderSessions();
       const payload = await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
       const item = payload.session;
-      document.getElementById("detailHead").innerHTML = `<h2>${esc(item.text || item.session_id)}</h2><p>${esc(item.cwd || "-")}<br>${esc(item.session_id)}<br>Model: ${esc(item.model || "default")} | Approval: ${esc(item.approval_policy || "-")} | Sandbox: ${esc(item.sandbox_mode || "-")}</p>`;
+      document.getElementById("detailHead").innerHTML = `<h2>${esc(item.text || item.session_id)}</h2><p>${esc(item.cwd || "-")}<br>${esc(item.session_id)}<br>Model: ${esc(item.model || "default")} | Approval: ${esc(item.approval_policy || "-")} | Sandbox: ${esc(item.sandbox_mode || "-")} | Reasoning: ${esc(item.reasoning_effort || "default")}</p>`;
       document.getElementById("noteInput").value = item.note || "";
       document.getElementById("noteBox").hidden = false;
       document.getElementById("composerSettings").hidden = false;
@@ -2213,7 +2264,8 @@ INDEX_HTML = """<!doctype html>
           prompt,
           model: document.getElementById("modelSelect").value,
           approval: document.getElementById("approvalSelect").value,
-          sandbox: document.getElementById("sandboxSelect").value
+          sandbox: document.getElementById("sandboxSelect").value,
+          reasoning_effort: document.getElementById("reasoningSelect").value
         })
       });
       document.getElementById("promptInput").value = "";
@@ -2255,7 +2307,8 @@ INDEX_HTML = """<!doctype html>
           note: document.getElementById("newNoteInput").value,
           model: document.getElementById("newModelSelect").value,
           approval: document.getElementById("newApprovalSelect").value,
-          sandbox: document.getElementById("newSandboxSelect").value
+          sandbox: document.getElementById("newSandboxSelect").value,
+          reasoning_effort: document.getElementById("newReasoningSelect").value
         })
       });
       closeModal("newChatModal");
@@ -2448,6 +2501,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                     model=str(payload.get("model", "default")),
                     approval_policy=str(payload.get("approval_policy", "default")),
                     sandbox_mode=str(payload.get("sandbox_mode", "default")),
+                    reasoning_effort=str(payload.get("reasoning_effort", "default")),
                 )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -2502,6 +2556,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                     model=str(payload.get("model", "default")),
                     sandbox=str(payload.get("sandbox", "default")),
                     approval=str(payload.get("approval", "default")),
+                    reasoning_effort=str(payload.get("reasoning_effort", "default")),
                     lease_id=str(payload.get("lease_id", "")),
                     owner_kind=str(payload.get("owner_kind", "mobile")),
                     owner_label=str(payload.get("owner_label", "Mobile")),
@@ -2538,6 +2593,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                     model=str(payload.get("model", "default")),
                     sandbox=str(payload.get("sandbox", "default")),
                     approval=str(payload.get("approval", "default")),
+                    reasoning_effort=str(payload.get("reasoning_effort", "default")),
                 )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)

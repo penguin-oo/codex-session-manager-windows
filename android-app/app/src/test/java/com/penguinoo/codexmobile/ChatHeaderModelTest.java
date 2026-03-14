@@ -16,13 +16,14 @@ public final class ChatHeaderModelTest {
                 "gpt-5.4",
                 "never",
                 "danger-full-access",
+                "xhigh",
                 false
         );
 
         String metadata = ChatHeaderModel.metadataLine(session, "socks5h://127.0.0.1:7897");
 
         assertEquals(
-                "D:\\project\nModel gpt-5.4 | Approval never | Sandbox danger-full-access | Proxy socks5h://127.0.0.1:7897",
+                "D:\\project\nModel gpt-5.4 | Approval never | Sandbox danger-full-access | Reasoning xhigh | Proxy socks5h://127.0.0.1:7897",
                 metadata
         );
     }
@@ -38,13 +39,14 @@ public final class ChatHeaderModelTest {
                 "default",
                 "default",
                 "default",
+                "default",
                 false
         );
 
         String metadata = ChatHeaderModel.metadataLine(session, "default");
 
         assertEquals(
-                "movie export\nModel default | Approval default | Sandbox default | Proxy default",
+                "movie export\nModel default | Approval default | Sandbox default | Reasoning default | Proxy default",
                 metadata
         );
     }

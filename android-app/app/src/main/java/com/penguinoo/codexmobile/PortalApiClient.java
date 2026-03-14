@@ -26,7 +26,8 @@ public final class PortalApiClient {
                 parseSessions(json.optJSONArray("sessions")),
                 parseStringList(json.optJSONArray("models")),
                 parseStringList(json.optJSONArray("approval_options")),
-                parseStringList(json.optJSONArray("sandbox_options"))
+                parseStringList(json.optJSONArray("sandbox_options")),
+                parseStringList(json.optJSONArray("reasoning_options"))
         );
     }
 
@@ -42,10 +43,11 @@ public final class PortalApiClient {
             String model,
             String approval,
             String sandbox,
+            String reasoningEffort,
             String leaseId,
             ChatImageAttachment imageAttachment
     ) throws IOException {
-        JSONObject body = buildSendMessageBody(prompt, model, approval, sandbox, leaseId, imageAttachment);
+        JSONObject body = buildSendMessageBody(prompt, model, approval, sandbox, reasoningEffort, leaseId, imageAttachment);
         JSONObject json = postJson(endpoint, "/api/sessions/" + sessionId + "/message", body);
         return parseJob(json);
     }
@@ -55,6 +57,7 @@ public final class PortalApiClient {
             String model,
             String approval,
             String sandbox,
+            String reasoningEffort,
             String leaseId,
             ChatImageAttachment imageAttachment
     ) throws IOException {
@@ -64,6 +67,7 @@ public final class PortalApiClient {
             body.put("model", model);
             body.put("approval", approval);
             body.put("sandbox", sandbox);
+            body.put("reasoning_effort", reasoningEffort);
             body.put("lease_id", leaseId);
             body.put("owner_kind", "mobile");
             body.put("owner_label", "Mobile");
@@ -87,7 +91,8 @@ public final class PortalApiClient {
             String note,
             String model,
             String approval,
-            String sandbox
+            String sandbox,
+            String reasoningEffort
     ) throws IOException {
         JSONObject body = new JSONObject();
         try {
@@ -97,6 +102,7 @@ public final class PortalApiClient {
             body.put("model", model);
             body.put("approval", approval);
             body.put("sandbox", sandbox);
+            body.put("reasoning_effort", reasoningEffort);
         } catch (JSONException exception) {
             throw new IOException("Failed to build new chat request.", exception);
         }
@@ -163,13 +169,15 @@ public final class PortalApiClient {
             String sessionId,
             String model,
             String approvalPolicy,
-            String sandboxMode
+            String sandboxMode,
+            String reasoningEffort
     ) throws IOException {
         JSONObject body = new JSONObject();
         try {
             body.put("model", model);
             body.put("approval_policy", approvalPolicy);
             body.put("sandbox_mode", sandboxMode);
+            body.put("reasoning_effort", reasoningEffort);
         } catch (JSONException exception) {
             throw new IOException("Failed to build session-settings request.", exception);
         }
@@ -255,6 +263,7 @@ public final class PortalApiClient {
                 parseStringList(json.optJSONArray("models")),
                 parseStringList(json.optJSONArray("approval_options")),
                 parseStringList(json.optJSONArray("sandbox_options")),
+                parseStringList(json.optJSONArray("reasoning_options")),
                 json.optString("proxy_summary")
         );
     }
@@ -368,7 +377,7 @@ public final class PortalApiClient {
 
     private static SessionSummary parseSession(JSONObject item) {
         if (item == null) {
-            return new SessionSummary("", 0L, "", "", "", "", "", "", false);
+            return new SessionSummary("", 0L, "", "", "", "", "", "", "", false);
         }
         return new SessionSummary(
                 item.optString("session_id"),
@@ -379,6 +388,7 @@ public final class PortalApiClient {
                 item.optString("model"),
                 item.optString("approval_policy"),
                 item.optString("sandbox_mode"),
+                item.optString("reasoning_effort"),
                 item.optBoolean("is_replying", false)
         );
     }

@@ -268,6 +268,7 @@ public final class MainActivity extends AppCompatActivity {
         intent.putStringArrayListExtra(NewChatActivity.EXTRA_MODELS, new ArrayList<>(bootstrap.models));
         intent.putStringArrayListExtra(NewChatActivity.EXTRA_APPROVALS, new ArrayList<>(bootstrap.approvalOptions));
         intent.putStringArrayListExtra(NewChatActivity.EXTRA_SANDBOXES, new ArrayList<>(bootstrap.sandboxOptions));
+        intent.putStringArrayListExtra(NewChatActivity.EXTRA_REASONINGS, new ArrayList<>(bootstrap.reasoningOptions));
         String defaultCwd = "";
         for (SessionSummary session : bootstrap.sessions) {
             if (session.cwd != null && !session.cwd.isEmpty()) {

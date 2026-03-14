@@ -19,11 +19,13 @@ public final class PortalSendMessageBodyTest {
                 "gpt-5",
                 "never",
                 "workspace-write",
+                "high",
                 "lease-1",
                 imageAttachment
         );
 
         assertEquals("hello", body.getString("prompt"));
+        assertEquals("high", body.getString("reasoning_effort"));
         assertEquals("photo.png", body.getJSONObject("image").getString("name"));
         assertEquals("image/png", body.getJSONObject("image").getString("mime_type"));
     }

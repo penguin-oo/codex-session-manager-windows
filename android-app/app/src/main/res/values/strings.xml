@@ -42,6 +42,7 @@
     <string name="label_model">Model</string>
     <string name="label_approval">Approval</string>
     <string name="label_sandbox">Sandbox</string>
+    <string name="label_reasoning">Reasoning</string>
     <string name="label_message">Message</string>
     <string name="label_note">Session note</string>
     <string name="label_working_directory">Working directory</string>
