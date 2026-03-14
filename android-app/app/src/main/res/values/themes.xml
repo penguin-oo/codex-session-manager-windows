@@ -18,9 +18,15 @@
         <item name="subtitleTextColor">@color/text_muted</item>
     </style>
 
-    <style name="ThemeOverlay.CodexMobile.PopupMenu" parent="ThemeOverlay.AppCompat.Light">
-        <item name="android:popupBackground">@android:color/white</item>
-        <item name="android:textColorPrimary">@android:color/black</item>
-        <item name="android:textColorSecondary">@android:color/darker_gray</item>
+    <style name="ThemeOverlay.CodexMobile.PopupMenu" parent="ThemeOverlay.AppCompat.Dark">
+        <item name="android:popupBackground">@drawable/bg_popup_menu</item>
+        <item name="android:textAppearanceLargePopupMenu">@style/TextAppearance.CodexMobile.PopupMenu</item>
+        <item name="android:textAppearanceSmallPopupMenu">@style/TextAppearance.CodexMobile.PopupMenu</item>
+        <item name="textAppearanceLargePopupMenu">@style/TextAppearance.CodexMobile.PopupMenu</item>
+        <item name="textAppearanceSmallPopupMenu">@style/TextAppearance.CodexMobile.PopupMenu</item>
+    </style>
+
+    <style name="TextAppearance.CodexMobile.PopupMenu" parent="TextAppearance.AppCompat.Body1">
+        <item name="android:textColor">@color/text_main</item>
     </style>
 </resources>

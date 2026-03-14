@@ -1,4 +1,5 @@
 ﻿import argparse
+import auth_slots
 import base64
 import ipaddress
 import json
@@ -1661,6 +1662,32 @@ class PortalService:
         DESKTOP_REFRESH_SIGNAL_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return {"ok": True, **payload}
 
+    def account_slots_payload(self) -> dict[str, object]:
+        active_slot = auth_slots.detect_active_slot()
+        current_auth = auth_slots.current_auth_info()
+        slots = auth_slots.list_account_slots()
+        return {
+            "active_slot": active_slot or "",
+            "current_auth": current_auth,
+            "slots": slots,
+            "has_running_jobs": self.has_running_jobs(),
+        }
+
+    def bind_current_account(self, slot_id: str) -> dict[str, object]:
+        auth_slots.save_current_auth_to_slot(slot_id)
+        return self.account_slots_payload()
+
+    def switch_account(self, slot_id: str) -> dict[str, object]:
+        if self.has_running_jobs():
+            raise RuntimeError("Stop active replies before switching accounts.")
+        auth_slots.switch_to_auth_slot(slot_id)
+        self.request_desktop_refresh(source="account_switch")
+        return self.account_slots_payload()
+
+    def has_running_jobs(self) -> bool:
+        with self.jobs.lock:
+            return any(str(job.get("status", "")) == "running" for job in self.jobs.jobs.values())
+
     def download_page_html(self) -> str:
         token = self.token
         return f"""<!doctype html>
@@ -2427,6 +2454,9 @@ class PortalHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/bootstrap":
             self._send_json(self.portal.bootstrap_payload())
             return
+        if parsed.path == "/api/accounts":
+            self._send_json(self.portal.account_slots_payload())
+            return
         if parsed.path.startswith("/api/sessions/"):
             session_id = parsed.path.removeprefix("/api/sessions/")
             payload = self.portal.session_payload(session_id)
@@ -2584,6 +2614,33 @@ class PortalHandler(BaseHTTPRequestHandler):
             result = self.portal.request_desktop_refresh(source=str(payload.get("source", "mobile")))
             self._send_json(result, status=HTTPStatus.ACCEPTED)
             return
+        if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/bind"):
+            slot_id = parsed.path.split("/")[3]
+            try:
+                result = self.portal.bind_current_account(slot_id)
+            except FileNotFoundError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
+        if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/switch"):
+            slot_id = parsed.path.split("/")[3]
+            try:
+                result = self.portal.switch_account(slot_id)
+            except FileNotFoundError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                return
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
         if parsed.path == "/api/chats":
             try:
                 result = self.portal.jobs.start_new_chat_job(
@@ -2711,5 +2768,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
 

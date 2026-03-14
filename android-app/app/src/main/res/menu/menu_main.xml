@@ -10,6 +10,10 @@
         android:title="@string/action_settings"
         app:showAsAction="never" />
     <item
+        android:id="@+id/action_accounts"
+        android:title="@string/action_accounts"
+        app:showAsAction="never" />
+    <item
         android:id="@+id/action_clear_saved"
         android:title="@string/action_clear"
         app:showAsAction="never" />

@@ -249,6 +249,10 @@ public final class ChatActivity extends AppCompatActivity {
             requestDesktopRefresh();
             return true;
         }
+        if (itemId == R.id.action_accounts) {
+            showAccountsDialog();
+            return true;
+        }
         if (itemId == R.id.action_session_settings) {
             editSessionSettings();
             return true;
@@ -853,6 +857,96 @@ public final class ChatActivity extends AppCompatActivity {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
             }
         });
+    }
+
+    private void showAccountsDialog() {
+        showBanner(getString(R.string.banner_loading_accounts));
+        executor.execute(() -> {
+            try {
+                AccountSlotsPayload payload = apiClient.fetchAccountSlots(endpoint);
+                runOnUiThread(() -> presentAccountsDialog(payload));
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void presentAccountsDialog(AccountSlotsPayload payload) {
+        List<AccountSlotSummary> slots = payload.slots;
+        if (slots.isEmpty()) {
+            showBanner(getString(R.string.label_account_unbound));
+            return;
+        }
+        CharSequence[] items = new CharSequence[slots.size()];
+        int selectedIndex = 0;
+        for (int index = 0; index < slots.size(); index++) {
+            AccountSlotSummary slot = slots.get(index);
+            items[index] = describeAccountSlot(slot);
+            if (slot.active) {
+                selectedIndex = index;
+            }
+        }
+        final int[] chosenIndex = {selectedIndex};
+        String currentIdentity = payload.currentEmail.isEmpty() ? payload.currentAccountId : payload.currentEmail;
+        String message = currentIdentity.isEmpty() ? "" : currentIdentity;
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.title_accounts)
+                .setMessage(message)
+                .setSingleChoiceItems(items, selectedIndex, (dialog, which) -> chosenIndex[0] = which)
+                .setPositiveButton(R.string.action_switch_here, (dialog, which) -> switchAccount(slots.get(chosenIndex[0])))
+                .setNeutralButton(R.string.action_bind_current_here, (dialog, which) -> bindCurrentAccount(slots.get(chosenIndex[0])))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void bindCurrentAccount(AccountSlotSummary slot) {
+        showBanner(getString(R.string.banner_loading_accounts));
+        executor.execute(() -> {
+            try {
+                apiClient.bindCurrentAccount(endpoint, slot.slotId);
+                runOnUiThread(() -> showBanner(getString(R.string.banner_account_bound, slotDisplayName(slot.slotId))));
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void switchAccount(AccountSlotSummary slot) {
+        if (!slot.bound) {
+            showBanner(getString(R.string.message_account_not_bound, slotDisplayName(slot.slotId)));
+            return;
+        }
+        showBanner(getString(R.string.banner_loading_accounts));
+        executor.execute(() -> {
+            try {
+                apiClient.switchAccount(endpoint, slot.slotId);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_account_switched, slotDisplayName(slot.slotId)));
+                    loadSession();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private CharSequence describeAccountSlot(AccountSlotSummary slot) {
+        String identity = !slot.email.isEmpty()
+                ? slot.email
+                : (!slot.accountId.isEmpty() ? slot.accountId : getString(R.string.label_account_unbound));
+        String mode = slot.authMode == null || slot.authMode.isEmpty() ? "" : "\nMode: " + slot.authMode;
+        String active = slot.active ? "\n" + getString(R.string.label_account_active) : "";
+        return slotDisplayName(slot.slotId) + "\n" + identity + mode + active;
+    }
+
+    private String slotDisplayName(String slotId) {
+        if ("account-a".equals(slotId)) {
+            return "Account A";
+        }
+        if ("account-b".equals(slotId)) {
+            return "Account B";
+        }
+        return slotId;
     }
 
     private void openLocalPathsOnPhone(List<String> paths) {

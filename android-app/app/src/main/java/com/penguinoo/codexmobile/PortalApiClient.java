@@ -36,6 +36,21 @@ public final class PortalApiClient {
         return parseSessionPayload(json);
     }
 
+    public AccountSlotsPayload fetchAccountSlots(PortalEndpoint endpoint) throws IOException {
+        JSONObject json = getJson(endpoint, "/api/accounts");
+        return parseAccountSlotsPayload(json);
+    }
+
+    public AccountSlotsPayload bindCurrentAccount(PortalEndpoint endpoint, String slotId) throws IOException {
+        JSONObject json = postJson(endpoint, "/api/accounts/" + slotId + "/bind", new JSONObject());
+        return parseAccountSlotsPayload(json);
+    }
+
+    public AccountSlotsPayload switchAccount(PortalEndpoint endpoint, String slotId) throws IOException {
+        JSONObject json = postJson(endpoint, "/api/accounts/" + slotId + "/switch", new JSONObject());
+        return parseAccountSlotsPayload(json);
+    }
+
     public PortalJob sendMessage(
             PortalEndpoint endpoint,
             String sessionId,
@@ -268,11 +283,46 @@ public final class PortalApiClient {
         );
     }
 
+    static AccountSlotsPayload parseAccountSlotsPayload(JSONObject json) {
+        JSONObject currentAuth = json.optJSONObject("current_auth");
+        return new AccountSlotsPayload(
+                json.optString("active_slot"),
+                currentAuth == null ? "" : currentAuth.optString("email"),
+                currentAuth == null ? "" : currentAuth.optString("account_id"),
+                currentAuth == null ? "" : currentAuth.optString("auth_mode"),
+                json.optBoolean("has_running_jobs", false),
+                parseAccountSlots(json.optJSONArray("slots"))
+        );
+    }
+
     private static PortalJob parseNullableJob(JSONObject json) {
         if (json == null || json.length() == 0) {
             return null;
         }
         return parseJob(json);
+    }
+
+    private static java.util.List<AccountSlotSummary> parseAccountSlots(JSONArray array) {
+        java.util.List<AccountSlotSummary> slots = new ArrayList<>();
+        if (array == null) {
+            return slots;
+        }
+        for (int index = 0; index < array.length(); index++) {
+            JSONObject item = array.optJSONObject(index);
+            if (item == null) {
+                continue;
+            }
+            boolean bound = !(item.optString("email").isEmpty() && item.optString("account_id").isEmpty());
+            slots.add(new AccountSlotSummary(
+                    item.optString("slot_id"),
+                    item.optString("email"),
+                    item.optString("account_id"),
+                    item.optString("auth_mode"),
+                    item.optString("active").equalsIgnoreCase("yes"),
+                    bound
+            ));
+        }
+        return slots;
     }
 
     private SessionLease parseLease(JSONObject json) {

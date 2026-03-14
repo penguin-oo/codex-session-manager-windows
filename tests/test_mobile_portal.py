@@ -449,6 +449,29 @@ class PortalServiceBootstrapTests(unittest.TestCase):
         self.assertEqual("high", session_payload["reasoning_effort"])
 
 
+class PortalAccountSlotsTests(unittest.TestCase):
+    def test_account_slots_payload_includes_active_slot_and_running_flag(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+        service.jobs.jobs["job-1"] = {"status": "running"}
+
+        with mock.patch.object(mobile_portal.auth_slots, "detect_active_slot", return_value="account-b"), \
+             mock.patch.object(mobile_portal.auth_slots, "current_auth_info", return_value={"email": "b@example.com"}), \
+             mock.patch.object(mobile_portal.auth_slots, "list_account_slots", return_value=[{"slot_id": "account-a"}, {"slot_id": "account-b"}]):
+            payload = service.account_slots_payload()
+
+        self.assertEqual("account-b", payload["active_slot"])
+        self.assertEqual("b@example.com", payload["current_auth"]["email"])
+        self.assertTrue(payload["has_running_jobs"])
+        self.assertEqual(2, len(payload["slots"]))
+
+    def test_switch_account_rejects_when_job_is_running(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+        service.jobs.jobs["job-1"] = {"status": "running"}
+
+        with self.assertRaisesRegex(RuntimeError, "Stop active replies"):
+            service.switch_account("account-b")
+
+
 class PortalFileShareTests(unittest.TestCase):
     def test_create_file_share_allows_supported_file_under_session_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
