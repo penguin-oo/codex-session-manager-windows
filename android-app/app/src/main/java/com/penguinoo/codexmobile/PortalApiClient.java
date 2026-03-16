@@ -51,6 +51,33 @@ public final class PortalApiClient {
         return parseAccountSlotsPayload(json);
     }
 
+    public AccountSlotsPayload createAccountSlot(PortalEndpoint endpoint, String label) throws IOException {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("label", label);
+        } catch (JSONException exception) {
+            throw new IOException("Failed to build account slot request.", exception);
+        }
+        JSONObject json = postJson(endpoint, "/api/accounts", body);
+        return parseAccountSlotsPayload(json);
+    }
+
+    public AccountSlotsPayload renameAccountSlot(PortalEndpoint endpoint, String slotId, String label) throws IOException {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("label", label);
+        } catch (JSONException exception) {
+            throw new IOException("Failed to build account slot request.", exception);
+        }
+        JSONObject json = postJson(endpoint, "/api/accounts/" + slotId + "/rename", body);
+        return parseAccountSlotsPayload(json);
+    }
+
+    public AccountSlotsPayload deleteAccountSlot(PortalEndpoint endpoint, String slotId) throws IOException {
+        JSONObject json = postJson(endpoint, "/api/accounts/" + slotId + "/delete", new JSONObject());
+        return parseAccountSlotsPayload(json);
+    }
+
     public PortalJob sendMessage(
             PortalEndpoint endpoint,
             String sessionId,
@@ -285,11 +312,14 @@ public final class PortalApiClient {
 
     static AccountSlotsPayload parseAccountSlotsPayload(JSONObject json) {
         JSONObject currentAuth = json.optJSONObject("current_auth");
+        JSONObject quota = json.optJSONObject("quota");
         return new AccountSlotsPayload(
                 json.optString("active_slot"),
                 currentAuth == null ? "" : currentAuth.optString("email"),
                 currentAuth == null ? "" : currentAuth.optString("account_id"),
                 currentAuth == null ? "" : currentAuth.optString("auth_mode"),
+                quota == null ? "" : quota.optString("summary"),
+                quota == null ? "" : quota.optString("state"),
                 json.optBoolean("has_running_jobs", false),
                 parseAccountSlots(json.optJSONArray("slots"))
         );
@@ -315,6 +345,7 @@ public final class PortalApiClient {
             boolean bound = !(item.optString("email").isEmpty() && item.optString("account_id").isEmpty());
             slots.add(new AccountSlotSummary(
                     item.optString("slot_id"),
+                    item.optString("label"),
                     item.optString("email"),
                     item.optString("account_id"),
                     item.optString("auth_mode"),

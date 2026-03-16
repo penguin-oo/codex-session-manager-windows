@@ -873,28 +873,71 @@ public final class ChatActivity extends AppCompatActivity {
 
     private void presentAccountsDialog(AccountSlotsPayload payload) {
         List<AccountSlotSummary> slots = payload.slots;
-        if (slots.isEmpty()) {
-            showBanner(getString(R.string.label_account_unbound));
-            return;
-        }
         CharSequence[] items = new CharSequence[slots.size()];
-        int selectedIndex = 0;
         for (int index = 0; index < slots.size(); index++) {
             AccountSlotSummary slot = slots.get(index);
             items[index] = describeAccountSlot(slot);
-            if (slot.active) {
-                selectedIndex = index;
-            }
         }
-        final int[] chosenIndex = {selectedIndex};
         String currentIdentity = payload.currentEmail.isEmpty() ? payload.currentAccountId : payload.currentEmail;
-        String message = currentIdentity.isEmpty() ? "" : currentIdentity;
+        String mode = payload.currentAuthMode == null || payload.currentAuthMode.isEmpty() ? "" : "\nMode: " + payload.currentAuthMode;
+        String quota = payload.quotaSummary == null || payload.quotaSummary.isEmpty()
+                ? getString(R.string.label_quota_unavailable)
+                : payload.quotaSummary;
+        String message = (currentIdentity.isEmpty() ? "" : currentIdentity) + mode + "\n" + quota;
         new AlertDialog.Builder(this)
                 .setTitle(R.string.title_accounts)
                 .setMessage(message)
-                .setSingleChoiceItems(items, selectedIndex, (dialog, which) -> chosenIndex[0] = which)
-                .setPositiveButton(R.string.action_switch_here, (dialog, which) -> switchAccount(slots.get(chosenIndex[0])))
-                .setNeutralButton(R.string.action_bind_current_here, (dialog, which) -> bindCurrentAccount(slots.get(chosenIndex[0])))
+                .setItems(items, (dialog, which) -> showAccountSlotActions(slots.get(which)))
+                .setPositiveButton(R.string.action_new_slot, (dialog, which) -> promptCreateAccountSlot())
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void showAccountSlotActions(AccountSlotSummary slot) {
+        List<String> actions = new ArrayList<>();
+        actions.add(getString(R.string.action_bind_current_here));
+        if (slot.bound) {
+            actions.add(getString(R.string.action_switch_here));
+        }
+        actions.add(getString(R.string.action_rename));
+        actions.add(getString(R.string.action_delete));
+        new AlertDialog.Builder(this)
+                .setTitle(slotDisplayName(slot))
+                .setItems(actions.toArray(new CharSequence[0]), (dialog, which) -> {
+                    String selected = actions.get(which);
+                    if (selected.equals(getString(R.string.action_bind_current_here))) {
+                        bindCurrentAccount(slot);
+                    } else if (selected.equals(getString(R.string.action_switch_here))) {
+                        switchAccount(slot);
+                    } else if (selected.equals(getString(R.string.action_rename))) {
+                        promptRenameAccountSlot(slot);
+                    } else if (selected.equals(getString(R.string.action_delete))) {
+                        confirmDeleteAccountSlot(slot);
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void promptCreateAccountSlot() {
+        EditText input = new EditText(this);
+        input.setHint(R.string.hint_account_slot_label);
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.action_new_slot)
+                .setView(input)
+                .setPositiveButton(R.string.action_save, (dialog, which) -> createAccountSlot(input.getText().toString()))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void promptRenameAccountSlot(AccountSlotSummary slot) {
+        EditText input = new EditText(this);
+        input.setText(slot.label);
+        input.setSelection(input.getText().length());
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.action_rename)
+                .setView(input)
+                .setPositiveButton(R.string.action_save, (dialog, which) -> renameAccountSlot(slot, input.getText().toString()))
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
     }
@@ -904,7 +947,7 @@ public final class ChatActivity extends AppCompatActivity {
         executor.execute(() -> {
             try {
                 apiClient.bindCurrentAccount(endpoint, slot.slotId);
-                runOnUiThread(() -> showBanner(getString(R.string.banner_account_bound, slotDisplayName(slot.slotId))));
+                runOnUiThread(() -> showBanner(getString(R.string.banner_account_bound, slotDisplayName(slot))));
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
             }
@@ -913,7 +956,7 @@ public final class ChatActivity extends AppCompatActivity {
 
     private void switchAccount(AccountSlotSummary slot) {
         if (!slot.bound) {
-            showBanner(getString(R.string.message_account_not_bound, slotDisplayName(slot.slotId)));
+            showBanner(getString(R.string.message_account_not_bound, slotDisplayName(slot)));
             return;
         }
         showBanner(getString(R.string.banner_loading_accounts));
@@ -921,7 +964,7 @@ public final class ChatActivity extends AppCompatActivity {
             try {
                 apiClient.switchAccount(endpoint, slot.slotId);
                 runOnUiThread(() -> {
-                    showBanner(getString(R.string.banner_account_switched, slotDisplayName(slot.slotId)));
+                    showBanner(getString(R.string.banner_account_switched, slotDisplayName(slot)));
                     loadSession();
                 });
             } catch (Exception exception) {
@@ -930,23 +973,71 @@ public final class ChatActivity extends AppCompatActivity {
         });
     }
 
+    private void createAccountSlot(String rawLabel) {
+        String label = rawLabel == null ? "" : rawLabel.trim();
+        if (label.isEmpty()) {
+            showBanner(getString(R.string.message_account_label_required));
+            return;
+        }
+        showBanner(getString(R.string.banner_loading_accounts));
+        executor.execute(() -> {
+            try {
+                apiClient.createAccountSlot(endpoint, label);
+                runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_created, label)));
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void renameAccountSlot(AccountSlotSummary slot, String rawLabel) {
+        String label = rawLabel == null ? "" : rawLabel.trim();
+        if (label.isEmpty()) {
+            showBanner(getString(R.string.message_account_label_required));
+            return;
+        }
+        showBanner(getString(R.string.banner_loading_accounts));
+        executor.execute(() -> {
+            try {
+                apiClient.renameAccountSlot(endpoint, slot.slotId, label);
+                runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_renamed, label)));
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void confirmDeleteAccountSlot(AccountSlotSummary slot) {
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.action_delete)
+                .setMessage(getString(R.string.message_delete_account_slot, slotDisplayName(slot)))
+                .setPositiveButton(R.string.action_delete, (dialog, which) -> {
+                    showBanner(getString(R.string.banner_loading_accounts));
+                    executor.execute(() -> {
+                        try {
+                            apiClient.deleteAccountSlot(endpoint, slot.slotId);
+                            runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_deleted, slotDisplayName(slot))));
+                        } catch (Exception exception) {
+                            runOnUiThread(() -> showBanner(exception.getMessage()));
+                        }
+                    });
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
     private CharSequence describeAccountSlot(AccountSlotSummary slot) {
         String identity = !slot.email.isEmpty()
                 ? slot.email
                 : (!slot.accountId.isEmpty() ? slot.accountId : getString(R.string.label_account_unbound));
         String mode = slot.authMode == null || slot.authMode.isEmpty() ? "" : "\nMode: " + slot.authMode;
         String active = slot.active ? "\n" + getString(R.string.label_account_active) : "";
-        return slotDisplayName(slot.slotId) + "\n" + identity + mode + active;
+        return slotDisplayName(slot) + "\n" + identity + mode + active;
     }
 
-    private String slotDisplayName(String slotId) {
-        if ("account-a".equals(slotId)) {
-            return "Account A";
-        }
-        if ("account-b".equals(slotId)) {
-            return "Account B";
-        }
-        return slotId;
+    private String slotDisplayName(AccountSlotSummary slot) {
+        String label = slot.label == null ? "" : slot.label.trim();
+        return label.isEmpty() ? slot.slotId : label;
     }
 
     private void openLocalPathsOnPhone(List<String> paths) {

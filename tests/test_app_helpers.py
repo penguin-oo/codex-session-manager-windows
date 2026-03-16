@@ -101,6 +101,21 @@ class AppHelperTests(unittest.TestCase):
         self.assertIn("Account B", summary)
         self.assertIn("Not bound yet.", summary)
 
+    def test_format_account_slot_summary_prefers_dynamic_label(self) -> None:
+        summary = app.format_account_slot_summary(
+            "slot-3",
+            {"label": "Travel", "email": "travel@example.com", "auth_mode": "chatgpt", "fingerprint": "abc"},
+            None,
+        )
+
+        self.assertIn("Travel", summary)
+        self.assertNotIn("slot-3", summary)
+
+    def test_format_quota_summary_uses_backend_text(self) -> None:
+        summary = app.format_account_quota_summary({"summary": "Weekly quota: 76% used", "state": "ok"})
+
+        self.assertEqual("Weekly quota: 76% used", summary)
+
 
 
 if __name__ == "__main__":

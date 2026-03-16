@@ -15,6 +15,8 @@
     <string name="action_refresh">Refresh</string>
     <string name="action_refresh_desktop">Refresh PC</string>
     <string name="action_accounts">Accounts</string>
+    <string name="action_new_slot">New slot</string>
+    <string name="action_rename">Rename</string>
     <string name="action_settings">Connection</string>
     <string name="action_clear">Clear saved URL</string>
     <string name="action_retry">Retry</string>
@@ -109,6 +111,13 @@
     <string name="action_switch_here">Switch here</string>
     <string name="label_account_active">Active</string>
     <string name="label_account_unbound">Not bound yet</string>
+    <string name="label_quota_unavailable">Quota unavailable</string>
+    <string name="hint_account_slot_label">Slot label</string>
+    <string name="message_account_label_required">A slot label is required.</string>
+    <string name="message_delete_account_slot">Delete saved slot %1$s? This removes only the backup slot, not the current login.</string>
+    <string name="banner_account_slot_created">Created slot %1$s.</string>
+    <string name="banner_account_slot_renamed">Renamed slot to %1$s.</string>
+    <string name="banner_account_slot_deleted">Deleted slot %1$s.</string>
     <string name="notification_reply_channel_name">Reply notifications</string>
     <string name="notification_reply_channel_description">Alerts when a Codex chat finishes replying.</string>
     <string name="notification_reply_title">%1$s finished replying</string>

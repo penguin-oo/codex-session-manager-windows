@@ -450,19 +450,21 @@ class PortalServiceBootstrapTests(unittest.TestCase):
 
 
 class PortalAccountSlotsTests(unittest.TestCase):
-    def test_account_slots_payload_includes_active_slot_and_running_flag(self) -> None:
+    def test_account_slots_payload_includes_active_slot_running_flag_and_quota(self) -> None:
         service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
         service.jobs.jobs["job-1"] = {"status": "running"}
 
         with mock.patch.object(mobile_portal.auth_slots, "detect_active_slot", return_value="account-b"), \
              mock.patch.object(mobile_portal.auth_slots, "current_auth_info", return_value={"email": "b@example.com"}), \
-             mock.patch.object(mobile_portal.auth_slots, "list_account_slots", return_value=[{"slot_id": "account-a"}, {"slot_id": "account-b"}]):
+             mock.patch.object(mobile_portal.auth_slots, "list_account_slots", return_value=[{"slot_id": "slot-1"}, {"slot_id": "slot-2"}]), \
+             mock.patch.object(mobile_portal, "read_current_weekly_quota", return_value={"summary": "Weekly quota: 42%", "state": "ok"}):
             payload = service.account_slots_payload()
 
         self.assertEqual("account-b", payload["active_slot"])
         self.assertEqual("b@example.com", payload["current_auth"]["email"])
         self.assertTrue(payload["has_running_jobs"])
         self.assertEqual(2, len(payload["slots"]))
+        self.assertEqual("Weekly quota: 42%", payload["quota"]["summary"])
 
     def test_switch_account_rejects_when_job_is_running(self) -> None:
         service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
@@ -471,8 +473,43 @@ class PortalAccountSlotsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Stop active replies"):
             service.switch_account("account-b")
 
+    def test_create_rename_and_delete_account_slot_round_trip(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+
+        with mock.patch.object(mobile_portal.auth_slots, "create_account_slot", return_value={"slot_id": "slot-3", "label": "Travel"}), \
+             mock.patch.object(service, "account_slots_payload", return_value={"slots": [{"slot_id": "slot-3", "label": "Travel"}]}):
+            created = service.create_account_slot("Travel")
+        self.assertEqual("Travel", created["slots"][0]["label"])
+
+        with mock.patch.object(mobile_portal.auth_slots, "rename_account_slot", return_value={"slot_id": "slot-3", "label": "Travel Backup"}), \
+             mock.patch.object(service, "account_slots_payload", return_value={"slots": [{"slot_id": "slot-3", "label": "Travel Backup"}]}):
+            renamed = service.rename_account_slot("slot-3", "Travel Backup")
+        self.assertEqual("Travel Backup", renamed["slots"][0]["label"])
+
+        with mock.patch.object(mobile_portal.auth_slots, "delete_account_slot"), \
+             mock.patch.object(service, "account_slots_payload", return_value={"slots": []}):
+            deleted = service.delete_account_slot("slot-3")
+        self.assertEqual([], deleted["slots"])
+
+    def test_read_current_weekly_quota_extracts_status_summary(self) -> None:
+        output = "Plan: ChatGPT Plus\nWeekly quota: 76% used (resets in 3 days)\n"
+
+        with mock.patch.object(mobile_portal, "run_text_command", return_value=output):
+            quota = mobile_portal.read_current_weekly_quota()
+
+        self.assertEqual("ok", quota["state"])
+        self.assertIn("Weekly quota: 76% used", quota["summary"])
+
 
 class PortalFileShareTests(unittest.TestCase):
+    def test_build_inline_content_disposition_supports_utf8_pdf_names(self) -> None:
+        header = mobile_portal.build_inline_content_disposition("动量守恒_长板双物块_原题摘录.pdf")
+
+        self.assertIn('inline; filename="', header)
+        self.assertIn("filename*=UTF-8''", header)
+        self.assertIn("%E5%8A%A8%E9%87%8F%E5%AE%88%E6%81%92", header)
+        self.assertNotIn('filename="动量守恒_长板双物块_原题摘录.pdf"', header)
+
     def test_create_file_share_allows_supported_file_under_session_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cwd = Path(temp_dir)

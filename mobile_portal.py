@@ -19,7 +19,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 try:
     import tomllib
@@ -206,6 +206,16 @@ def guess_release_file_content_type(path: Path) -> str:
     return "application/octet-stream"
 
 
+def build_inline_content_disposition(file_name: str) -> str:
+    clean_name = (file_name or "download").replace("\r", "").replace("\n", "")
+    ascii_name = "".join(ch if 32 <= ord(ch) < 127 and ch not in {'"', "\\"} else "_" for ch in clean_name).strip()
+    if not ascii_name:
+        suffix = Path(clean_name).suffix or ""
+        ascii_name = f"download{suffix}"
+    encoded_name = quote(clean_name, safe="")
+    return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"
+
+
 def flatten_message_content(content: list[dict[str, object]]) -> str:
     parts: list[str] = []
     for item in content:
@@ -374,6 +384,27 @@ def run_text_command(args: list[str], timeout_seconds: float = 3.0) -> str:
     if result.returncode != 0:
         return ""
     return (result.stdout or "").strip()
+
+
+def parse_weekly_quota_summary(status_output: str) -> dict[str, str]:
+    text = (status_output or "").strip()
+    if not text:
+        return {"state": "unavailable", "summary": "Quota unavailable"}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "weekly quota" in line.lower():
+            return {"state": "ok", "summary": line}
+    first_line = text.splitlines()[0].strip()
+    if first_line:
+        return {"state": "ok", "summary": first_line}
+    return {"state": "unavailable", "summary": "Quota unavailable"}
+
+
+def read_current_weekly_quota(timeout_seconds: float = 4.0) -> dict[str, str]:
+    output = run_text_command([CODEX_BIN, "/status"], timeout_seconds=timeout_seconds)
+    return parse_weekly_quota_summary(output)
 
 
 def build_history_entry_text(prompt: str, image_paths: list[Path] | None = None) -> str:
@@ -1671,7 +1702,20 @@ class PortalService:
             "current_auth": current_auth,
             "slots": slots,
             "has_running_jobs": self.has_running_jobs(),
+            "quota": read_current_weekly_quota(),
         }
+
+    def create_account_slot(self, label: str) -> dict[str, object]:
+        auth_slots.create_account_slot(label)
+        return self.account_slots_payload()
+
+    def rename_account_slot(self, slot_id: str, label: str) -> dict[str, object]:
+        auth_slots.rename_account_slot(slot_id, label)
+        return self.account_slots_payload()
+
+    def delete_account_slot(self, slot_id: str) -> dict[str, object]:
+        auth_slots.delete_account_slot(slot_id)
+        return self.account_slots_payload()
 
     def bind_current_account(self, slot_id: str) -> dict[str, object]:
         auth_slots.save_current_auth_to_slot(slot_id)
@@ -2626,6 +2670,38 @@ class PortalHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(result)
             return
+        if parsed.path == "/api/accounts":
+            try:
+                result = self.portal.create_account_slot(str(payload.get("label", "")))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result, status=HTTPStatus.CREATED)
+            return
+        if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/rename"):
+            slot_id = parsed.path.split("/")[3]
+            try:
+                result = self.portal.rename_account_slot(slot_id, str(payload.get("label", "")))
+            except FileNotFoundError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
+        if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/delete"):
+            slot_id = parsed.path.split("/")[3]
+            try:
+                result = self.portal.delete_account_slot(slot_id)
+            except FileNotFoundError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
         if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/switch"):
             slot_id = parsed.path.split("/")[3]
             try:
@@ -2723,7 +2799,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type or "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Disposition", f'inline; filename="{file_name}"')
+        self.send_header("Content-Disposition", build_inline_content_disposition(file_name))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)

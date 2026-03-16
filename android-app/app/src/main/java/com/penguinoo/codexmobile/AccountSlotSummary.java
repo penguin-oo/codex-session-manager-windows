@@ -2,6 +2,7 @@ package com.penguinoo.codexmobile;
 
 public final class AccountSlotSummary {
     public final String slotId;
+    public final String label;
     public final String email;
     public final String accountId;
     public final String authMode;
@@ -10,6 +11,7 @@ public final class AccountSlotSummary {
 
     public AccountSlotSummary(
             String slotId,
+            String label,
             String email,
             String accountId,
             String authMode,
@@ -17,6 +19,7 @@ public final class AccountSlotSummary {
             boolean bound
     ) {
         this.slotId = slotId;
+        this.label = label;
         this.email = email;
         this.accountId = accountId;
         this.authMode = authMode;
