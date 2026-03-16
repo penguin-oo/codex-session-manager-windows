@@ -140,6 +140,72 @@ class AuthSlotsTests(unittest.TestCase):
 
         self.assertEqual("account-b", active)
 
+    def test_list_account_slots_migrates_legacy_standard_slots(self) -> None:
+        self.write_current_auth(
+            email="a@example.com",
+            account_id="acct-a",
+            refresh_token="refresh-a",
+            cap_sid="cap-a",
+        )
+        auth_slots.save_current_auth_to_slot(
+            "account-a",
+            codex_home=self.codex_home,
+            slots_dir=self.slots_dir,
+        )
+        self.write_current_auth(
+            email="b@example.com",
+            account_id="acct-b",
+            refresh_token="refresh-b",
+            cap_sid="cap-b",
+        )
+        auth_slots.save_current_auth_to_slot(
+            "account-b",
+            codex_home=self.codex_home,
+            slots_dir=self.slots_dir,
+        )
+
+        items = auth_slots.list_account_slots(
+            codex_home=self.codex_home,
+            slots_dir=self.slots_dir,
+        )
+
+        self.assertEqual(["account-a", "account-b"], [item["slot_id"] for item in items])
+        self.assertEqual(["Account A", "Account B"], [item["label"] for item in items])
+        metadata = auth_slots.load_slot_registry(slots_dir=self.slots_dir)
+        self.assertEqual(2, len(metadata))
+
+    def test_create_rename_and_delete_dynamic_slot(self) -> None:
+        created = auth_slots.create_account_slot("Personal Plus", slots_dir=self.slots_dir)
+        self.assertEqual("Personal Plus", created["label"])
+
+        renamed = auth_slots.rename_account_slot(created["slot_id"], "Backup", slots_dir=self.slots_dir)
+        self.assertEqual("Backup", renamed["label"])
+
+        items = auth_slots.list_account_slots(codex_home=self.codex_home, slots_dir=self.slots_dir)
+        self.assertEqual(["Backup"], [item["label"] for item in items])
+
+        auth_slots.delete_account_slot(created["slot_id"], slots_dir=self.slots_dir)
+        self.assertEqual([], auth_slots.list_account_slots(codex_home=self.codex_home, slots_dir=self.slots_dir))
+
+    def test_save_current_auth_to_dynamic_slot_uses_label_metadata(self) -> None:
+        created = auth_slots.create_account_slot("Work", slots_dir=self.slots_dir)
+        self.write_current_auth(
+            email="work@example.com",
+            account_id="acct-work",
+            refresh_token="refresh-work",
+            cap_sid="cap-work",
+        )
+
+        info = auth_slots.save_current_auth_to_slot(
+            created["slot_id"],
+            codex_home=self.codex_home,
+            slots_dir=self.slots_dir,
+        )
+
+        self.assertEqual("Work", info["label"])
+        listed = auth_slots.list_account_slots(codex_home=self.codex_home, slots_dir=self.slots_dir)
+        self.assertEqual("work@example.com", listed[0]["email"])
+
 
 if __name__ == "__main__":
     unittest.main()
