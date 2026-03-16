@@ -28,6 +28,8 @@ Local-only files are ignored on purpose:
 If you clone this repository, the current packaged files in `release/` come down with it:
 - `release/codex-session-manager-windows-x64.zip`
 - `release/codex-mobile-debug.apk`
+- `release/tailscale-setup-1.94.2.exe`
+- `release/tailscale-android-universal-1.94.2.apk`
 
 ### Option 2: Use GitHub Releases
 Historical versions should be downloaded from GitHub Releases instead of from git history.
@@ -96,6 +98,8 @@ Supported behavior:
 Use this when the phone and PC are not on the same Wi-Fi.
 
 1. Install Tailscale on the PC and phone.
+   - PC installer in this repo: `release/tailscale-setup-1.94.2.exe`
+   - Android installer in this repo: `release/tailscale-android-universal-1.94.2.apk`
 2. Sign in with the same account or tailnet.
 3. Start `run-mobile.bat`.
 4. Use the printed `Tailscale (cross-network)` URL in the Android app.
