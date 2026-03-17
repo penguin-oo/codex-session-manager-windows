@@ -51,6 +51,8 @@ run.bat
 run-mobile.bat
 ```
 
+`run-mobile.bat` now self-elevates. If it is started from a normal desktop shell, Windows should prompt for administrator approval automatically. The phone-side portal and any Codex jobs started through it inherit that elevated Windows token.
+
 ### Connect the Android app
 1. Install `release/codex-mobile-debug.apk`.
 2. Start `run-mobile.bat` on the PC.
@@ -163,6 +165,27 @@ The tracked APK is the current debug build generated from `android-app/`.
 - confirm `run-mobile.bat` is still running
 - use the exact URL including `?token=...`
 - if using Tailscale, confirm both devices are connected to the same tailnet
+
+### How to ensure the highest practical Windows privilege
+- For phone-driven chats:
+  - start `run-mobile.bat`
+  - accept the UAC prompt
+  - this gives the portal and its child Codex jobs administrator / high-integrity rights
+- For desktop-opened chat windows:
+  - keep `Admin` checked in the desktop manager before clicking `Open Terminal`
+  - Windows will prompt for elevation for that specific terminal window
+- If you want the desktop manager process itself elevated too:
+  - right-click `run.bat`
+  - choose `Run as administrator`
+- This project does not elevate to `SYSTEM` or `TrustedInstaller`; the supported top level is normal Windows administrator / high integrity
+
+### PowerShell `Invoke-WebRequest` security prompt
+- That prompt is not caused by missing administrator rights
+- It appears when a PowerShell command uses `Invoke-WebRequest` without safer parsing flags
+- Prefer:
+  - `curl.exe ...`
+  - or `Invoke-WebRequest ... -UseBasicParsing`
+- Raising Windows privilege does not suppress this prompt by itself
 
 ### Desktop manager opens slowly
 - restart the desktop manager after upgrades
