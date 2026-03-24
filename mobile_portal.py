@@ -35,6 +35,7 @@ CODEX_HOME = Path(os.environ.get("USERPROFILE", "")) / ".codex"
 HISTORY_FILE = CODEX_HOME / "history.jsonl"
 NOTES_FILE = CODEX_HOME / "session_notes.json"
 SETTINGS_FILE = CODEX_HOME / "session_settings.json"
+PORTAL_SETTINGS_FILE = CODEX_HOME / "mobile_portal_settings.json"
 SESSIONS_DIR = CODEX_HOME / "sessions"
 CONFIG_FILE = CODEX_HOME / "config.toml"
 MODELS_CACHE_FILE = CODEX_HOME / "models_cache.json"
@@ -50,6 +51,8 @@ TAILSCALE_WINDOWS_PATH = Path(r"C:\Program Files\Tailscale\tailscale.exe")
 FILE_SHARE_TTL_SECONDS = 30 * 60
 SUPPORTED_SHARED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf"}
 ALLOWED_DOWNLOAD_FILES = {"codex-mobile-debug.apk", "codex-session-manager-windows-x64.zip"}
+DEFAULT_PROXY_ENABLED = True
+DEFAULT_PROXY_PORT = 7897
 
 
 @dataclass
@@ -225,6 +228,45 @@ def flatten_message_content(content: list[dict[str, object]]) -> str:
         if isinstance(text, str) and text.strip():
             parts.append(text.strip())
     return "\n\n".join(parts).strip()
+
+
+def normalize_message_text(text: str) -> str:
+    return " ".join(text.split()).strip()
+
+
+def is_duplicate_user_message(
+    seen_user_messages: dict[str, list[int]],
+    text: str,
+    ts: int,
+    tolerance_ms: int = 10_000,
+) -> bool:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return False
+    existing = seen_user_messages.get(normalized, [])
+    if not existing:
+        return False
+    if ts <= 0:
+        return True
+    for existing_ts in existing:
+        if existing_ts <= 0 or abs(existing_ts - ts) <= tolerance_ms:
+            return True
+    return False
+
+
+def is_internal_session_user_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    internal_prefixes = (
+        "# AGENTS.md instructions for ",
+        "<environment_context>",
+        "<permissions instructions>",
+        "<collaboration_mode>",
+        "<personality_spec>",
+        "<skills_instructions>",
+    )
+    return any(stripped.startswith(prefix) for prefix in internal_prefixes)
 
 
 def resolve_portal_token(explicit_token: str, token_file: Path = PORTAL_TOKEN_FILE) -> str:
@@ -417,33 +459,72 @@ def build_history_entry_text(prompt: str, image_paths: list[Path] | None = None)
     return "\n".join(labels).strip()
 
 
-def build_codex_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+def load_proxy_settings(settings_file: Path = PORTAL_SETTINGS_FILE) -> dict[str, object]:
+    if settings_file.exists():
+        try:
+            raw = json.loads(settings_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            raw = {}
+        if isinstance(raw, dict):
+            enabled = bool(raw.get("proxy_enabled", DEFAULT_PROXY_ENABLED))
+            try:
+                port = int(raw.get("proxy_port", DEFAULT_PROXY_PORT))
+            except (TypeError, ValueError):
+                port = DEFAULT_PROXY_PORT
+            if 1 <= port <= 65535:
+                return {"proxy_enabled": enabled, "proxy_port": port}
+    return {"proxy_enabled": DEFAULT_PROXY_ENABLED, "proxy_port": DEFAULT_PROXY_PORT}
+
+
+def save_proxy_settings(proxy_enabled: bool, proxy_port: int, settings_file: Path = PORTAL_SETTINGS_FILE) -> dict[str, object]:
+    port = int(proxy_port)
+    if port < 1 or port > 65535:
+        raise ValueError("Proxy port must be between 1 and 65535.")
+    payload = {"proxy_enabled": bool(proxy_enabled), "proxy_port": port}
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+    settings_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def apply_proxy_settings_to_env(base_env: dict[str, str] | None, proxy_settings: dict[str, object]) -> dict[str, str]:
     env = dict(base_env or os.environ)
-    proxy_value = (
-        env.get("ALL_PROXY")
-        or env.get("all_proxy")
-        or env.get("HTTPS_PROXY")
-        or env.get("https_proxy")
-        or env.get("HTTP_PROXY")
-        or env.get("http_proxy")
-        or DEFAULT_PROXY_URL
-    )
     no_proxy_value = env.get("NO_PROXY") or env.get("no_proxy") or DEFAULT_NO_PROXY
+    env["NO_PROXY"] = no_proxy_value
+    env["no_proxy"] = no_proxy_value
+    if not bool(proxy_settings.get("proxy_enabled", DEFAULT_PROXY_ENABLED)):
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            env.pop(key, None)
+        return env
+    try:
+        port = int(proxy_settings.get("proxy_port", DEFAULT_PROXY_PORT))
+    except (TypeError, ValueError):
+        port = DEFAULT_PROXY_PORT
+    proxy_value = f"socks5h://127.0.0.1:{port}"
     env["HTTP_PROXY"] = proxy_value
     env["HTTPS_PROXY"] = proxy_value
     env["ALL_PROXY"] = proxy_value
     env["http_proxy"] = proxy_value
     env["https_proxy"] = proxy_value
     env["all_proxy"] = proxy_value
-    env["NO_PROXY"] = no_proxy_value
-    env["no_proxy"] = no_proxy_value
     return env
 
 
-def current_proxy_summary(base_env: dict[str, str] | None = None) -> str:
-    env = build_codex_subprocess_env(base_env)
-    proxy_value = str(env.get("ALL_PROXY", "")).strip()
-    return proxy_value or "direct"
+def build_codex_subprocess_env(base_env: dict[str, str] | None = None, settings_file: Path = PORTAL_SETTINGS_FILE) -> dict[str, str]:
+    return apply_proxy_settings_to_env(base_env, load_proxy_settings(settings_file))
+
+
+def current_proxy_summary_from_settings(proxy_settings: dict[str, object]) -> str:
+    if not bool(proxy_settings.get("proxy_enabled", DEFAULT_PROXY_ENABLED)):
+        return "direct"
+    try:
+        port = int(proxy_settings.get("proxy_port", DEFAULT_PROXY_PORT))
+    except (TypeError, ValueError):
+        port = DEFAULT_PROXY_PORT
+    return f"socks5h://127.0.0.1:{port}"
+
+
+def current_proxy_summary(settings_file: Path = PORTAL_SETTINGS_FILE) -> str:
+    return current_proxy_summary_from_settings(load_proxy_settings(settings_file))
 
 
 def list_windows_process_rows() -> list[dict[str, object]]:
@@ -700,6 +781,7 @@ class CodexDataStore:
                 return copy_message_list(cached[1])
 
         messages: list[dict[str, object]] = []
+        seen_user_messages: dict[str, list[int]] = {}
 
         if HISTORY_FILE.exists():
             with HISTORY_FILE.open("r", encoding="utf-8") as handle:
@@ -713,13 +795,12 @@ class CodexDataStore:
                         continue
                     if str(obj.get("session_id", "")).strip() != session_id:
                         continue
-                    messages.append(
-                        {
-                            "role": "user",
-                            "ts": int(obj.get("ts", 0)),
-                            "text": str(obj.get("text", "")),
-                        }
-                    )
+                    text = str(obj.get("text", ""))
+                    ts = int(obj.get("ts", 0))
+                    messages.append({"role": "user", "ts": ts, "text": text})
+                    normalized = normalize_message_text(text)
+                    if normalized:
+                        seen_user_messages.setdefault(normalized, []).append(ts)
 
         if session_file:
             try:
@@ -737,20 +818,34 @@ class CodexDataStore:
                         payload = obj.get("payload", {})
                         if not isinstance(payload, dict):
                             continue
-                        if payload.get("type") != "message" or payload.get("role") != "assistant":
+                        if payload.get("type") != "message":
                             continue
-                        if payload.get("phase") != "final_answer":
-                            continue
+                        role = str(payload.get("role", ""))
                         content = payload.get("content", [])
                         if not isinstance(content, list):
                             continue
                         text = flatten_message_content(content)
                         if not text:
                             continue
+                        ts = iso_to_ts(str(obj.get("timestamp", "")))
+                        if role == "user":
+                            if is_internal_session_user_text(text):
+                                continue
+                            if is_duplicate_user_message(seen_user_messages, text, ts):
+                                continue
+                            messages.append({"role": "user", "ts": ts, "text": text})
+                            normalized = normalize_message_text(text)
+                            if normalized:
+                                seen_user_messages.setdefault(normalized, []).append(ts)
+                            continue
+                        if role != "assistant":
+                            continue
+                        if payload.get("phase") != "final_answer":
+                            continue
                         messages.append(
                             {
                                 "role": "assistant",
-                                "ts": iso_to_ts(str(obj.get("timestamp", ""))),
+                                "ts": ts,
                                 "text": text,
                             }
                         )
@@ -1682,6 +1777,7 @@ class PortalService:
         self.host = host
         self.port = port
         self.token = token
+        self.proxy_settings_file = PORTAL_SETTINGS_FILE
         self.data_store = CodexDataStore()
         self.jobs = JobRunner(self.data_store)
         self.shared_files_lock = threading.Lock()
@@ -1728,6 +1824,20 @@ class PortalService:
         self.request_desktop_refresh(source="account_switch")
         return self.account_slots_payload()
 
+    def proxy_settings_payload(self) -> dict[str, object]:
+        settings = load_proxy_settings(self.proxy_settings_file)
+        return {
+            "proxy_enabled": bool(settings.get("proxy_enabled", DEFAULT_PROXY_ENABLED)),
+            "proxy_port": int(settings.get("proxy_port", DEFAULT_PROXY_PORT)),
+            "proxy_scheme": "socks5h",
+            "proxy_host": "127.0.0.1",
+            "proxy_summary": current_proxy_summary_from_settings(settings),
+        }
+
+    def update_proxy_settings(self, proxy_enabled: bool, proxy_port: int) -> dict[str, object]:
+        save_proxy_settings(proxy_enabled, proxy_port, self.proxy_settings_file)
+        return self.proxy_settings_payload()
+
     def has_running_jobs(self) -> bool:
         with self.jobs.lock:
             return any(str(job.get("status", "")) == "running" for job in self.jobs.jobs.values())
@@ -1761,6 +1871,7 @@ class PortalService:
 </html>"""
 
     def bootstrap_payload(self) -> dict[str, object]:
+        proxy_summary = current_proxy_summary(self.proxy_settings_file)
         sessions: list[dict[str, object]] = []
         for item in self.data_store.load_sessions():
             payload = asdict(item)
@@ -1776,7 +1887,7 @@ class PortalService:
             "sandbox_options": ["default", "read-only", "workspace-write", "danger-full-access"],
             "reasoning_options": list(REASONING_EFFORT_OPTIONS),
             "recent_cwds": self.jobs.list_recent_cwds(),
-            "proxy_summary": current_proxy_summary(),
+            "proxy_summary": proxy_summary,
         }
 
     def session_payload(self, session_id: str) -> dict[str, object] | None:
@@ -1788,7 +1899,7 @@ class PortalService:
             session["is_replying"] = self.jobs.active_job_for_session(session_id) is not None
         payload["owner"] = self.jobs.current_owner(session_id)
         payload["active_job"] = self.jobs.active_job_for_session(session_id)
-        payload["proxy_summary"] = current_proxy_summary()
+        payload["proxy_summary"] = current_proxy_summary(self.proxy_settings_file)
         payload["models"] = ["default", *self.data_store.load_available_models()]
         payload["approval_options"] = ["default", "untrusted", "on-request", "never"]
         payload["sandbox_options"] = ["default", "read-only", "workspace-write", "danger-full-access"]
@@ -2501,6 +2612,9 @@ class PortalHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/accounts":
             self._send_json(self.portal.account_slots_payload())
             return
+        if parsed.path == "/api/proxy-settings":
+            self._send_json(self.portal.proxy_settings_payload())
+            return
         if parsed.path.startswith("/api/sessions/"):
             session_id = parsed.path.removeprefix("/api/sessions/")
             payload = self.portal.session_payload(session_id)
@@ -2677,6 +2791,17 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(result, status=HTTPStatus.CREATED)
+            return
+        if parsed.path == "/api/proxy-settings":
+            try:
+                result = self.portal.update_proxy_settings(
+                    proxy_enabled=bool(payload.get("proxy_enabled", DEFAULT_PROXY_ENABLED)),
+                    proxy_port=int(payload.get("proxy_port", DEFAULT_PROXY_PORT)),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
             return
         if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/rename"):
             slot_id = parsed.path.split("/")[3]

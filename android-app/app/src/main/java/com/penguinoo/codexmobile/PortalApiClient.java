@@ -41,6 +41,23 @@ public final class PortalApiClient {
         return parseAccountSlotsPayload(json);
     }
 
+    public PortalProxySettings fetchProxySettings(PortalEndpoint endpoint) throws IOException {
+        JSONObject json = getJson(endpoint, "/api/proxy-settings");
+        return parseProxySettings(json);
+    }
+
+    public PortalProxySettings saveProxySettings(PortalEndpoint endpoint, boolean proxyEnabled, int proxyPort) throws IOException {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("proxy_enabled", proxyEnabled);
+            body.put("proxy_port", proxyPort);
+        } catch (JSONException exception) {
+            throw new IOException("Failed to build proxy settings request.", exception);
+        }
+        JSONObject json = postJson(endpoint, "/api/proxy-settings", body);
+        return parseProxySettings(json);
+    }
+
     public AccountSlotsPayload bindCurrentAccount(PortalEndpoint endpoint, String slotId) throws IOException {
         JSONObject json = postJson(endpoint, "/api/accounts/" + slotId + "/bind", new JSONObject());
         return parseAccountSlotsPayload(json);
@@ -322,6 +339,16 @@ public final class PortalApiClient {
                 quota == null ? "" : quota.optString("state"),
                 json.optBoolean("has_running_jobs", false),
                 parseAccountSlots(json.optJSONArray("slots"))
+        );
+    }
+
+    static PortalProxySettings parseProxySettings(JSONObject json) {
+        return new PortalProxySettings(
+                json.optBoolean("proxy_enabled", true),
+                json.optInt("proxy_port", 7897),
+                json.optString("proxy_scheme", "socks5h"),
+                json.optString("proxy_host", "127.0.0.1"),
+                json.optString("proxy_summary")
         );
     }
 

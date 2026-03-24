@@ -4,11 +4,13 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
+import android.text.InputType;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -16,6 +18,7 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.widget.SwitchCompat;
 import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 
@@ -126,6 +129,10 @@ public final class MainActivity extends AppCompatActivity {
         }
         if (itemId == R.id.action_accounts) {
             showAccountsDialog();
+            return true;
+        }
+        if (itemId == R.id.action_proxy_settings) {
+            showProxySettingsDialog();
             return true;
         }
         if (itemId == R.id.action_clear_saved) {
@@ -321,6 +328,100 @@ public final class MainActivity extends AppCompatActivity {
         });
     }
 
+    private void showProxySettingsDialog() {
+        String rawUrl = configStore.getPortalUrl();
+        if (rawUrl.isEmpty()) {
+            showBanner(getString(R.string.banner_paste_portal));
+            return;
+        }
+        showBanner(getString(R.string.banner_loading_proxy_settings));
+        executor.execute(() -> {
+            try {
+                PortalEndpoint endpoint = PortalEndpoint.parse(rawUrl);
+                PortalProxySettings settings = apiClient.fetchProxySettings(endpoint);
+                runOnUiThread(() -> presentProxySettingsDialog(endpoint, settings));
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void presentProxySettingsDialog(PortalEndpoint endpoint, PortalProxySettings settings) {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        int horizontalPadding = dpToPx(20);
+        int verticalPadding = dpToPx(12);
+        container.setPadding(horizontalPadding, verticalPadding, horizontalPadding, 0);
+
+        TextView hintView = new TextView(this);
+        hintView.setText(R.string.message_proxy_settings_hint);
+        container.addView(hintView);
+
+        SwitchCompat enabledSwitch = new SwitchCompat(this);
+        enabledSwitch.setText(R.string.label_proxy_enabled);
+        enabledSwitch.setChecked(settings.proxyEnabled);
+        enabledSwitch.setPadding(0, dpToPx(16), 0, 0);
+        container.addView(enabledSwitch);
+
+        EditText portInput = new EditText(this);
+        portInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        portInput.setHint(R.string.label_proxy_port);
+        portInput.setText(String.valueOf(settings.proxyPort));
+        portInput.setSelection(portInput.getText().length());
+        portInput.setEnabled(settings.proxyEnabled);
+        container.addView(portInput);
+
+        TextView summaryView = new TextView(this);
+        summaryView.setText(getString(
+                R.string.label_proxy_summary,
+                settings.proxySummary == null || settings.proxySummary.isEmpty() ? "direct" : settings.proxySummary
+        ));
+        summaryView.setPadding(0, dpToPx(16), 0, 0);
+        container.addView(summaryView);
+
+        enabledSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> portInput.setEnabled(isChecked));
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.title_proxy_settings)
+                .setView(container)
+                .setPositiveButton(R.string.action_save, (dialog, which) -> saveProxySettings(
+                        endpoint,
+                        enabledSwitch.isChecked(),
+                        portInput.getText() == null ? "" : portInput.getText().toString()
+                ))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void saveProxySettings(PortalEndpoint endpoint, boolean proxyEnabled, String rawPort) {
+        int proxyPort;
+        try {
+            proxyPort = Integer.parseInt((rawPort == null ? "" : rawPort).trim());
+        } catch (NumberFormatException exception) {
+            showBanner(getString(R.string.message_proxy_port_required));
+            return;
+        }
+        if (proxyPort < 1 || proxyPort > 65535) {
+            showBanner(getString(R.string.message_proxy_port_required));
+            return;
+        }
+        showBanner(getString(R.string.banner_saving_proxy_settings));
+        executor.execute(() -> {
+            try {
+                PortalProxySettings result = apiClient.saveProxySettings(endpoint, proxyEnabled, proxyPort);
+                runOnUiThread(() -> {
+                    showBanner(getString(
+                            R.string.banner_proxy_settings_saved,
+                            result.proxySummary == null || result.proxySummary.isEmpty() ? "direct" : result.proxySummary
+                    ));
+                    loadBootstrap();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
     private void presentAccountsDialog(PortalEndpoint endpoint, AccountSlotsPayload payload) {
         List<AccountSlotSummary> slots = payload.slots;
         CharSequence[] items = new CharSequence[slots.size()];
@@ -503,6 +604,10 @@ public final class MainActivity extends AppCompatActivity {
 
     private void startReplyMonitor() {
         app().getReplyMonitor().start(configStore.getPortalUrl());
+    }
+
+    private int dpToPx(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     private CodexMobileApp app() {

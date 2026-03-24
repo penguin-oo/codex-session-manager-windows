@@ -8,7 +8,7 @@ public final class ChatStreamingState {
     }
 
     public static String resolveLiveText(PortalJob job) {
-        if (job == null || !job.isRunning()) {
+        if (job == null) {
             return "";
         }
         if (job.liveText != null && !job.liveText.isBlank()) {

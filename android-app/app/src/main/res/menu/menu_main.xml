@@ -14,6 +14,10 @@
         android:title="@string/action_accounts"
         app:showAsAction="never" />
     <item
+        android:id="@+id/action_proxy_settings"
+        android:title="@string/action_proxy_settings"
+        app:showAsAction="never" />
+    <item
         android:id="@+id/action_clear_saved"
         android:title="@string/action_clear"
         app:showAsAction="never" />

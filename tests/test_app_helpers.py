@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import app
 
@@ -115,6 +116,83 @@ class AppHelperTests(unittest.TestCase):
         summary = app.format_account_quota_summary({"summary": "Weekly quota: 76% used", "state": "ok"})
 
         self.assertEqual("Weekly quota: 76% used", summary)
+
+    def test_build_token_pool_provider_override_args_points_codex_to_local_proxy(self) -> None:
+        args = app.build_token_pool_provider_override_args(
+            model="gpt-5.4",
+            proxy_port=8317,
+            provider_name="built_in_token_pool",
+            env_key_name="CODEX_TOKEN_POOL_API_KEY",
+        )
+
+        rendered = " ".join(args)
+        self.assertIn('model_provider="built_in_token_pool"', rendered)
+        self.assertIn('model_providers.built_in_token_pool.base_url="http://127.0.0.1:8317"', rendered)
+        self.assertIn('model_providers.built_in_token_pool.env_key="CODEX_TOKEN_POOL_API_KEY"', rendered)
+        self.assertIn('model_providers.built_in_token_pool.wire_api="responses"', rendered)
+        self.assertIn('model_providers.built_in_token_pool.requires_openai_auth=false', rendered)
+        self.assertIn('model_providers.built_in_token_pool.supports_websockets=false', rendered)
+
+    def test_build_token_pool_environment_ps_prefix_sets_local_api_key(self) -> None:
+        prefix = app.build_token_pool_environment_ps_prefix(
+            env_key_name="CODEX_TOKEN_POOL_API_KEY",
+            api_key_value="local-proxy-key",
+        )
+
+        self.assertIn("$env:CODEX_TOKEN_POOL_API_KEY='local-proxy-key'", prefix)
+
+    def test_build_token_pool_proxy_command_uses_app_script_in_source_mode(self) -> None:
+        with mock.patch.object(app.shutil, "which", return_value=None):
+            command = app.build_token_pool_proxy_command(
+                executable="C:\\Python311\\python.exe",
+                app_path="D:\\codex\\manger\\app.py",
+                port=8317,
+                api_key="local-proxy-key",
+                token_dir="C:\\Users\\MECHREVO\\.cli-proxy-api",
+                frozen=False,
+            )
+
+        self.assertEqual("C:\\Python311\\python.exe", command[0])
+        self.assertEqual("D:\\codex\\manger\\app.py", command[1])
+        self.assertIn("--token-pool-proxy", command)
+        self.assertIn("--port", command)
+
+    def test_build_token_pool_proxy_command_prefers_conda_env_when_available(self) -> None:
+        with mock.patch.object(app.shutil, "which", return_value="C:\\Miniconda3\\condabin\\conda.bat"):
+            command = app.build_token_pool_proxy_command(
+                executable="C:\\Python311\\python.exe",
+                app_path="D:\\codex\\manger\\app.py",
+                port=8317,
+                api_key="local-proxy-key",
+                token_dir="C:\\Users\\MECHREVO\\.cli-proxy-api",
+                frozen=False,
+            )
+
+        self.assertEqual("C:\\Miniconda3\\condabin\\conda.bat", command[0])
+        self.assertEqual(["run", "--no-capture-output", "-n", "codex-accel", "python", "D:\\codex\\manger\\app.py"], command[1:7])
+        self.assertIn("--token-pool-proxy", command)
+
+    def test_build_token_pool_proxy_command_uses_executable_only_when_frozen(self) -> None:
+        command = app.build_token_pool_proxy_command(
+            executable="D:\\codex\\manger\\codex-session-manager.exe",
+            app_path="D:\\codex\\manger\\app.py",
+            port=8317,
+            api_key="local-proxy-key",
+            token_dir="C:\\Users\\MECHREVO\\.cli-proxy-api",
+            frozen=True,
+        )
+
+        self.assertEqual("D:\\codex\\manger\\codex-session-manager.exe", command[0])
+        self.assertNotIn("D:\\codex\\manger\\app.py", command)
+
+    def test_main_dispatches_token_pool_proxy_mode(self) -> None:
+        with mock.patch.object(app, "sys") as mocked_sys, mock.patch.object(app.token_pool_proxy, "main", return_value=7) as proxy_main:
+            mocked_sys.argv = ["app.py", "--token-pool-proxy", "--port", "8317", "--api-key", "local", "--token-dir", "C:\\tokens"]
+
+            result = app.main()
+
+        self.assertEqual(7, result)
+        proxy_main.assert_called_once_with(["--port", "8317", "--api-key", "local", "--token-dir", "C:\\tokens"])
 
 
 

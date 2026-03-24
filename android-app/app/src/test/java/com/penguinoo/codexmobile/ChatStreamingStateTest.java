@@ -10,6 +10,23 @@ import org.junit.Test;
 
 public final class ChatStreamingStateTest {
     @Test
+    public void resolveLiveText_keepsPartialTextForCancelledJobs() {
+        PortalJob job = new PortalJob(
+                "job-1",
+                "cancelled",
+                "session-1",
+                "partial answer",
+                "",
+                "",
+                0,
+                "",
+                ""
+        );
+
+        assertEquals("partial answer", ChatStreamingState.resolveLiveText(job));
+    }
+
+    @Test
     public void applyLiveText_appendsEphemeralAssistantBubble() {
         List<ChatMessage> messages = new ArrayList<>();
         messages.add(new ChatMessage("user", "hello", 1L));

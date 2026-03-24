@@ -1,11 +1,14 @@
 ﻿import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 import tomllib
 import tkinter as tk
 import auth_slots
+import token_pool_proxy
+import token_pool_settings
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +29,7 @@ MODELS_CACHE_FILE = CODEX_HOME / "models_cache.json"
 SKILLS_DIR = CODEX_HOME / "skills"
 PORTAL_TOKEN_FILE = CODEX_HOME / "mobile_portal_token.txt"
 DESKTOP_REFRESH_SIGNAL_FILE = CODEX_HOME / "desktop_refresh_signal.json"
+TOKEN_POOL_PROXY_STATE_FILE = CODEX_HOME / "token_pool_proxy_state.json"
 PORTAL_BASE_URL = "http://127.0.0.1:8765"
 APP_DIR = Path(__file__).resolve().parent
 AUTO_REFRESH_MS = 2500
@@ -34,6 +38,8 @@ PORTAL_TIMEOUT_SECONDS = 0.25
 PORTAL_BACKOFF_SECONDS = 5.0
 TERMINAL_PROXY_SCHEMES = ("http", "socks5", "socks5h")
 DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1,.local,.ts.net"
+TOKEN_POOL_PROVIDER_NAME = "built_in_token_pool"
+TOKEN_POOL_ENV_KEY_NAME = "CODEX_TOKEN_POOL_API_KEY"
 @dataclass
 class SessionItem:
     session_id: str
@@ -133,6 +139,96 @@ def build_proxy_environment_ps_prefix(enabled: bool, scheme: str, host: str, por
     )
 
 
+def build_token_pool_environment_ps_prefix(env_key_name: str, api_key_value: str) -> str:
+    clean_name = env_key_name.strip()
+    if not clean_name:
+        raise ValueError("Token pool env key name is required.")
+    escaped_value = api_key_value.replace("'", "''")
+    return f"$env:{clean_name}='{escaped_value}'; "
+
+
+def build_token_pool_provider_override_args(
+    model: str,
+    proxy_port: int,
+    provider_name: str = TOKEN_POOL_PROVIDER_NAME,
+    env_key_name: str = TOKEN_POOL_ENV_KEY_NAME,
+) -> list[str]:
+    clean_provider = provider_name.strip() or TOKEN_POOL_PROVIDER_NAME
+    clean_env_key = env_key_name.strip() or TOKEN_POOL_ENV_KEY_NAME
+    clean_model = model.strip()
+    if not clean_model:
+        raise ValueError("A model is required for token pool launches.")
+    return [
+        "-c",
+        f'model_provider="{clean_provider}"',
+        "-c",
+        f'model_providers.{clean_provider}.name="Built-in Token Pool"',
+        "-c",
+        f'model_providers.{clean_provider}.base_url="http://127.0.0.1:{int(proxy_port)}"',
+        "-c",
+        f'model_providers.{clean_provider}.env_key="{clean_env_key}"',
+        "-c",
+        f'model_providers.{clean_provider}.wire_api="responses"',
+        "-c",
+        f'model_providers.{clean_provider}.requires_openai_auth=false',
+        "-c",
+        f'model_providers.{clean_provider}.supports_websockets=false',
+    ]
+
+
+def build_token_pool_proxy_command(
+    *,
+    executable: str,
+    app_path: str,
+    port: int,
+    api_key: str,
+    token_dir: str,
+    frozen: bool,
+) -> list[str]:
+    if not frozen:
+        conda_executable = shutil.which("conda")
+        if conda_executable:
+            command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
+        else:
+            command = [executable, app_path]
+    else:
+        command = [executable]
+    command.extend(
+        [
+            "--token-pool-proxy",
+            "--port",
+            str(int(port)),
+            "--api-key",
+            api_key,
+            "--token-dir",
+            token_dir,
+        ]
+    )
+    return command
+
+
+def load_token_pool_proxy_state(state_file: Path = TOKEN_POOL_PROXY_STATE_FILE) -> dict[str, object]:
+    if not state_file.exists():
+        return {}
+    try:
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_token_pool_proxy_state(state: dict[str, object], state_file: Path = TOKEN_POOL_PROXY_STATE_FILE) -> None:
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_token_pool_proxy_state(state_file: Path = TOKEN_POOL_PROXY_STATE_FILE) -> None:
+    try:
+        state_file.unlink()
+    except OSError:
+        pass
+
+
 def read_current_weekly_quota(timeout_seconds: float = 4.0) -> dict[str, str]:
     try:
         result = subprocess.run(
@@ -225,6 +321,7 @@ class SessionManagerApp:
         self._desktop_signal_mtime = DESKTOP_REFRESH_SIGNAL_FILE.stat().st_mtime if DESKTOP_REFRESH_SIGNAL_FILE.exists() else 0.0
         self._history_signature: tuple[int, int] | None = None
         self.account_var = tk.StringVar(value="Auth: checking...")
+        self.backend_settings = token_pool_settings.load_backend_settings()
 
         self.font_scale = 1.0
         self._base_fonts: dict[str, int] = {}
@@ -1066,11 +1163,14 @@ class SessionManagerApp:
     def _build_codex_resume_args(self, item: SessionItem) -> list[str]:
         args: list[str] = ["codex.cmd", "resume", item.session_id]
         args.extend(self._build_codex_override_args())
+        args.extend(self._build_backend_override_args(item.model.strip() or "gpt-5.4"))
         return args
 
     def _build_codex_new_args(self) -> list[str]:
         args: list[str] = ["codex.cmd"]
         args.extend(self._build_codex_override_args())
+        selected_model = self.model_var.get().strip()
+        args.extend(self._build_backend_override_args(selected_model if selected_model and selected_model != "default" else "gpt-5.4"))
         return args
 
     def _toggle_launch_overrides(self) -> None:
@@ -1097,6 +1197,152 @@ class SessionManagerApp:
             port_text=self.proxy_port_var.get(),
         )
 
+    def _reload_backend_settings(self) -> dict[str, object]:
+        self.backend_settings = token_pool_settings.load_backend_settings()
+        return self.backend_settings
+
+    def _token_pool_settings(self) -> dict[str, object]:
+        return self._reload_backend_settings()
+
+    def _build_token_pool_ps_prefix(self) -> str:
+        settings = self._token_pool_settings()
+        return build_token_pool_environment_ps_prefix(
+            env_key_name=TOKEN_POOL_ENV_KEY_NAME,
+            api_key_value=str(settings.get("proxy_api_key", "")),
+        )
+
+    def _token_pool_health(self, port: int | None = None) -> dict[str, object] | None:
+        settings = self._token_pool_settings()
+        health_port = int(port or settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
+        req = url_request.Request(
+            f"http://127.0.0.1:{health_port}/health",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with url_request.urlopen(req, timeout=0.5) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (OSError, ValueError, url_error.URLError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _build_token_pool_proxy_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["PYTHONNOUSERSITE"] = "1"
+        if self.use_proxy_var.get():
+            proxy_prefix = build_proxy_environment_ps_prefix(
+                enabled=True,
+                scheme=self.proxy_scheme_var.get(),
+                host=self.proxy_host_var.get(),
+                port_text=self.proxy_port_var.get(),
+            )
+            proxy_map = {
+                "HTTP_PROXY": None,
+                "HTTPS_PROXY": None,
+                "ALL_PROXY": None,
+                "http_proxy": None,
+                "https_proxy": None,
+                "all_proxy": None,
+                "NO_PROXY": DEFAULT_NO_PROXY,
+                "no_proxy": DEFAULT_NO_PROXY,
+            }
+            clean_scheme = self.proxy_scheme_var.get().strip().lower() or "http"
+            clean_host = self.proxy_host_var.get().strip() or "127.0.0.1"
+            clean_port = int(self.proxy_port_var.get())
+            proxy_url = f"{clean_scheme}://{clean_host}:{clean_port}"
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+                env[key] = proxy_url
+            env["NO_PROXY"] = DEFAULT_NO_PROXY
+            env["no_proxy"] = DEFAULT_NO_PROXY
+            _ = proxy_prefix
+        else:
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+                env.pop(key, None)
+            env["NO_PROXY"] = DEFAULT_NO_PROXY
+            env["no_proxy"] = DEFAULT_NO_PROXY
+        return env
+
+    def _start_token_pool_proxy(self) -> None:
+        settings = self._token_pool_settings()
+        token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+        token_pool_settings.ensure_token_pool_dir(token_dir)
+        token_files = token_pool_settings.list_token_files(token_dir)
+        if not token_files:
+            raise RuntimeError(f"No token files found in {token_dir}")
+        port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
+        if self._token_pool_health(port):
+            return
+        command = build_token_pool_proxy_command(
+            executable=sys.executable,
+            app_path=str(Path(__file__).resolve()),
+            port=port,
+            api_key=str(settings.get("proxy_api_key", "")),
+            token_dir=str(token_dir),
+            frozen=getattr(sys, "frozen", False),
+        )
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(APP_DIR),
+            env=self._build_token_pool_proxy_env(),
+            creationflags=creationflags,
+        )
+        save_token_pool_proxy_state(
+            {
+                "pid": proc.pid,
+                "port": port,
+                "token_dir": str(token_dir),
+                "started_at": time.time(),
+            }
+        )
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            if self._token_pool_health(port):
+                return
+            time.sleep(0.2)
+        raise RuntimeError("Built-in token pool proxy did not become ready.")
+
+    def _stop_token_pool_proxy(self) -> None:
+        state = load_token_pool_proxy_state()
+        pid = int(state.get("pid", 0) or 0)
+        if pid > 0:
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
+            except OSError:
+                pass
+        clear_token_pool_proxy_state()
+
+    def _restart_token_pool_proxy(self) -> None:
+        self._stop_token_pool_proxy()
+        time.sleep(0.2)
+        self._start_token_pool_proxy()
+
+    def _token_pool_status_summary(self) -> str:
+        settings = self._token_pool_settings()
+        token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+        token_count = len(token_pool_settings.list_token_files(token_dir))
+        port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
+        health = self._token_pool_health(port)
+        mode = str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH))
+        running = "running" if health else "stopped"
+        return f"Mode: {mode}\nToken files: {token_count}\nPort: {port}\nProxy: {running}"
+
+    def _build_backend_override_args(self, fallback_model: str) -> list[str]:
+        settings = self._token_pool_settings()
+        if settings.get("backend_mode") != token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+            return []
+        return build_token_pool_provider_override_args(
+            model=fallback_model,
+            proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+            provider_name=TOKEN_POOL_PROVIDER_NAME,
+            env_key_name=TOKEN_POOL_ENV_KEY_NAME,
+        )
+
+    def _ensure_backend_ready(self) -> None:
+        settings = self._token_pool_settings()
+        if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+            self._start_token_pool_proxy()
+
     def _toggle_proxy_controls(self) -> None:
         proxy_controls_enabled = self.use_proxy_var.get()
         state = "readonly" if proxy_controls_enabled else "disabled"
@@ -1109,6 +1355,10 @@ class SessionManagerApp:
     def _build_terminal_ps_command(self, cwd: str, codex_args: list[str]) -> str:
         cwd_escaped = cwd.replace("'", "''")
         proxy_prefix = self._build_proxy_ps_prefix()
+        token_pool_prefix = ""
+        settings = self._token_pool_settings()
+        if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+            token_pool_prefix = self._build_token_pool_ps_prefix()
         return (
             "chcp 65001 > $null; "
             "$utf8 = [System.Text.UTF8Encoding]::new($false); "
@@ -1116,6 +1366,7 @@ class SessionManagerApp:
             "[Console]::OutputEncoding = $utf8; "
             "$OutputEncoding = $utf8; "
             f"{proxy_prefix}"
+            f"{token_pool_prefix}"
             f"Set-Location -LiteralPath '{cwd_escaped}'; "
             f"& {self._to_ps_arg_string(codex_args)}"
         )
@@ -1159,6 +1410,103 @@ class SessionManagerApp:
         action_row.pack(fill=tk.X, pady=(0, 10))
         ttk.Button(action_row, text="New Slot", command=lambda: create_slot()).pack(side=tk.LEFT)
 
+        backend_mode_var = tk.StringVar(value=str(self._token_pool_settings().get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)))
+        token_dir_var = tk.StringVar(value="")
+        token_pool_status_var = tk.StringVar(value="")
+
+        token_pool_frame = ttk.LabelFrame(container, text="Built-in Token Pool", padding=10)
+        token_pool_frame.pack(fill=tk.X, pady=(0, 10))
+
+        mode_row = ttk.Frame(token_pool_frame)
+        mode_row.pack(fill=tk.X)
+        ttk.Radiobutton(mode_row, text="Use Codex Auth", variable=backend_mode_var, value=token_pool_settings.BACKEND_MODE_CODEX_AUTH).pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_row, text="Use Built-in Token Pool", variable=backend_mode_var, value=token_pool_settings.BACKEND_MODE_TOKEN_POOL).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(mode_row, text="Apply Mode", command=lambda: apply_backend_mode()).pack(side=tk.RIGHT)
+
+        ttk.Label(token_pool_frame, text="Token folder", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 0))
+        ttk.Label(token_pool_frame, textvariable=token_dir_var, justify=tk.LEFT, wraplength=540).pack(anchor="w", pady=(4, 8))
+        ttk.Label(token_pool_frame, text="Status", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        ttk.Label(token_pool_frame, textvariable=token_pool_status_var, justify=tk.LEFT, wraplength=540).pack(anchor="w", pady=(4, 8))
+
+        token_pool_button_row = ttk.Frame(token_pool_frame)
+        token_pool_button_row.pack(fill=tk.X)
+        ttk.Button(token_pool_button_row, text="Import Token Files", command=lambda: import_token_files_dialog()).pack(side=tk.LEFT)
+        ttk.Button(token_pool_button_row, text="Open Token Folder", command=lambda: open_token_folder()).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(token_pool_button_row, text="Start Proxy", command=lambda: start_token_pool_proxy_dialog()).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(token_pool_button_row, text="Stop Proxy", command=lambda: stop_token_pool_proxy_dialog()).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(token_pool_button_row, text="Restart Proxy", command=lambda: restart_token_pool_proxy_dialog()).pack(side=tk.LEFT, padx=(8, 0))
+
+        def refresh_token_pool_section() -> None:
+            settings = self._token_pool_settings()
+            token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+            token_pool_settings.ensure_token_pool_dir(token_dir)
+            backend_mode_var.set(str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)))
+            token_dir_var.set(str(token_dir))
+            token_pool_status_var.set(self._token_pool_status_summary())
+
+        def apply_backend_mode() -> None:
+            settings = self._token_pool_settings()
+            token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+            updated = token_pool_settings.save_backend_settings(
+                backend_mode=backend_mode_var.get(),
+                token_dir=token_dir,
+                proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+                proxy_api_key=str(settings.get("proxy_api_key", "")),
+            )
+            self.backend_settings = updated
+            refresh_token_pool_section()
+            self.status_var.set(f"Auth backend set to {updated.get('backend_mode')}")
+
+        def import_token_files_dialog() -> None:
+            settings = self._token_pool_settings()
+            token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+            token_pool_settings.ensure_token_pool_dir(token_dir)
+            selected = filedialog.askopenfilenames(
+                parent=dialog,
+                title="Import token JSON files",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+            if not selected:
+                return
+            try:
+                imported = token_pool_settings.import_token_files([Path(path) for path in selected], token_dir=token_dir)
+            except Exception as exc:
+                messagebox.showerror("Import Token Files", str(exc), parent=dialog)
+                return
+            refresh_token_pool_section()
+            self.status_var.set(f"Imported {len(imported)} token file(s)")
+
+        def open_token_folder() -> None:
+            settings = self._token_pool_settings()
+            token_dir = token_pool_settings.ensure_token_pool_dir(Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR))))
+            try:
+                os.startfile(str(token_dir))  # type: ignore[attr-defined]
+            except Exception as exc:
+                messagebox.showerror("Open Token Folder", str(exc), parent=dialog)
+
+        def start_token_pool_proxy_dialog() -> None:
+            try:
+                self._start_token_pool_proxy()
+            except Exception as exc:
+                messagebox.showerror("Start Proxy", str(exc), parent=dialog)
+                return
+            refresh_token_pool_section()
+            self.status_var.set("Built-in token pool proxy started")
+
+        def stop_token_pool_proxy_dialog() -> None:
+            self._stop_token_pool_proxy()
+            refresh_token_pool_section()
+            self.status_var.set("Built-in token pool proxy stopped")
+
+        def restart_token_pool_proxy_dialog() -> None:
+            try:
+                self._restart_token_pool_proxy()
+            except Exception as exc:
+                messagebox.showerror("Restart Proxy", str(exc), parent=dialog)
+                return
+            refresh_token_pool_section()
+            self.status_var.set("Built-in token pool proxy restarted")
+
         def refresh_dialog() -> None:
             auth_info = auth_slots.current_auth_info()
             active_slot = auth_slots.detect_active_slot()
@@ -1174,6 +1522,7 @@ class SessionManagerApp:
                 child.destroy()
             if not slots:
                 ttk.Label(slots_frame, text="No account slots yet. Create one, then bind the current login.").pack(anchor="w")
+                refresh_token_pool_section()
                 return
             for index, slot_info in enumerate(slots):
                 slot_id = str(slot_info.get("slot_id", ""))
@@ -1197,6 +1546,7 @@ class SessionManagerApp:
                 ttk.Button(button_row, text="Rename", command=lambda value=slot_id, label=slot_info.get("label", ""): rename_slot(value, label)).pack(side=tk.LEFT, padx=(8, 0))
                 ttk.Button(button_row, text="Delete", command=lambda value=slot_id, label=slot_info.get("label", ""): delete_slot(value, label)).pack(side=tk.LEFT, padx=(8, 0))
             slots_frame.grid_columnconfigure(0, weight=1)
+            refresh_token_pool_section()
 
         def create_slot() -> None:
             label = simpledialog.askstring("New Slot", "Slot label:", parent=dialog)
@@ -1324,10 +1674,11 @@ class SessionManagerApp:
 
         cwd = item.cwd or str(Path.home())
 
-        codex_args = self._build_codex_resume_args(item)
         try:
+            self._ensure_backend_ready()
+            codex_args = self._build_codex_resume_args(item)
             ps_command = self._build_terminal_ps_command(cwd, codex_args)
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             messagebox.showerror("Invalid Proxy", str(exc))
             return
 
@@ -1351,10 +1702,11 @@ class SessionManagerApp:
         )
         if not target_dir:
             return
-        codex_args = self._build_codex_new_args()
         try:
+            self._ensure_backend_ready()
+            codex_args = self._build_codex_new_args()
             ps_command = self._build_terminal_ps_command(target_dir, codex_args)
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             messagebox.showerror("Invalid Proxy", str(exc))
             return
         start_process = build_start_process_command(ps_command, self.admin_var.get())
@@ -1447,6 +1799,10 @@ class SessionManagerApp:
 
 
 def main() -> int:
+    if "--token-pool-proxy" in sys.argv[1:]:
+        marker_index = sys.argv.index("--token-pool-proxy")
+        return token_pool_proxy.main(sys.argv[marker_index + 1 :])
+
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():

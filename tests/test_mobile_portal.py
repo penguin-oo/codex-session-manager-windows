@@ -49,6 +49,54 @@ class WorkingDirectoryTests(unittest.TestCase):
             self.assertTrue(target.is_dir())
 
 
+class ProxySettingsTests(unittest.TestCase):
+    def test_load_proxy_settings_defaults_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+
+            settings = mobile_portal.load_proxy_settings(settings_path)
+
+            self.assertTrue(settings["proxy_enabled"])
+            self.assertEqual(7897, settings["proxy_port"])
+
+    def test_save_proxy_settings_validates_port(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+
+            saved = mobile_portal.save_proxy_settings(False, 9001, settings_path)
+
+            self.assertFalse(saved["proxy_enabled"])
+            self.assertEqual(9001, saved["proxy_port"])
+
+            with self.assertRaisesRegex(ValueError, "between 1 and 65535"):
+                mobile_portal.save_proxy_settings(True, 70000, settings_path)
+
+    def test_apply_proxy_settings_to_env_uses_fixed_host_and_scheme(self) -> None:
+        env = {"NO_PROXY": "localhost"}
+
+        updated = mobile_portal.apply_proxy_settings_to_env(env, {"proxy_enabled": True, "proxy_port": 9002})
+
+        self.assertEqual("socks5h://127.0.0.1:9002", updated["ALL_PROXY"])
+        self.assertEqual("localhost", updated["NO_PROXY"])
+
+        disabled = mobile_portal.apply_proxy_settings_to_env(env, {"proxy_enabled": False, "proxy_port": 9002})
+        self.assertNotIn("ALL_PROXY", disabled)
+
+    def test_build_codex_subprocess_env_uses_saved_settings_over_existing_proxy_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            mobile_portal.save_proxy_settings(True, 9003, settings_path)
+            with mock.patch.dict(
+                mobile_portal.os.environ,
+                {"ALL_PROXY": "http://10.0.0.2:8888", "NO_PROXY": "localhost"},
+                clear=True,
+            ):
+                env = mobile_portal.build_codex_subprocess_env(settings_file=settings_path)
+
+        self.assertEqual("socks5h://127.0.0.1:9003", env["ALL_PROXY"])
+        self.assertEqual("localhost", env["NO_PROXY"])
+
+
 class _FakeStore:
     def __init__(self, sessions: list[mobile_portal.SessionItem] | None = None) -> None:
         self._sessions = sessions or []
@@ -448,6 +496,23 @@ class PortalServiceBootstrapTests(unittest.TestCase):
         self.assertEqual("danger-full-access", session_payload["sandbox_mode"])
         self.assertEqual("high", session_payload["reasoning_effort"])
 
+    def test_proxy_settings_payload_and_update_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            service.proxy_settings_file = settings_path
+
+            initial = service.proxy_settings_payload()
+            updated = service.update_proxy_settings(False, 9010)
+
+        self.assertTrue(initial["proxy_enabled"])
+        self.assertEqual(7897, initial["proxy_port"])
+        self.assertEqual("socks5h", initial["proxy_scheme"])
+        self.assertEqual("127.0.0.1", initial["proxy_host"])
+        self.assertFalse(updated["proxy_enabled"])
+        self.assertEqual(9010, updated["proxy_port"])
+        self.assertEqual("direct", updated["proxy_summary"])
+
 
 class PortalAccountSlotsTests(unittest.TestCase):
     def test_account_slots_payload_includes_active_slot_running_flag_and_quota(self) -> None:
@@ -649,11 +714,14 @@ class ProxyEnvTests(unittest.TestCase):
         self.assertEqual("socks5h://127.0.0.1:7897", env["ALL_PROXY"])
         self.assertEqual("localhost,127.0.0.1,::1", env["NO_PROXY"])
 
-    def test_build_codex_subprocess_env_preserves_explicit_proxy(self) -> None:
-        with mock.patch.dict(mobile_portal.os.environ, {"ALL_PROXY": "http://10.0.0.2:8888"}, clear=True):
-            env = mobile_portal.build_codex_subprocess_env()
+    def test_build_codex_subprocess_env_uses_saved_proxy_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            mobile_portal.save_proxy_settings(True, 9003, settings_path)
+            with mock.patch.dict(mobile_portal.os.environ, {"ALL_PROXY": "http://10.0.0.2:8888"}, clear=True):
+                env = mobile_portal.build_codex_subprocess_env(settings_file=settings_path)
 
-        self.assertEqual("http://10.0.0.2:8888", env["ALL_PROXY"])
+        self.assertEqual("socks5h://127.0.0.1:9003", env["ALL_PROXY"])
 
 
 class SessionProcessDetectionTests(unittest.TestCase):
@@ -788,6 +856,239 @@ class HistoryEntryTests(unittest.TestCase):
         text = mobile_portal.build_history_entry_text("", [Path("photo.jpg")])
 
         self.assertEqual("[Image] photo.jpg", text)
+
+
+class LoadMessagesTests(unittest.TestCase):
+    def test_load_messages_includes_user_messages_from_session_file_when_history_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            history_file = temp_root / "history.jsonl"
+            sessions_dir = temp_root / "sessions" / "2026" / "03" / "19"
+            sessions_dir.mkdir(parents=True)
+            session_file = sessions_dir / "rollout-session-1.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "session-1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:01.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "hello from file"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:02.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "final_answer",
+                                    "content": [{"type": "output_text", "text": "reply from file"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(mobile_portal, "HISTORY_FILE", history_file), \
+                    mock.patch.object(mobile_portal, "SESSIONS_DIR", temp_root / "sessions"):
+                store = mobile_portal.CodexDataStore()
+                messages = store.load_messages("session-1")
+
+        self.assertEqual(
+            [
+                {"role": "user", "text": "hello from file"},
+                {"role": "assistant", "text": "reply from file"},
+            ],
+            [{"role": item["role"], "text": item["text"]} for item in messages],
+        )
+
+    def test_load_messages_deduplicates_user_messages_present_in_history_and_session_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            history_file = temp_root / "history.jsonl"
+            history_file.write_text(
+                mobile_portal.json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "ts": mobile_portal.iso_to_ts("2026-03-19T07:00:01.000Z"),
+                        "text": "same prompt",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            sessions_dir = temp_root / "sessions" / "2026" / "03" / "19"
+            sessions_dir.mkdir(parents=True)
+            session_file = sessions_dir / "rollout-session-1.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "session-1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:01.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "same prompt"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:02.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "final_answer",
+                                    "content": [{"type": "output_text", "text": "reply from file"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(mobile_portal, "HISTORY_FILE", history_file), \
+                    mock.patch.object(mobile_portal, "SESSIONS_DIR", temp_root / "sessions"):
+                store = mobile_portal.CodexDataStore()
+                messages = store.load_messages("session-1")
+
+        self.assertEqual(
+            [
+                {"role": "user", "text": "same prompt"},
+                {"role": "assistant", "text": "reply from file"},
+            ],
+            [{"role": item["role"], "text": item["text"]} for item in messages],
+        )
+    def test_load_messages_ignores_internal_session_context_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            history_file = temp_root / "history.jsonl"
+            sessions_dir = temp_root / "sessions" / "2026" / "03" / "19"
+            sessions_dir.mkdir(parents=True)
+            session_file = sessions_dir / "rollout-session-1.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "session-1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:01.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "# AGENTS.md instructions for C:\Windows\System32",
+                                        }
+                                    ],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:02.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "<environment_context>\n<cwd>C:\Windows\System32</cwd>\n</environment_context>",
+                                        }
+                                    ],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:03.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "real user prompt"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:04.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "final_answer",
+                                    "content": [{"type": "output_text", "text": "real reply"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(mobile_portal, "HISTORY_FILE", history_file), \
+                    mock.patch.object(mobile_portal, "SESSIONS_DIR", temp_root / "sessions"):
+                store = mobile_portal.CodexDataStore()
+                messages = store.load_messages("session-1")
+
+        self.assertEqual(
+            [
+                {"role": "user", "text": "real user prompt"},
+                {"role": "assistant", "text": "real reply"},
+            ],
+            [{"role": item["role"], "text": item["text"]} for item in messages],
+        )
 
 
 if __name__ == "__main__":

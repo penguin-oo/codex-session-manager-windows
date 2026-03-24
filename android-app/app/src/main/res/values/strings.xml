@@ -15,6 +15,7 @@
     <string name="action_refresh">Refresh</string>
     <string name="action_refresh_desktop">Refresh PC</string>
     <string name="action_accounts">Accounts</string>
+    <string name="action_proxy_settings">Proxy settings</string>
     <string name="action_new_slot">New slot</string>
     <string name="action_rename">Rename</string>
     <string name="action_settings">Connection</string>
@@ -53,6 +54,8 @@
     <string name="label_selected_image">Selected image</string>
     <string name="label_remove_image">Remove image</string>
     <string name="label_proxy_summary">Proxy %1$s</string>
+    <string name="label_proxy_enabled">Enable proxy</string>
+    <string name="label_proxy_port">Proxy port</string>
     <string name="label_replying">Replying</string>
     <string name="label_sending">Sending...</string>
     <string name="label_codex_replying">Codex is replying...</string>
@@ -68,6 +71,7 @@
     <string name="title_browse_folders">Browse folders</string>
     <string name="title_session_settings">Session settings</string>
     <string name="title_accounts">Accounts</string>
+    <string name="title_proxy_settings">Proxy settings</string>
 
     <string name="connection_needed_title">Connect to your Codex portal</string>
     <string name="connection_needed_summary">Paste the LAN URL printed by run-mobile.bat. It already includes the access token.</string>
@@ -103,10 +107,15 @@
     <string name="banner_saving_session_settings">Saving session settings...</string>
     <string name="banner_session_settings_saved">Session settings saved.</string>
     <string name="banner_loading_accounts">Loading accounts...</string>
+    <string name="banner_loading_proxy_settings">Loading proxy settings...</string>
+    <string name="banner_saving_proxy_settings">Saving proxy settings...</string>
+    <string name="banner_proxy_settings_saved">Proxy settings saved: %1$s</string>
     <string name="banner_account_bound">Saved current login to %1$s.</string>
     <string name="banner_account_switched">Switched future requests to %1$s.</string>
     <string name="message_accounts_running_jobs">Stop active replies before switching accounts.</string>
     <string name="message_account_not_bound">%1$s is not bound yet.</string>
+    <string name="message_proxy_port_required">Enter a proxy port between 1 and 65535.</string>
+    <string name="message_proxy_settings_hint">Mobile requests will use socks5h://127.0.0.1:&lt;port&gt;. Changes affect future requests only.</string>
     <string name="action_bind_current_here">Bind current here</string>
     <string name="action_switch_here">Switch here</string>
     <string name="label_account_active">Active</string>
