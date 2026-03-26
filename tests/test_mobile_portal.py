@@ -5,6 +5,7 @@ import threading
 import unittest
 from base64 import b64encode
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import mobile_portal
@@ -1016,6 +1017,25 @@ class PortalDownloadsTests(unittest.TestCase):
 
         self.assertIn("/downloads/codex-mobile-debug.apk?token=verify-token", html)
         self.assertIn("/downloads/codex-session-manager-windows-x64.zip?token=verify-token", html)
+
+
+class PortalAuthorizationTests(unittest.TestCase):
+    def _make_handler(self, *, portal_token: str, header_token: str = "", path: str = "/") -> mobile_portal.PortalHandler:
+        handler = mobile_portal.PortalHandler.__new__(mobile_portal.PortalHandler)
+        handler.headers = {"X-Access-Token": header_token}
+        handler.path = path
+        handler.server = SimpleNamespace(portal=SimpleNamespace(token=portal_token))
+        return handler
+
+    def test_is_authorized_accepts_exact_non_ascii_header_token(self) -> None:
+        handler = self._make_handler(portal_token="令牌-测试", header_token="令牌-测试")
+
+        self.assertTrue(handler._is_authorized())
+
+    def test_is_authorized_accepts_exact_non_ascii_query_token(self) -> None:
+        handler = self._make_handler(portal_token="令牌-测试", path="/api/bootstrap?token=%E4%BB%A4%E7%89%8C-%E6%B5%8B%E8%AF%95")
+
+        self.assertTrue(handler._is_authorized())
 
 
 class ResumeArgsTests(unittest.TestCase):

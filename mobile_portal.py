@@ -301,6 +301,15 @@ def resolve_portal_token(explicit_token: str, token_file: Path = PORTAL_TOKEN_FI
     return generated_token
 
 
+def tokens_match(candidate: str, expected: str) -> bool:
+    if not candidate or not expected:
+        return False
+    try:
+        return secrets.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+    except Exception:
+        return False
+
+
 def build_resume_args(
     output_file: Path,
     session_id: str,
@@ -3441,11 +3450,11 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def _is_authorized(self) -> bool:
         header_token = self.headers.get("X-Access-Token", "").strip()
-        if header_token and secrets.compare_digest(header_token, self.portal.token):
+        if tokens_match(header_token, self.portal.token):
             return True
         parsed = urlparse(self.path)
         query_token = parse_qs(parsed.query).get("token", [""])[0].strip()
-        if query_token and secrets.compare_digest(query_token, self.portal.token):
+        if tokens_match(query_token, self.portal.token):
             return True
         return False
 
@@ -3530,6 +3539,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
 
 
