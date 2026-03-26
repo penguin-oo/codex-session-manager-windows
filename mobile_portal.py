@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import auth_slots
 import base64
 import ipaddress
@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from urllib import error as url_error
 from urllib import request as url_request
 
+import token_pool_proxy
 import token_pool_settings
 
 try:
@@ -3550,11 +3551,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="0.0.0.0", help="Listen host. Defaults to 0.0.0.0")
     parser.add_argument("--port", type=int, default=8765, help="Listen port. Defaults to 8765")
     parser.add_argument("--token", default="", help="Access token. Random if omitted.")
+    parser.add_argument("--token-pool-proxy", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--api-key", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--token-dir", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--upstream-base-url", default="", help=argparse.SUPPRESS)
     return parser
 
 
-def main() -> int:
-    args = build_arg_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    if args.token_pool_proxy:
+        proxy_args = [
+            "--port",
+            str(args.port),
+            "--api-key",
+            str(args.api_key),
+            "--token-dir",
+            str(args.token_dir),
+        ]
+        if str(args.upstream_base_url).strip():
+            proxy_args.extend(["--upstream-base-url", str(args.upstream_base_url).strip()])
+        return token_pool_proxy.main(proxy_args)
     token = resolve_portal_token(args.token)
     portal = PortalService(host=args.host, port=args.port, token=token)
     server = ThreadingHTTPServer((args.host, args.port), PortalHandler)
@@ -3584,4 +3601,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -1156,6 +1156,50 @@ class TokenPoolBackendStartupTests(unittest.TestCase):
         self.assertEqual("C:\Miniconda\Scripts\conda.exe", command[0])
         self.assertIn("codex-accel", command)
 
+    def test_build_arg_parser_accepts_token_pool_proxy_mode(self) -> None:
+        args = mobile_portal.build_arg_parser().parse_args(
+            [
+                "--token-pool-proxy",
+                "--port",
+                "8317",
+                "--api-key",
+                "pool-api-key",
+                "--token-dir",
+                "C:\\tokens",
+            ]
+        )
+
+        self.assertTrue(args.token_pool_proxy)
+        self.assertEqual(8317, args.port)
+        self.assertEqual("pool-api-key", args.api_key)
+        self.assertEqual("C:\\tokens", args.token_dir)
+
+    def test_main_delegates_to_token_pool_proxy_main_when_proxy_mode_enabled(self) -> None:
+        with mock.patch.object(mobile_portal.token_pool_proxy, "main", return_value=0) as proxy_main:
+            result = mobile_portal.main(
+                [
+                    "--token-pool-proxy",
+                    "--port",
+                    "8317",
+                    "--api-key",
+                    "pool-api-key",
+                    "--token-dir",
+                    "C:\\tokens",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        proxy_main.assert_called_once_with(
+            [
+                "--port",
+                "8317",
+                "--api-key",
+                "pool-api-key",
+                "--token-dir",
+                "C:\\tokens",
+            ]
+        )
+
     def test_start_token_pool_backend_surfaces_early_process_exit_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
