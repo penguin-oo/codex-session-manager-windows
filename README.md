@@ -134,6 +134,32 @@ cd android-app
 - Windows
 - Python 3.11+
 - Tkinter included in the standard Python installer
+- `codex` available in `PATH`
+
+### Built-in token pool
+- Python package: `requests`
+- token files stored in `C:\Users\<YourUser>\.cli-proxy-api\`
+- each token file must be a `.json` file and contain one of:
+  - `access_token`
+  - `token`
+  - `api_key`
+
+### Python environment selection for the built-in token pool
+The desktop manager and mobile portal start with your normal Python launcher.
+
+The built-in token pool proxy uses this startup order:
+1. if `conda` exists and the `codex-accel` environment exists, it starts with `conda run -n codex-accel python ...`
+2. otherwise it falls back to the current/default Python that launched `mobile_portal.py`
+
+This means:
+- `codex-accel` is optional
+- a separate virtual environment is not required
+- on machines without `codex-accel`, the built-in token pool still works as long as the current Python is 3.11+ and has `requests`
+
+Recommended one-line install on a fresh machine:
+```powershell
+python -m pip install requests
+```
 
 ### Android
 - Android Studio or compatible Gradle/SDK setup if you want to build the APK yourself
@@ -165,6 +191,15 @@ The tracked APK is the current debug build generated from `android-app/`.
 - confirm `run-mobile.bat` is still running
 - use the exact URL including `?token=...`
 - if using Tailscale, confirm both devices are connected to the same tailnet
+
+### Built-in token pool proxy did not become ready
+Check these in order:
+- make sure the machine is using the latest code from this repository
+- confirm Python is `3.11+`
+- run `python -m pip install requests`
+- confirm token files exist in `C:\Users\<YourUser>\.cli-proxy-api\`
+- if `conda` is installed but `codex-accel` is not, that is now supported; the launcher should fall back automatically
+- if it still fails, restart `run-mobile.bat` and read the new error text carefully, because startup errors are now surfaced directly instead of only showing a generic timeout
 
 ### How to ensure the highest practical Windows privilege
 - For phone-driven chats:
