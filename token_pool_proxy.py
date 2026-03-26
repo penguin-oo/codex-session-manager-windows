@@ -130,6 +130,14 @@ class TokenPoolForwarder:
                 clean = clean.replace(state.access_token, '[redacted-token]')
         return clean
 
+    def _is_model_capacity_error(self, message: str) -> bool:
+        text = message.lower()
+        return (
+            'selected model is at capacity' in text
+            or ('at capacity' in text and 'model' in text)
+            or 'please try a different model' in text
+        )
+
     def forward_with_failover(self, upstream_fn: Callable[[TokenState], ForwardResponse]) -> ForwardResponse:
         states = self.pool.states()
         if not states:
@@ -145,7 +153,7 @@ class TokenPoolForwarder:
             except TokenPoolUpstreamError as exc:
                 sanitized = self._sanitize_message(str(exc))
                 last_error = sanitized
-                if exc.quota_exhausted or exc.status_code in {401, 403, 429}:
+                if exc.quota_exhausted or exc.status_code in {401, 403, 429} or self._is_model_capacity_error(sanitized):
                     self.pool.mark_quota_failure(state.file_name, sanitized)
                     continue
                 if exc.retryable or exc.status_code >= 500:

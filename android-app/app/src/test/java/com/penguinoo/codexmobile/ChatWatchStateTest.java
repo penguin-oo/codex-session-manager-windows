@@ -7,6 +7,19 @@ import org.junit.Test;
 
 public final class ChatWatchStateTest {
     @Test
+    public void shouldInvalidateWatch_requiresFiveConsecutiveFailures() {
+        assertFalse(ChatWatchState.shouldInvalidateWatch(1));
+        assertFalse(ChatWatchState.shouldInvalidateWatch(4));
+        assertTrue(ChatWatchState.shouldInvalidateWatch(5));
+    }
+
+    @Test
+    public void nextFailureCount_resetsAfterSuccess() {
+        assertTrue(ChatWatchState.nextFailureCount(true, 3) == 0);
+        assertTrue(ChatWatchState.nextFailureCount(false, 3) == 4);
+    }
+
+    @Test
     public void shouldApplyLiveUpdate_whenWatcherMatchesCurrentJob_returnsTrue() {
         PortalJob job = new PortalJob("job-1", "running", "session-1", "", "", "partial", 1, "mobile", "Mobile");
 

@@ -9,8 +9,10 @@ import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
+import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -423,25 +425,57 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void presentAccountsDialog(PortalEndpoint endpoint, AccountSlotsPayload payload) {
-        List<AccountSlotSummary> slots = payload.slots;
-        CharSequence[] items = new CharSequence[slots.size()];
-        for (int index = 0; index < slots.size(); index++) {
-            AccountSlotSummary slot = slots.get(index);
-            items[index] = describeAccountSlot(slot);
-        }
-        String currentIdentity = payload.currentEmail.isEmpty() ? payload.currentAccountId : payload.currentEmail;
-        String mode = payload.currentAuthMode == null || payload.currentAuthMode.isEmpty() ? "" : "\nMode: " + payload.currentAuthMode;
-        String quota = payload.quotaSummary == null || payload.quotaSummary.isEmpty()
-                ? getString(R.string.label_quota_unavailable)
-                : payload.quotaSummary;
-        String message = (currentIdentity.isEmpty() ? "" : currentIdentity) + mode + "\n" + quota;
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.title_accounts)
-                .setMessage(message)
-                .setItems(items, (dialog, which) -> showAccountSlotActions(endpoint, slots.get(which)))
-                .setPositiveButton(R.string.action_new_slot, (dialog, which) -> promptCreateAccountSlot(endpoint))
-                .setNegativeButton(android.R.string.cancel, null)
-                .show();
+        AccountCenterDialogSupport.show(this, payload, new AccountCenterDialogSupport.Callbacks() {
+            @Override
+            public void onRefresh() {
+                showAccountsDialog();
+            }
+
+            @Override
+            public void onCreateSlot() {
+                promptCreateAccountSlot(endpoint);
+            }
+
+            @Override
+            public void onBindCurrent(AccountSlotSummary slot) {
+                bindCurrentAccount(endpoint, slot);
+            }
+
+            @Override
+            public void onSwitch(AccountSlotSummary slot) {
+                switchAccount(endpoint, slot);
+            }
+
+            @Override
+            public void onRename(AccountSlotSummary slot) {
+                promptRenameAccountSlot(endpoint, slot);
+            }
+
+            @Override
+            public void onDelete(AccountSlotSummary slot) {
+                confirmDeleteAccountSlot(endpoint, slot);
+            }
+
+            @Override
+            public void onToggleBackendMode(BackendStatusPayload backend) {
+                toggleBackendMode(endpoint, backend);
+            }
+
+            @Override
+            public void onStartBackend() {
+                startBackendProxy(endpoint);
+            }
+
+            @Override
+            public void onStopBackend() {
+                stopBackendProxy(endpoint);
+            }
+
+            @Override
+            public void onRestartBackend() {
+                restartBackendProxy(endpoint);
+            }
+        });
     }
 
     private void showAccountSlotActions(PortalEndpoint endpoint, AccountSlotSummary slot) {
@@ -498,7 +532,11 @@ public final class MainActivity extends AppCompatActivity {
         executor.execute(() -> {
             try {
                 apiClient.bindCurrentAccount(endpoint, slot.slotId);
-                runOnUiThread(() -> showBanner(getString(R.string.banner_account_bound, slotDisplayName(slot))));
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_account_bound, slotDisplayName(slot)));
+                    loadBootstrap();
+                    showAccountsDialog();
+                });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
             }
@@ -517,6 +555,7 @@ public final class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     showBanner(getString(R.string.banner_account_switched, slotDisplayName(slot)));
                     loadBootstrap();
+                    showAccountsDialog();
                 });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
@@ -534,7 +573,11 @@ public final class MainActivity extends AppCompatActivity {
         executor.execute(() -> {
             try {
                 apiClient.createAccountSlot(endpoint, label);
-                runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_created, label)));
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_account_slot_created, label));
+                    loadBootstrap();
+                    showAccountsDialog();
+                });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
             }
@@ -551,7 +594,11 @@ public final class MainActivity extends AppCompatActivity {
         executor.execute(() -> {
             try {
                 apiClient.renameAccountSlot(endpoint, slot.slotId, label);
-                runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_renamed, label)));
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_account_slot_renamed, label));
+                    loadBootstrap();
+                    showAccountsDialog();
+                });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
             }
@@ -567,7 +614,11 @@ public final class MainActivity extends AppCompatActivity {
                     executor.execute(() -> {
                         try {
                             apiClient.deleteAccountSlot(endpoint, slot.slotId);
-                            runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_deleted, slotDisplayName(slot))));
+                            runOnUiThread(() -> {
+                                showBanner(getString(R.string.banner_account_slot_deleted, slotDisplayName(slot)));
+                                loadBootstrap();
+                                showAccountsDialog();
+                            });
                         } catch (Exception exception) {
                             runOnUiThread(() -> showBanner(exception.getMessage()));
                         }
@@ -575,6 +626,72 @@ public final class MainActivity extends AppCompatActivity {
                 })
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
+    }
+
+    private void toggleBackendMode(PortalEndpoint endpoint, BackendStatusPayload backend) {
+        String nextMode = backend.isTokenPoolMode() ? "codex_auth" : "built_in_token_pool";
+        int proxyPort = backend.proxyPort > 0 ? backend.proxyPort : 8317;
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.saveBackendStatus(endpoint, nextMode, backend.tokenDir, proxyPort);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_backend_mode_saved, nextMode));
+                    loadBootstrap();
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void startBackendProxy(PortalEndpoint endpoint) {
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.startBackendProxy(endpoint);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_backend_proxy_started));
+                    loadBootstrap();
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void stopBackendProxy(PortalEndpoint endpoint) {
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.stopBackendProxy(endpoint);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_backend_proxy_stopped));
+                    loadBootstrap();
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void restartBackendProxy(PortalEndpoint endpoint) {
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.restartBackendProxy(endpoint);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_backend_proxy_restarted));
+                    loadBootstrap();
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
     }
 
     private CharSequence describeAccountSlot(AccountSlotSummary slot) {

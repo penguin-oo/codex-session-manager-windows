@@ -5,6 +5,8 @@ import ipaddress
 import json
 import mimetypes
 import os
+import queue
+import re
 import signal
 import secrets
 import shutil
@@ -20,6 +22,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
+from urllib import error as url_error
+from urllib import request as url_request
+
+import token_pool_settings
 
 try:
     import tomllib
@@ -36,6 +42,7 @@ HISTORY_FILE = CODEX_HOME / "history.jsonl"
 NOTES_FILE = CODEX_HOME / "session_notes.json"
 SETTINGS_FILE = CODEX_HOME / "session_settings.json"
 PORTAL_SETTINGS_FILE = CODEX_HOME / "mobile_portal_settings.json"
+BACKEND_SETTINGS_FILE = CODEX_HOME / "token_pool_settings.json"
 SESSIONS_DIR = CODEX_HOME / "sessions"
 CONFIG_FILE = CODEX_HOME / "config.toml"
 MODELS_CACHE_FILE = CODEX_HOME / "models_cache.json"
@@ -43,6 +50,8 @@ SKILLS_DIR = CODEX_HOME / "skills"
 PORTAL_TOKEN_FILE = CODEX_HOME / "mobile_portal_token.txt"
 DESKTOP_REFRESH_SIGNAL_FILE = CODEX_HOME / "desktop_refresh_signal.json"
 RELEASES_DIR = Path(__file__).resolve().parent / "release"
+APP_DIR = Path(__file__).resolve().parent
+TOKEN_POOL_PROXY_STATE_FILE = CODEX_HOME / "token_pool_proxy_state.json"
 CODEX_BIN = "codex.cmd" if os.name == "nt" else "codex"
 RUNNING_JOB_GRACE_SECONDS = 8
 OWNER_HEARTBEAT_TIMEOUT_SECONDS = 30
@@ -53,6 +62,11 @@ SUPPORTED_SHARED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf"}
 ALLOWED_DOWNLOAD_FILES = {"codex-mobile-debug.apk", "codex-session-manager-windows-x64.zip"}
 DEFAULT_PROXY_ENABLED = True
 DEFAULT_PROXY_PORT = 7897
+TOKEN_POOL_PROVIDER_NAME = "built_in_token_pool"
+TOKEN_POOL_ENV_KEY_NAME = "CODEX_TOKEN_POOL_API_KEY"
+INTERNAL_ASSISTANT_PROTOCOL_RE = re.compile(
+    r"(?im)^\s*(?:user|assistant)\s+to=(?:functions|multi_tool_use|all|web|shell|commentary)\b.*$"
+)
 
 
 @dataclass
@@ -296,6 +310,7 @@ def build_resume_args(
     approval: str,
     reasoning_effort: str,
     image_paths: list[Path] | None = None,
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
 ) -> list[str]:
     args = [CODEX_BIN, "exec", "--json", "-o", str(output_file), "--skip-git-repo-check"]
     if model and model != "default":
@@ -306,13 +321,39 @@ def build_resume_args(
         args.extend(["-c", f'approval_policy="{approval}"'])
     if reasoning_effort and reasoning_effort != "default":
         args.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+    args.extend(build_backend_override_args(backend_settings_file=backend_settings_file))
     args.append("resume")
     for image_path in image_paths or []:
         args.extend(["-i", str(image_path)])
     args.append(session_id)
     clean_prompt = prompt.strip()
     if clean_prompt:
-        args.append(clean_prompt)
+        args.append("-")
+    return args
+
+
+def build_new_chat_args(
+    output_file: Path,
+    prompt: str,
+    model: str,
+    sandbox: str,
+    approval: str,
+    reasoning_effort: str,
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+) -> list[str]:
+    args = [CODEX_BIN, "exec", "--json", "-o", str(output_file)]
+    if model and model != "default":
+        args.extend(["-m", model])
+    if sandbox and sandbox != "default":
+        args.extend(["-s", sandbox])
+    if approval and approval != "default":
+        args.extend(["-c", f'approval_policy="{approval}"'])
+    if reasoning_effort and reasoning_effort != "default":
+        args.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+    args.extend(build_backend_override_args(backend_settings_file=backend_settings_file))
+    args.append("--skip-git-repo-check")
+    if prompt.strip():
+        args.append("-")
     return args
 
 
@@ -445,7 +486,7 @@ def parse_weekly_quota_summary(status_output: str) -> dict[str, str]:
 
 
 def read_current_weekly_quota(timeout_seconds: float = 4.0) -> dict[str, str]:
-    output = run_text_command([CODEX_BIN, "/status"], timeout_seconds=timeout_seconds)
+    output = run_text_command([CODEX_BIN, "status"], timeout_seconds=timeout_seconds)
     return parse_weekly_quota_summary(output)
 
 
@@ -509,8 +550,56 @@ def apply_proxy_settings_to_env(base_env: dict[str, str] | None, proxy_settings:
     return env
 
 
-def build_codex_subprocess_env(base_env: dict[str, str] | None = None, settings_file: Path = PORTAL_SETTINGS_FILE) -> dict[str, str]:
-    return apply_proxy_settings_to_env(base_env, load_proxy_settings(settings_file))
+def build_token_pool_provider_override_args(
+    proxy_port: int,
+    provider_name: str = TOKEN_POOL_PROVIDER_NAME,
+    env_key_name: str = TOKEN_POOL_ENV_KEY_NAME,
+) -> list[str]:
+    clean_provider = provider_name.strip() or TOKEN_POOL_PROVIDER_NAME
+    clean_env_key = env_key_name.strip() or TOKEN_POOL_ENV_KEY_NAME
+    return [
+        "-c",
+        f'model_provider="{clean_provider}"',
+        "-c",
+        f'model_providers.{clean_provider}.name="Built-in Token Pool"',
+        "-c",
+        f'model_providers.{clean_provider}.base_url="http://127.0.0.1:{int(proxy_port)}"',
+        "-c",
+        f'model_providers.{clean_provider}.env_key="{clean_env_key}"',
+        "-c",
+        f'model_providers.{clean_provider}.wire_api="responses"',
+        "-c",
+        f'model_providers.{clean_provider}.requires_openai_auth=false',
+        "-c",
+        f'model_providers.{clean_provider}.supports_websockets=false',
+    ]
+
+
+def build_backend_override_args(
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+) -> list[str]:
+    settings = token_pool_settings.load_backend_settings(backend_settings_file)
+    if settings.get("backend_mode") != token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+        return []
+    return build_token_pool_provider_override_args(
+        proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+        provider_name=TOKEN_POOL_PROVIDER_NAME,
+        env_key_name=TOKEN_POOL_ENV_KEY_NAME,
+    )
+
+
+def build_codex_subprocess_env(
+    base_env: dict[str, str] | None = None,
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+) -> dict[str, str]:
+    env = apply_proxy_settings_to_env(base_env, load_proxy_settings(settings_file))
+    backend_settings = token_pool_settings.load_backend_settings(backend_settings_file)
+    if backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+        env[TOKEN_POOL_ENV_KEY_NAME] = str(backend_settings.get("proxy_api_key", "")).strip()
+    else:
+        env.pop(TOKEN_POOL_ENV_KEY_NAME, None)
+    return env
 
 
 def current_proxy_summary_from_settings(proxy_settings: dict[str, object]) -> str:
@@ -525,6 +614,166 @@ def current_proxy_summary_from_settings(proxy_settings: dict[str, object]) -> st
 
 def current_proxy_summary(settings_file: Path = PORTAL_SETTINGS_FILE) -> str:
     return current_proxy_summary_from_settings(load_proxy_settings(settings_file))
+
+
+def sanitize_assistant_message_text(text: str) -> str:
+    clean = text.strip()
+    if not clean:
+        return ""
+    matches = list(INTERNAL_ASSISTANT_PROTOCOL_RE.finditer(clean))
+    if not matches:
+        return clean
+    first_match = matches[0]
+    if first_match.start() == 0:
+        return ""
+    return clean[: first_match.start()].rstrip()
+
+
+def build_token_pool_proxy_command(
+    *,
+    executable: str,
+    app_path: str,
+    port: int,
+    api_key: str,
+    token_dir: str,
+) -> list[str]:
+    conda_executable = shutil.which("conda")
+    if conda_executable:
+        command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
+    else:
+        command = [executable, app_path]
+    command.extend(
+        [
+            "--token-pool-proxy",
+            "--port",
+            str(int(port)),
+            "--api-key",
+            api_key,
+            "--token-dir",
+            token_dir,
+        ]
+    )
+    return command
+
+
+def load_token_pool_proxy_state(state_file: Path = TOKEN_POOL_PROXY_STATE_FILE) -> dict[str, object]:
+    if not state_file.exists():
+        return {}
+    try:
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_token_pool_proxy_state(state: dict[str, object], state_file: Path = TOKEN_POOL_PROXY_STATE_FILE) -> None:
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_token_pool_proxy_state(state_file: Path = TOKEN_POOL_PROXY_STATE_FILE) -> None:
+    try:
+        state_file.unlink()
+    except OSError:
+        pass
+
+
+def token_pool_proxy_is_healthy(
+    port: int,
+    timeout_seconds: float = 0.5,
+) -> dict[str, object] | None:
+    req = url_request.Request(
+        f"http://127.0.0.1:{int(port)}/health",
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with url_request.urlopen(req, timeout=timeout_seconds) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError, url_error.URLError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def start_token_pool_backend(
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+    proxy_settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> dict[str, object]:
+    settings = token_pool_settings.load_backend_settings(backend_settings_file)
+    token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+    token_pool_settings.ensure_token_pool_dir(token_dir)
+    token_files = token_pool_settings.list_token_files(token_dir)
+    if not token_files:
+        raise RuntimeError(f"No token files found in {token_dir}")
+    port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
+    health = token_pool_proxy_is_healthy(port)
+    if health:
+        return health
+    command = build_token_pool_proxy_command(
+        executable=sys.executable,
+        app_path=str(Path(__file__).resolve()),
+        port=port,
+        api_key=str(settings.get("proxy_api_key", "")),
+        token_dir=str(token_dir),
+    )
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.Popen(
+        command,
+        cwd=str(APP_DIR),
+        env=build_codex_subprocess_env(settings_file=proxy_settings_file, backend_settings_file=backend_settings_file),
+        creationflags=creationflags,
+    )
+    save_token_pool_proxy_state(
+        {
+            "pid": proc.pid,
+            "port": port,
+            "token_dir": str(token_dir),
+            "started_at": time.time(),
+        }
+    )
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        health = token_pool_proxy_is_healthy(port)
+        if health:
+            return health
+        time.sleep(0.2)
+    raise RuntimeError("Built-in token pool proxy did not become ready.")
+
+
+def stop_token_pool_backend(state_file: Path = TOKEN_POOL_PROXY_STATE_FILE) -> None:
+    state = load_token_pool_proxy_state(state_file)
+    pid = int(state.get("pid", 0) or 0)
+    if pid > 0:
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
+        except OSError:
+            pass
+    clear_token_pool_proxy_state(state_file)
+
+
+def restart_token_pool_backend(
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+    proxy_settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> dict[str, object]:
+    stop_token_pool_backend()
+    time.sleep(0.2)
+    return start_token_pool_backend(
+        backend_settings_file=backend_settings_file,
+        proxy_settings_file=proxy_settings_file,
+    )
+
+
+def ensure_token_pool_backend_ready(
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+    proxy_settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> None:
+    settings = token_pool_settings.load_backend_settings(backend_settings_file)
+    if settings.get("backend_mode") != token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+        return
+    start_token_pool_backend(
+        backend_settings_file=backend_settings_file,
+        proxy_settings_file=proxy_settings_file,
+    )
 
 
 def list_windows_process_rows() -> list[dict[str, object]]:
@@ -782,6 +1031,24 @@ class CodexDataStore:
 
         messages: list[dict[str, object]] = []
         seen_user_messages: dict[str, list[int]] = {}
+        current_turn: dict[str, object] | None = None
+
+        def flush_pending_assistant(task_complete_ts: int = 0, explicit_text: str = "") -> None:
+            nonlocal current_turn
+            if not current_turn:
+                return
+            if not bool(current_turn.get("has_final_answer")):
+                fallback_text = explicit_text.strip() or str(current_turn.get("last_assistant_text", "")).strip()
+                fallback_ts = int(current_turn.get("last_assistant_ts", 0) or task_complete_ts)
+                if fallback_text:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "ts": fallback_ts or task_complete_ts,
+                            "text": fallback_text,
+                        }
+                    )
+            current_turn = None
 
         if HISTORY_FILE.exists():
             with HISTORY_FILE.open("r", encoding="utf-8") as handle:
@@ -813,7 +1080,18 @@ class CodexDataStore:
                             obj = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        if obj.get("type") != "response_item":
+                        obj_type = str(obj.get("type", ""))
+                        ts = iso_to_ts(str(obj.get("timestamp", "")))
+                        if obj_type == "event_msg":
+                            payload = obj.get("payload", {})
+                            if not isinstance(payload, dict):
+                                continue
+                            if str(payload.get("type", "")) == "task_complete":
+                                raw_last_message = payload.get("last_agent_message")
+                                explicit_text = raw_last_message if isinstance(raw_last_message, str) else ""
+                                flush_pending_assistant(task_complete_ts=ts, explicit_text=explicit_text)
+                            continue
+                        if obj_type != "response_item":
                             continue
                         payload = obj.get("payload", {})
                         if not isinstance(payload, dict):
@@ -827,12 +1105,17 @@ class CodexDataStore:
                         text = flatten_message_content(content)
                         if not text:
                             continue
-                        ts = iso_to_ts(str(obj.get("timestamp", "")))
                         if role == "user":
                             if is_internal_session_user_text(text):
                                 continue
                             if is_duplicate_user_message(seen_user_messages, text, ts):
                                 continue
+                            flush_pending_assistant()
+                            current_turn = {
+                                "has_final_answer": False,
+                                "last_assistant_text": "",
+                                "last_assistant_ts": 0,
+                            }
                             messages.append({"role": "user", "ts": ts, "text": text})
                             normalized = normalize_message_text(text)
                             if normalized:
@@ -841,7 +1124,12 @@ class CodexDataStore:
                         if role != "assistant":
                             continue
                         if payload.get("phase") != "final_answer":
+                            if current_turn is not None:
+                                current_turn["last_assistant_text"] = text
+                                current_turn["last_assistant_ts"] = ts
                             continue
+                        if current_turn is not None:
+                            current_turn["has_final_answer"] = True
                         messages.append(
                             {
                                 "role": "assistant",
@@ -849,6 +1137,7 @@ class CodexDataStore:
                                 "text": text,
                             }
                         )
+                flush_pending_assistant()
             except OSError:
                 pass
 
@@ -1121,8 +1410,16 @@ class CodexDataStore:
 
 
 class JobRunner:
-    def __init__(self, data_store: CodexDataStore) -> None:
+    def __init__(
+        self,
+        data_store: CodexDataStore,
+        *,
+        proxy_settings_file: Path = PORTAL_SETTINGS_FILE,
+        backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+    ) -> None:
         self.data_store = data_store
+        self.proxy_settings_file = proxy_settings_file
+        self.backend_settings_file = backend_settings_file
         self.lock = threading.Lock()
         self.jobs: dict[str, dict[str, object]] = {}
         self.active_sessions: set[str] = set()
@@ -1309,7 +1606,6 @@ class JobRunner:
         image_path = materialize_image_attachment(image_payload)
         if image_path is not None:
             image_paths.append(image_path)
-        history_text = build_history_entry_text(prompt, image_paths)
         conflicting_pids = find_conflicting_interactive_session_pids(session_id, list_windows_process_rows())
         if conflicting_pids:
             raise RuntimeError("This session is currently open in a desktop Codex terminal. Close that terminal before sending from mobile.")
@@ -1354,9 +1650,6 @@ class JobRunner:
                 "owner_label": str(owner.get("owner_label", owner_label)),
                 "lease_id": lease_id.strip(),
             }
-        if history_text:
-            self.data_store.append_history_entry(session_id, history_text, ts=created_at)
-
         thread = threading.Thread(
             target=self._run_resume_job,
             args=(job_id, item.cwd or str(Path.home()), session_id, prompt, model, sandbox, approval, reasoning_effort, image_paths),
@@ -1496,7 +1789,21 @@ class JobRunner:
         image_paths: list[Path] | None = None,
     ) -> None:
         output_file = Path(tempfile.mkstemp(prefix="codex-mobile-out-", suffix=".txt")[1])
-        args = build_resume_args(output_file, session_id, prompt, model, sandbox, approval, reasoning_effort, image_paths or [])
+        ensure_token_pool_backend_ready(
+            backend_settings_file=self.backend_settings_file,
+            proxy_settings_file=self.proxy_settings_file,
+        )
+        args = build_resume_args(
+            output_file,
+            session_id,
+            prompt,
+            model,
+            sandbox,
+            approval,
+            reasoning_effort,
+            image_paths or [],
+            backend_settings_file=self.backend_settings_file,
+        )
         queued_at = now_ts()
         with self.lock:
             job = self.jobs.get(job_id)
@@ -1504,10 +1811,11 @@ class JobRunner:
                 queued_at = int(job.get("created_at", queued_at))
 
         try:
-            detected_session = self._run_codex_process(job_id, args, cwd, session_id)
+            stdin_text = prompt if prompt.strip() else None
+            detected_session = self._run_codex_process(job_id, args, cwd, session_id, stdin_text=stdin_text)
             history_text = build_history_entry_text(prompt, image_paths or [])
             target_session = detected_session or session_id
-            if history_text and target_session and target_session != session_id:
+            if history_text and target_session:
                 self.data_store.append_history_entry(target_session, history_text, ts=queued_at)
             last_message = output_file.read_text(encoding="utf-8", errors="ignore").strip() if output_file.exists() else ""
             if not last_message:
@@ -1537,16 +1845,19 @@ class JobRunner:
         reasoning_effort: str,
     ) -> None:
         output_file = Path(tempfile.mkstemp(prefix="codex-mobile-out-", suffix=".txt")[1])
-        args = [CODEX_BIN, "exec", "--json", "-o", str(output_file)]
-        if model and model != "default":
-            args.extend(["-m", model])
-        if sandbox and sandbox != "default":
-            args.extend(["-s", sandbox])
-        if approval and approval != "default":
-            args.extend(["-c", f'approval_policy="{approval}"'])
-        if reasoning_effort and reasoning_effort != "default":
-            args.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
-        args.extend(["--skip-git-repo-check", prompt])
+        ensure_token_pool_backend_ready(
+            backend_settings_file=self.backend_settings_file,
+            proxy_settings_file=self.proxy_settings_file,
+        )
+        args = build_new_chat_args(
+            output_file,
+            prompt,
+            model,
+            sandbox,
+            approval,
+            reasoning_effort,
+            backend_settings_file=self.backend_settings_file,
+        )
         queued_at = now_ts()
         with self.lock:
             job = self.jobs.get(job_id)
@@ -1554,7 +1865,7 @@ class JobRunner:
                 queued_at = int(job.get("created_at", queued_at))
 
         try:
-            session_id = self._run_codex_process(job_id, args, cwd, "")
+            session_id = self._run_codex_process(job_id, args, cwd, "", stdin_text=prompt)
             opening_prompt_recorded = False
             last_message = output_file.read_text(encoding="utf-8", errors="ignore").strip() if output_file.exists() else ""
             if not last_message:
@@ -1578,20 +1889,39 @@ class JobRunner:
             except OSError:
                 pass
 
-    def _run_codex_process(self, job_id: str, args: list[str], cwd: str, fallback_session_id: str) -> str:
+    def _run_codex_process(
+        self,
+        job_id: str,
+        args: list[str],
+        cwd: str,
+        fallback_session_id: str,
+        stdin_text: str | None = None,
+    ) -> str:
         process = subprocess.Popen(
             args,
             cwd=cwd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=build_codex_subprocess_env(),
+            env=build_codex_subprocess_env(
+                settings_file=self.proxy_settings_file,
+                backend_settings_file=self.backend_settings_file,
+            ),
         )
         detected_session_id = fallback_session_id
-        saw_turn_completed = False
+        if stdin_text is not None and process.stdin is not None:
+            try:
+                process.stdin.write(stdin_text)
+            except BrokenPipeError:
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
         if process.stdout is None:
             raise RuntimeError("Failed to open Codex process output.")
         with self.lock:
@@ -1600,7 +1930,38 @@ class JobRunner:
                 job["pid"] = int(process.pid)
                 job["heartbeat_at"] = now_ts()
 
-        for raw_line in process.stdout:
+        line_queue: queue.Queue[str | None] = queue.Queue()
+        stdout_finished = threading.Event()
+
+        def pump_stdout() -> None:
+            try:
+                for raw_line in process.stdout:
+                    line_queue.put(raw_line)
+            finally:
+                stdout_finished.set()
+                line_queue.put(None)
+
+        pump_thread = threading.Thread(target=pump_stdout, daemon=True)
+        pump_thread.start()
+
+        completion_deadline = 0.0
+        while True:
+            timeout = 0.2
+            if completion_deadline > 0.0:
+                remaining = completion_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                timeout = min(timeout, max(remaining, 0.01))
+            try:
+                raw_line = line_queue.get(timeout=timeout)
+            except queue.Empty:
+                if stdout_finished.is_set():
+                    break
+                if completion_deadline > 0.0:
+                    break
+                continue
+            if raw_line is None:
+                break
             line = raw_line.strip()
             if not line:
                 continue
@@ -1608,31 +1969,33 @@ class JobRunner:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                if completion_deadline > 0.0:
+                    completion_deadline = time.monotonic() + PROCESS_EXIT_GRACE_SECONDS
                 continue
-            detected_session_id, stop_reading = self._handle_codex_event(job_id, event, detected_session_id)
-            if stop_reading:
-                saw_turn_completed = True
-                break
+            detected_session_id, completion_seen = self._handle_codex_event(job_id, event, detected_session_id)
+            if completion_seen or completion_deadline > 0.0:
+                completion_deadline = time.monotonic() + PROCESS_EXIT_GRACE_SECONDS
 
-        if saw_turn_completed:
-            try:
-                process.wait(timeout=PROCESS_EXIT_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                try:
-                    process.wait(timeout=PROCESS_EXIT_GRACE_SECONDS)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    try:
-                        process.wait(timeout=PROCESS_EXIT_GRACE_SECONDS)
-                    except subprocess.TimeoutExpired:
-                        pass
-            return detected_session_id
-
-        return_code = process.wait()
+        if completion_deadline > 0.0 and not stdout_finished.is_set():
+            return_code = self._stop_process_after_grace(process)
+        else:
+            return_code = process.wait()
         if return_code != 0:
             raise RuntimeError(f"Codex exited with code {return_code}.")
+        if not self._job_last_message(job_id):
+            raise RuntimeError("Codex exited without completing the turn.")
         return detected_session_id
+
+    def _stop_process_after_grace(self, process: subprocess.Popen[str]) -> int:
+        try:
+            return process.wait(timeout=PROCESS_EXIT_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+        try:
+            return process.wait(timeout=PROCESS_EXIT_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return process.wait(timeout=PROCESS_EXIT_GRACE_SECONDS)
 
     def _handle_codex_event(self, job_id: str, event: dict[str, object], detected_session_id: str) -> tuple[str, bool]:
         event_type = str(event.get("type", ""))
@@ -1661,6 +2024,19 @@ class JobRunner:
                 if job:
                     job["heartbeat_at"] = now_ts()
             return detected_session_id, True
+
+        if event_type == "event_msg":
+            payload = event.get("payload", {})
+            if isinstance(payload, dict) and str(payload.get("type", "")) == "task_complete":
+                last_agent_message = payload.get("last_agent_message")
+                if isinstance(last_agent_message, str) and last_agent_message.strip():
+                    clean_text = last_agent_message.strip()
+                    self._append_live_text(job_id, clean_text)
+                    with self.lock:
+                        job = self.jobs.get(job_id)
+                        if job:
+                            job["last_message"] = clean_text
+                return detected_session_id, True
 
         text = self._extract_event_text(event)
         if text:
@@ -1778,8 +2154,13 @@ class PortalService:
         self.port = port
         self.token = token
         self.proxy_settings_file = PORTAL_SETTINGS_FILE
+        self.backend_settings_file = BACKEND_SETTINGS_FILE
         self.data_store = CodexDataStore()
-        self.jobs = JobRunner(self.data_store)
+        self.jobs = JobRunner(
+            self.data_store,
+            proxy_settings_file=self.proxy_settings_file,
+            backend_settings_file=self.backend_settings_file,
+        )
         self.shared_files_lock = threading.Lock()
         self.shared_files: dict[str, dict[str, object]] = {}
 
@@ -1799,6 +2180,7 @@ class PortalService:
             "slots": slots,
             "has_running_jobs": self.has_running_jobs(),
             "quota": read_current_weekly_quota(),
+            "backend": self.backend_status_payload(),
         }
 
     def create_account_slot(self, label: str) -> dict[str, object]:
@@ -1837,6 +2219,56 @@ class PortalService:
     def update_proxy_settings(self, proxy_enabled: bool, proxy_port: int) -> dict[str, object]:
         save_proxy_settings(proxy_enabled, proxy_port, self.proxy_settings_file)
         return self.proxy_settings_payload()
+
+    def backend_status_payload(self) -> dict[str, object]:
+        settings = token_pool_settings.load_backend_settings(self.backend_settings_file)
+        token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+        token_count = len(token_pool_settings.list_token_files(token_dir))
+        proxy_port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
+        health = token_pool_proxy_is_healthy(proxy_port)
+        return {
+            "backend_mode": str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)),
+            "token_dir": str(token_dir),
+            "proxy_port": proxy_port,
+            "proxy_running": bool(health),
+            "proxy_summary": f"http://127.0.0.1:{proxy_port}" if health else "stopped",
+            "token_count": token_count,
+            "last_error": "",
+        }
+
+    def update_backend_settings(self, backend_mode: str, token_dir: str, proxy_port: int) -> dict[str, object]:
+        current = token_pool_settings.load_backend_settings(self.backend_settings_file)
+        token_dir_path = Path(token_dir.strip() or str(current.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+        updated = token_pool_settings.save_backend_settings(
+            backend_mode=backend_mode,
+            settings_file=self.backend_settings_file,
+            token_dir=token_dir_path,
+            proxy_port=proxy_port,
+            proxy_api_key=str(current.get("proxy_api_key", "")),
+        )
+        self.jobs.backend_settings_file = self.backend_settings_file
+        return {
+            "backend_mode": str(updated.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)),
+            **self.backend_status_payload(),
+        }
+
+    def start_backend_proxy(self) -> dict[str, object]:
+        start_token_pool_backend(
+            backend_settings_file=self.backend_settings_file,
+            proxy_settings_file=self.proxy_settings_file,
+        )
+        return self.backend_status_payload()
+
+    def stop_backend_proxy(self) -> dict[str, object]:
+        stop_token_pool_backend()
+        return self.backend_status_payload()
+
+    def restart_backend_proxy(self) -> dict[str, object]:
+        restart_token_pool_backend(
+            backend_settings_file=self.backend_settings_file,
+            proxy_settings_file=self.proxy_settings_file,
+        )
+        return self.backend_status_payload()
 
     def has_running_jobs(self) -> bool:
         with self.jobs.lock:
@@ -2308,7 +2740,7 @@ INDEX_HTML = """<!doctype html>
   </div>
 
   <script>
-    const state = { token: "", bootstrap: null, selectedSessionId: "" };
+    const state = { token: "", bootstrap: null, selectedSessionId: "", selectedSessionPayload: null };
     const esc = (v) => (v || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
     const timeText = (ts) => ts ? new Date(ts * 1000).toLocaleString() : "-";
 
@@ -2332,6 +2764,65 @@ INDEX_HTML = """<!doctype html>
 
     function setStatus(text) {
       document.getElementById("jobStatus").innerHTML = text ? `<div class="pill">${esc(text)}</div>` : "";
+    }
+
+    function sessionMessages(payload) {
+      return Array.isArray(payload && payload.messages) ? payload.messages : [];
+    }
+
+    function lastAssistantMessageKey(payload) {
+      const messages = sessionMessages(payload);
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (!message || message.role !== "assistant") continue;
+        const text = String(message.text || "").trim();
+        if (!text) continue;
+        return `${message.ts || 0}:${text}`;
+      }
+      return "";
+    }
+
+    function currentSessionSnapshot() {
+      return {
+        messageCount: sessionMessages(state.selectedSessionPayload).length,
+        lastAssistantKey: lastAssistantMessageKey(state.selectedSessionPayload),
+      };
+    }
+
+    function hasFreshAssistantReply(payload, snapshot, requireAssistantReply = true) {
+      const messages = sessionMessages(payload);
+      if (!messages.length) return false;
+      const lastMessage = messages[messages.length - 1];
+      const countIncreased = messages.length > Number(snapshot && snapshot.messageCount || 0);
+      if (!countIncreased) return false;
+      if (!requireAssistantReply) return true;
+      const currentAssistantKey = lastAssistantMessageKey(payload);
+      return Boolean(
+        lastMessage &&
+        lastMessage.role === "assistant" &&
+        String(lastMessage.text || "").trim() &&
+        currentAssistantKey &&
+        currentAssistantKey !== String(snapshot && snapshot.lastAssistantKey || "")
+      );
+    }
+
+    async function waitForFinalAssistantMessage(sessionId, snapshot, options = {}) {
+      const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 30000;
+      const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 600;
+      const requireAssistantReply = options.requireAssistantReply !== false;
+      const startedAt = Date.now();
+      let latestPayload = null;
+      while (Date.now() - startedAt <= timeoutMs) {
+        latestPayload = await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
+        if (hasFreshAssistantReply(latestPayload, snapshot, requireAssistantReply)) {
+          return { payload: latestPayload, synced: true };
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+      }
+      if (!latestPayload) {
+        latestPayload = await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
+      }
+      return { payload: latestPayload, synced: false };
     }
 
     function renderHero() {
@@ -2402,21 +2893,34 @@ INDEX_HTML = """<!doctype html>
       document.getElementById("composerSettings").hidden = true;
       document.getElementById("composer").hidden = true;
       document.getElementById("noteInput").value = "";
+      state.selectedSessionPayload = null;
     }
 
-    async function loadSession(sessionId) {
-      state.selectedSessionId = sessionId;
-      renderSessions();
-      const payload = await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    function renderSessionPayload(payload, options = {}) {
+      state.selectedSessionPayload = payload;
       const item = payload.session;
+      if (!item) {
+        clearSession();
+        return payload;
+      }
       document.getElementById("detailHead").innerHTML = `<h2>${esc(item.text || item.session_id)}</h2><p>${esc(item.cwd || "-")}<br>${esc(item.session_id)}<br>Model: ${esc(item.model || "default")} | Approval: ${esc(item.approval_policy || "-")} | Sandbox: ${esc(item.sandbox_mode || "-")} | Reasoning: ${esc(item.reasoning_effort || "default")}</p>`;
       document.getElementById("noteInput").value = item.note || "";
       document.getElementById("noteBox").hidden = false;
       document.getElementById("composerSettings").hidden = false;
       document.getElementById("composer").hidden = false;
       const list = document.getElementById("messageList");
-      list.innerHTML = payload.messages.map((m) => `<article class="bubble ${m.role}"><div>${esc(m.text)}</div><div class="time">${m.role} 路 ${timeText(m.ts)}</div></article>`).join("") || '<div class="empty">No messages parsed for this session yet.</div>';
-      list.scrollTop = list.scrollHeight;
+      list.innerHTML = sessionMessages(payload).map((m) => `<article class="bubble ${m.role}"><div>${esc(m.text)}</div><div class="time">${m.role} 路 ${timeText(m.ts)}</div></article>`).join("") || '<div class="empty">No messages parsed for this session yet.</div>';
+      if (options.scrollToBottom !== false) {
+        list.scrollTop = list.scrollHeight;
+      }
+      return payload;
+    }
+
+    async function loadSession(sessionId, options = {}) {
+      state.selectedSessionId = sessionId;
+      renderSessions();
+      const payload = options.payload || await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
+      return renderSessionPayload(payload, options);
     }
 
     async function pollJob(jobId, onDone) {
@@ -2440,6 +2944,7 @@ INDEX_HTML = """<!doctype html>
     async function sendPrompt() {
       const prompt = document.getElementById("promptInput").value.trim();
       if (!prompt || !state.selectedSessionId) return;
+      const snapshot = currentSessionSnapshot();
       const result = await api(`/api/sessions/${encodeURIComponent(state.selectedSessionId)}/message`, {
         method: "POST",
         body: JSON.stringify({
@@ -2453,9 +2958,16 @@ INDEX_HTML = """<!doctype html>
       document.getElementById("promptInput").value = "";
       setStatus("Submitting prompt to Codex...");
       await pollJob(result.job_id, async (job) => {
+        const sessionId = job.session_id || state.selectedSessionId;
+        setStatus("Syncing final reply into chat history...");
+        const syncResult = await waitForFinalAssistantMessage(sessionId, snapshot);
         await refreshBootstrap();
-        await loadSession(job.session_id || state.selectedSessionId);
-        setStatus(job.last_message ? `Finished: ${job.last_message.slice(0, 140)}` : "Finished.");
+        await loadSession(sessionId, { payload: syncResult.payload });
+        if (syncResult.synced) {
+          setStatus(job.last_message ? `Finished: ${job.last_message.slice(0, 140)}` : "Finished.");
+          return;
+        }
+        setStatus("Final reply is still syncing into chat history...");
       });
     }
 
@@ -2481,6 +2993,7 @@ INDEX_HTML = """<!doctype html>
     }
 
     async function createChat() {
+      const openingPrompt = document.getElementById("newPromptInput").value.trim();
       const result = await api("/api/chats", {
         method: "POST",
         body: JSON.stringify({
@@ -2496,8 +3009,17 @@ INDEX_HTML = """<!doctype html>
       closeModal("newChatModal");
       setStatus("Creating new chat...");
       await pollJob(result.job_id, async (job) => {
+        let syncResult = null;
+        if (job.session_id && openingPrompt) {
+          setStatus("Syncing final reply into chat history...");
+          syncResult = await waitForFinalAssistantMessage(job.session_id, { messageCount: 0, lastAssistantKey: "" });
+        }
         await refreshBootstrap(true);
-        if (job.session_id) await loadSession(job.session_id);
+        if (job.session_id) await loadSession(job.session_id, syncResult ? { payload: syncResult.payload } : {});
+        if (syncResult && !syncResult.synced) {
+          setStatus("Final reply is still syncing into chat history...");
+          return;
+        }
         setStatus(job.last_message ? `New chat ready: ${job.last_message.slice(0, 140)}` : "New chat ready.");
       });
     }
@@ -2611,6 +3133,9 @@ class PortalHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/accounts":
             self._send_json(self.portal.account_slots_payload())
+            return
+        if parsed.path == "/api/backend":
+            self._send_json(self.portal.backend_status_payload())
             return
         if parsed.path == "/api/proxy-settings":
             self._send_json(self.portal.proxy_settings_payload())
@@ -2791,6 +3316,42 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._send_json(result, status=HTTPStatus.CREATED)
+            return
+        if parsed.path == "/api/backend":
+            try:
+                result = self.portal.update_backend_settings(
+                    backend_mode=str(payload.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)),
+                    token_dir=str(payload.get("token_dir", "")),
+                    proxy_port=int(payload.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
+        if parsed.path == "/api/backend/start":
+            try:
+                result = self.portal.start_backend_proxy()
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
+        if parsed.path == "/api/backend/stop":
+            try:
+                result = self.portal.stop_backend_proxy()
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
+        if parsed.path == "/api/backend/restart":
+            try:
+                result = self.portal.restart_backend_proxy()
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
             return
         if parsed.path == "/api/proxy-settings":
             try:

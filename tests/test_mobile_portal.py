@@ -1,11 +1,14 @@
-﻿import tempfile
+﻿import queue
+import subprocess
+import tempfile
+import threading
 import unittest
 from base64 import b64encode
-import subprocess
 from pathlib import Path
 from unittest import mock
 
 import mobile_portal
+import token_pool_settings
 
 
 class ResolvePortalTokenTests(unittest.TestCase):
@@ -294,7 +297,7 @@ class JobRunnerOwnershipTests(unittest.TestCase):
                 "default",
             )
 
-        append_history_entry.assert_not_called()
+        append_history_entry.assert_called_once_with("session-1", "hello from mobile", ts=123)
 
         with mock.patch.object(runner, "_run_codex_process", return_value="session-2"), \
                 mock.patch.object(runner.data_store, "append_history_entry") as append_history_entry:
@@ -311,7 +314,30 @@ class JobRunnerOwnershipTests(unittest.TestCase):
 
         append_history_entry.assert_called_once_with("session-2", "hello from mobile", ts=123)
 
-    def test_run_codex_process_finishes_after_turn_completed_even_if_process_exit_lags(self) -> None:
+    def test_start_resume_job_does_not_record_history_before_worker_starts(self) -> None:
+        session = mobile_portal.SessionItem(
+            session_id="session-1",
+            ts=1,
+            text="hello",
+            note="",
+            history_count=1,
+            cwd=str(Path.cwd()),
+            model="gpt-5",
+            approval_policy="default",
+            sandbox_mode="workspace-write",
+            turn_id="turn-1",
+            session_file="",
+        )
+        fake_store = _FakeStore([session])
+        runner = mobile_portal.JobRunner(fake_store)
+
+        with mock.patch.object(runner, "_run_resume_job"), \
+             mock.patch("mobile_portal.list_windows_process_rows", return_value=[]):
+            runner.start_resume_job("session-1", "hello again", "default", "default", "default", "default")
+
+        self.assertEqual([], fake_store.append_history_calls)
+
+    def test_run_codex_process_keeps_reading_after_turn_completed_to_capture_trailing_final_answer(self) -> None:
         runner = mobile_portal.JobRunner(_FakeStore())
         runner.jobs["job-1"] = {
             "job_id": "job-1",
@@ -333,26 +359,22 @@ class JobRunnerOwnershipTests(unittest.TestCase):
                 self.pid = 321
                 self.stdout = iter([
                     '{"type":"thread.started","thread_id":"session-1"}\n',
-                    '{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"text":"done"}]}}\n',
                     '{"type":"turn.completed","usage":{"total_tokens":1}}\n',
+                    '{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"text":"done after completion"}]}}\n',
                 ])
-                self.terminated = False
 
             def wait(self, timeout: float | None = None) -> int:
-                if not self.terminated:
-                    raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
                 return 0
 
             def terminate(self) -> None:
-                self.terminated = True
+                raise AssertionError("process should not be terminated after turn.completed when stdout continues")
 
             def kill(self) -> None:
-                self.terminated = True
+                raise AssertionError("process should not be killed after turn.completed when stdout continues")
 
         fake_process = _FakeProcess()
 
-        with mock.patch("mobile_portal.subprocess.Popen", return_value=fake_process), \
-                mock.patch.object(runner, "_is_pid_running", side_effect=[True, False]):
+        with mock.patch("mobile_portal.subprocess.Popen", return_value=fake_process):
             detected_session = runner._run_codex_process(
                 "job-1",
                 ["codex.cmd", "exec"],
@@ -361,9 +383,252 @@ class JobRunnerOwnershipTests(unittest.TestCase):
             )
 
         self.assertEqual("session-1", detected_session)
-        self.assertTrue(fake_process.terminated)
         job = runner.get_job("job-1")
-        self.assertEqual("done", job["last_message"])
+        self.assertEqual("done after completion", job["last_message"])
+
+    def test_run_codex_process_uses_task_complete_last_agent_message(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "resume",
+            "session_id": "session-1",
+            "created_at": mobile_portal.now_ts(),
+            "heartbeat_at": mobile_portal.now_ts(),
+            "pid": 0,
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+        }
+
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 654
+                self.stdout = iter([
+                    '{"type":"thread.started","thread_id":"session-1"}\n',
+                    '{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"text":"working"}]}}\n',
+                    '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"final link https://example.test/file.zip"}}\n',
+                ])
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def terminate(self) -> None:
+                raise AssertionError("process should not be terminated when task_complete was received")
+
+            def kill(self) -> None:
+                raise AssertionError("process should not be killed when task_complete was received")
+
+        fake_process = _FakeProcess()
+
+        with mock.patch("mobile_portal.subprocess.Popen", return_value=fake_process):
+            detected_session = runner._run_codex_process(
+                "job-1",
+                ["codex.cmd", "exec"],
+                str(Path.cwd()),
+                "session-1",
+            )
+
+        self.assertEqual("session-1", detected_session)
+        job = runner.get_job("job-1")
+        self.assertEqual("final link https://example.test/file.zip", job["last_message"])
+
+    def test_run_codex_process_finishes_after_task_complete_even_if_process_does_not_exit(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "resume",
+            "session_id": "session-1",
+            "created_at": mobile_portal.now_ts(),
+            "heartbeat_at": mobile_portal.now_ts(),
+            "pid": 0,
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+        }
+
+        class _BlockingStdout:
+            def __init__(self) -> None:
+                self._queue: queue.Queue[str | None] = queue.Queue()
+                self._queue.put('{"type":"thread.started","thread_id":"session-1"}\n')
+                self._queue.put('{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"done but process stuck"}}\n')
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> str:
+                item = self._queue.get()
+                if item is None:
+                    raise StopIteration
+                return item
+
+            def finish(self) -> None:
+                self._queue.put(None)
+
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 432
+                self.stdout = _BlockingStdout()
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.terminate_calls > 0 or self.kill_calls > 0:
+                    return 0
+                if timeout is None:
+                    return 0
+                raise subprocess.TimeoutExpired("codex.cmd", timeout)
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+                self.stdout.finish()
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.stdout.finish()
+
+        fake_process = _FakeProcess()
+        result: dict[str, object] = {}
+
+        def _runner() -> None:
+            try:
+                result["session_id"] = runner._run_codex_process(
+                    "job-1",
+                    ["codex.cmd", "exec"],
+                    str(Path.cwd()),
+                    "session-1",
+                )
+            except Exception as exc:  # pragma: no cover - assertion uses result
+                result["error"] = exc
+
+        with mock.patch.object(mobile_portal, "PROCESS_EXIT_GRACE_SECONDS", 0.05), \
+             mock.patch("mobile_portal.subprocess.Popen", return_value=fake_process):
+            worker = threading.Thread(target=_runner, daemon=True)
+            worker.start()
+            worker.join(0.4)
+            if worker.is_alive():
+                fake_process.stdout.finish()
+                worker.join(1.0)
+
+        self.assertFalse(worker.is_alive(), "process should finish shortly after task_complete")
+        self.assertNotIn("error", result)
+        self.assertEqual("session-1", result.get("session_id"))
+        job = runner.get_job("job-1")
+        self.assertEqual("done but process stuck", job["last_message"])
+        self.assertEqual(1, fake_process.terminate_calls)
+        self.assertEqual(0, fake_process.kill_calls)
+
+    def test_run_codex_process_writes_prompt_to_stdin_when_requested(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "resume",
+            "session_id": "session-1",
+            "created_at": mobile_portal.now_ts(),
+            "heartbeat_at": mobile_portal.now_ts(),
+            "pid": 0,
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+        }
+
+        class _FakeStdin:
+            def __init__(self) -> None:
+                self.parts: list[str] = []
+                self.closed = False
+
+            def write(self, value: str) -> int:
+                self.parts.append(value)
+                return len(value)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 654
+                self.stdin = _FakeStdin()
+                self.stdout = iter([
+                    '{"type":"thread.started","thread_id":"session-1"}\n',
+                    '{"type":"turn.completed"}\n',
+                    '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"stdin ok"}}\n',
+                ])
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+        fake_process = _FakeProcess()
+
+        with mock.patch("mobile_portal.subprocess.Popen", return_value=fake_process):
+            detected_session = runner._run_codex_process(
+                "job-1",
+                ["codex.cmd", "exec", "-"],
+                str(Path.cwd()),
+                "session-1",
+                stdin_text="--help\nsecond line",
+            )
+
+        self.assertEqual("session-1", detected_session)
+        self.assertEqual("--help\nsecond line", "".join(fake_process.stdin.parts))
+        self.assertTrue(fake_process.stdin.closed)
+
+    def test_run_codex_process_rejects_empty_exit_without_turn_completion(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "resume",
+            "session_id": "session-1",
+            "created_at": mobile_portal.now_ts(),
+            "heartbeat_at": mobile_portal.now_ts(),
+            "pid": 0,
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+        }
+
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 777
+                self.stdout = iter([
+                    '{"type":"thread.started","thread_id":"session-1"}\n',
+                ])
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+        fake_process = _FakeProcess()
+
+        with mock.patch("mobile_portal.subprocess.Popen", return_value=fake_process):
+            with self.assertRaisesRegex(RuntimeError, "without completing the turn"):
+                runner._run_codex_process(
+                    "job-1",
+                    ["codex.cmd", "exec"],
+                    str(Path.cwd()),
+                    "session-1",
+                )
 
     def test_run_new_chat_job_records_opening_message_for_created_session(self) -> None:
         runner = mobile_portal.JobRunner(_FakeStore())
@@ -514,6 +779,18 @@ class PortalServiceBootstrapTests(unittest.TestCase):
         self.assertEqual("direct", updated["proxy_summary"])
 
 
+class PortalPageTemplateTests(unittest.TestCase):
+    def test_reply_completion_waits_for_final_message_before_finished_status(self) -> None:
+        html = mobile_portal.INDEX_HTML
+
+        self.assertIn("waitForFinalAssistantMessage", html)
+        self.assertIn("Syncing final reply into chat history...", html)
+        self.assertLess(
+            html.index('setStatus("Syncing final reply into chat history...")'),
+            html.index('setStatus(job.last_message ? `Finished: ${job.last_message.slice(0, 140)}` : "Finished.");'),
+        )
+
+
 class PortalAccountSlotsTests(unittest.TestCase):
     def test_account_slots_payload_includes_active_slot_running_flag_and_quota(self) -> None:
         service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
@@ -564,6 +841,77 @@ class PortalAccountSlotsTests(unittest.TestCase):
 
         self.assertEqual("ok", quota["state"])
         self.assertIn("Weekly quota: 76% used", quota["summary"])
+
+    def test_read_current_weekly_quota_uses_plain_status_command(self) -> None:
+        with mock.patch.object(mobile_portal, "run_text_command", return_value="") as run_text_command:
+            mobile_portal.read_current_weekly_quota()
+
+        run_text_command.assert_called_once_with([mobile_portal.CODEX_BIN, "status"], timeout_seconds=4.0)
+
+    def test_account_slots_payload_includes_backend_status(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+
+        with mock.patch.object(mobile_portal.auth_slots, "detect_active_slot", return_value="account-b"), \
+             mock.patch.object(mobile_portal.auth_slots, "current_auth_info", return_value={"email": "b@example.com"}), \
+             mock.patch.object(mobile_portal.auth_slots, "list_account_slots", return_value=[]), \
+             mock.patch.object(mobile_portal, "read_current_weekly_quota", return_value={"summary": "Weekly quota: 42%", "state": "ok"}), \
+             mock.patch.object(service, "backend_status_payload", return_value={
+                 "backend_mode": "built_in_token_pool",
+                 "proxy_port": 8317,
+                 "proxy_running": True,
+                 "proxy_summary": "http://127.0.0.1:8317",
+                 "token_count": 3,
+                 "last_error": "",
+             }):
+            payload = service.account_slots_payload()
+
+        self.assertEqual("built_in_token_pool", payload["backend"]["backend_mode"])
+        self.assertTrue(payload["backend"]["proxy_running"])
+        self.assertEqual(3, payload["backend"]["token_count"])
+
+    def test_backend_status_payload_reports_token_pool_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            token_dir.mkdir()
+            (token_dir / "a.json").write_text('{"token":"a"}', encoding="utf-8")
+            (token_dir / "b.json").write_text('{"token":"b"}', encoding="utf-8")
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+                settings_file=backend_settings_path,
+                token_dir=token_dir,
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+            )
+            service.backend_settings_file = backend_settings_path
+
+            with mock.patch.object(mobile_portal, "token_pool_proxy_is_healthy", return_value=True):
+                payload = service.backend_status_payload()
+
+        self.assertEqual("built_in_token_pool", payload["backend_mode"])
+        self.assertEqual(8317, payload["proxy_port"])
+        self.assertTrue(payload["proxy_running"])
+        self.assertEqual(2, payload["token_count"])
+
+    def test_update_backend_settings_persists_and_returns_backend_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            service.backend_settings_file = backend_settings_path
+
+            updated = service.update_backend_settings(
+                backend_mode=token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+                token_dir=str(token_dir),
+                proxy_port=8456,
+            )
+
+            loaded = token_pool_settings.load_backend_settings(backend_settings_path)
+
+        self.assertEqual(token_pool_settings.BACKEND_MODE_TOKEN_POOL, updated["backend_mode"])
+        self.assertEqual(8456, loaded["proxy_port"])
+        self.assertEqual(str(token_dir), loaded["token_dir"])
 
 
 class PortalFileShareTests(unittest.TestCase):
@@ -686,7 +1034,7 @@ class ResumeArgsTests(unittest.TestCase):
             image_paths=[image_file],
         )
 
-        self.assertEqual(["resume", "-i", str(image_file), "session-1", "describe this"], args[-5:])
+        self.assertEqual(["resume", "-i", str(image_file), "session-1", "-"], args[-5:])
         self.assertIn('model_reasoning_effort="medium"', args)
 
     def test_build_resume_args_omits_blank_prompt_for_image_only_message(self) -> None:
@@ -702,6 +1050,20 @@ class ResumeArgsTests(unittest.TestCase):
         )
 
         self.assertEqual(["resume", "-i", "photo.png", "session-1"], args[-4:])
+
+    def test_build_new_chat_args_uses_stdin_marker_for_prompt_text(self) -> None:
+        args = mobile_portal.build_new_chat_args(
+            output_file=Path("out.txt"),
+            prompt="--help",
+            model="gpt-5.4",
+            sandbox="workspace-write",
+            approval="never",
+            reasoning_effort="high",
+        )
+
+        self.assertEqual("-", args[-1])
+        self.assertIn("--skip-git-repo-check", args)
+        self.assertIn('approval_policy="never"', args)
 
 
 class ProxyEnvTests(unittest.TestCase):
@@ -722,6 +1084,61 @@ class ProxyEnvTests(unittest.TestCase):
                 env = mobile_portal.build_codex_subprocess_env(settings_file=settings_path)
 
         self.assertEqual("socks5h://127.0.0.1:9003", env["ALL_PROXY"])
+
+    def test_build_codex_subprocess_env_includes_token_pool_api_key_when_backend_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proxy_settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            mobile_portal.save_proxy_settings(True, 9003, proxy_settings_path)
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+            )
+
+            env = mobile_portal.build_codex_subprocess_env(
+                settings_file=proxy_settings_path,
+                backend_settings_file=backend_settings_path,
+            )
+
+        self.assertEqual("pool-api-key", env["CODEX_TOKEN_POOL_API_KEY"])
+
+
+class BackendOverrideArgsTests(unittest.TestCase):
+    def test_build_backend_override_args_returns_empty_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+            )
+
+            args = mobile_portal.build_backend_override_args(backend_settings_file=backend_settings_path)
+
+        self.assertEqual([], args)
+
+    def test_build_backend_override_args_points_codex_to_local_token_pool_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8319,
+                proxy_api_key="pool-api-key",
+            )
+
+            args = mobile_portal.build_backend_override_args(backend_settings_file=backend_settings_path)
+
+        rendered = " ".join(args)
+        self.assertIn('model_provider="built_in_token_pool"', rendered)
+        self.assertIn('model_providers.built_in_token_pool.base_url="http://127.0.0.1:8319"', rendered)
+        self.assertIn('model_providers.built_in_token_pool.env_key="CODEX_TOKEN_POOL_API_KEY"', rendered)
 
 
 class SessionProcessDetectionTests(unittest.TestCase):
@@ -1089,6 +1506,215 @@ class LoadMessagesTests(unittest.TestCase):
             ],
             [{"role": item["role"], "text": item["text"]} for item in messages],
         )
+
+    def test_load_messages_falls_back_to_task_complete_last_agent_message_when_final_answer_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            history_file = temp_root / "history.jsonl"
+            sessions_dir = temp_root / "sessions" / "2026" / "03" / "19"
+            sessions_dir.mkdir(parents=True)
+            session_file = sessions_dir / "rollout-session-1.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "session-1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:01.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "need link"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:03.000Z",
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "task_complete",
+                                    "turn_id": "turn-1",
+                                    "last_agent_message": "http://example.test/file.zip",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(mobile_portal, "HISTORY_FILE", history_file), \
+                    mock.patch.object(mobile_portal, "SESSIONS_DIR", temp_root / "sessions"):
+                store = mobile_portal.CodexDataStore()
+                messages = store.load_messages("session-1")
+
+        self.assertEqual(
+            [
+                {"role": "user", "text": "need link"},
+                {"role": "assistant", "text": "http://example.test/file.zip"},
+            ],
+            [{"role": item["role"], "text": item["text"]} for item in messages],
+        )
+
+    def test_load_messages_falls_back_to_last_assistant_message_when_task_complete_is_null(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            history_file = temp_root / "history.jsonl"
+            sessions_dir = temp_root / "sessions" / "2026" / "03" / "19"
+            sessions_dir.mkdir(parents=True)
+            session_file = sessions_dir / "rollout-session-1.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "session-1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:01.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "same link again"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:02.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "commentary",
+                                    "content": [{"type": "output_text", "text": "service still on 8877"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:03.000Z",
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "task_complete",
+                                    "turn_id": "turn-1",
+                                    "last_agent_message": None,
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(mobile_portal, "HISTORY_FILE", history_file), \
+                    mock.patch.object(mobile_portal, "SESSIONS_DIR", temp_root / "sessions"):
+                store = mobile_portal.CodexDataStore()
+                messages = store.load_messages("session-1")
+
+        self.assertEqual(
+            [
+                {"role": "user", "text": "same link again"},
+                {"role": "assistant", "text": "service still on 8877"},
+            ],
+            [{"role": item["role"], "text": item["text"]} for item in messages],
+        )
+
+class MobileBackendLaunchTests(unittest.TestCase):
+    def test_run_resume_job_ensures_token_pool_backend_ready(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "resume",
+            "session_id": "session-1",
+            "created_at": mobile_portal.now_ts(),
+            "heartbeat_at": mobile_portal.now_ts(),
+            "pid": 0,
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+        }
+
+        with mock.patch.object(mobile_portal, "ensure_token_pool_backend_ready", create=True) as ensure_ready, \
+             mock.patch.object(mobile_portal, "build_resume_args", return_value=["codex.cmd", "exec"]), \
+             mock.patch.object(runner, "_run_codex_process", return_value="session-1"), \
+             mock.patch("mobile_portal.tempfile.mkstemp", return_value=(1, str(Path(tempfile.gettempdir()) / "portal-out-1.txt"))), \
+             mock.patch.object(Path, "unlink", return_value=None):
+            runner._run_resume_job(
+                "job-1",
+                str(Path.cwd()),
+                "session-1",
+                "hello",
+                "default",
+                "default",
+                "default",
+                "default",
+                [],
+            )
+
+        ensure_ready.assert_called_once()
+
+    def test_run_new_chat_job_ensures_token_pool_backend_ready(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "new_chat",
+            "session_id": "",
+            "created_at": mobile_portal.now_ts(),
+            "heartbeat_at": mobile_portal.now_ts(),
+            "pid": 0,
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+            "note": "",
+            "opening_prompt": "hello",
+            "opening_prompt_recorded": False,
+        }
+
+        with mock.patch.object(mobile_portal, "ensure_token_pool_backend_ready", create=True) as ensure_ready, \
+             mock.patch.object(mobile_portal, "build_new_chat_args", return_value=["codex.cmd", "exec"]), \
+             mock.patch.object(runner, "_run_codex_process", return_value="session-1"), \
+             mock.patch("mobile_portal.tempfile.mkstemp", return_value=(1, str(Path(tempfile.gettempdir()) / "portal-out-2.txt"))), \
+             mock.patch.object(Path, "unlink", return_value=None):
+            runner._run_new_chat_job(
+                "job-1",
+                str(Path.cwd()),
+                "hello",
+                "default",
+                "default",
+                "default",
+                "default",
+            )
+
+        ensure_ready.assert_called_once()
 
 
 if __name__ == "__main__":

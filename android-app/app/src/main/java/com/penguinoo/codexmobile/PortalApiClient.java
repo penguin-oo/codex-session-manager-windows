@@ -41,6 +41,44 @@ public final class PortalApiClient {
         return parseAccountSlotsPayload(json);
     }
 
+    public BackendStatusPayload fetchBackendStatus(PortalEndpoint endpoint) throws IOException {
+        JSONObject json = getJson(endpoint, "/api/backend");
+        return parseBackendStatus(json);
+    }
+
+    public BackendStatusPayload saveBackendStatus(
+            PortalEndpoint endpoint,
+            String backendMode,
+            String tokenDir,
+            int proxyPort
+    ) throws IOException {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("backend_mode", backendMode);
+            body.put("token_dir", tokenDir);
+            body.put("proxy_port", proxyPort);
+        } catch (JSONException exception) {
+            throw new IOException("Failed to build backend settings request.", exception);
+        }
+        JSONObject json = postJson(endpoint, "/api/backend", body);
+        return parseBackendStatus(json);
+    }
+
+    public BackendStatusPayload startBackendProxy(PortalEndpoint endpoint) throws IOException {
+        JSONObject json = postJson(endpoint, "/api/backend/start", new JSONObject());
+        return parseBackendStatus(json);
+    }
+
+    public BackendStatusPayload stopBackendProxy(PortalEndpoint endpoint) throws IOException {
+        JSONObject json = postJson(endpoint, "/api/backend/stop", new JSONObject());
+        return parseBackendStatus(json);
+    }
+
+    public BackendStatusPayload restartBackendProxy(PortalEndpoint endpoint) throws IOException {
+        JSONObject json = postJson(endpoint, "/api/backend/restart", new JSONObject());
+        return parseBackendStatus(json);
+    }
+
     public PortalProxySettings fetchProxySettings(PortalEndpoint endpoint) throws IOException {
         JSONObject json = getJson(endpoint, "/api/proxy-settings");
         return parseProxySettings(json);
@@ -330,6 +368,7 @@ public final class PortalApiClient {
     static AccountSlotsPayload parseAccountSlotsPayload(JSONObject json) {
         JSONObject currentAuth = json.optJSONObject("current_auth");
         JSONObject quota = json.optJSONObject("quota");
+        JSONObject backend = json.optJSONObject("backend");
         return new AccountSlotsPayload(
                 json.optString("active_slot"),
                 currentAuth == null ? "" : currentAuth.optString("email"),
@@ -338,7 +377,20 @@ public final class PortalApiClient {
                 quota == null ? "" : quota.optString("summary"),
                 quota == null ? "" : quota.optString("state"),
                 json.optBoolean("has_running_jobs", false),
+                backend == null ? new BackendStatusPayload("", "", 0, false, "", 0, "") : parseBackendStatus(backend),
                 parseAccountSlots(json.optJSONArray("slots"))
+        );
+    }
+
+    static BackendStatusPayload parseBackendStatus(JSONObject json) {
+        return new BackendStatusPayload(
+                json.optString("backend_mode"),
+                json.optString("token_dir"),
+                json.optInt("proxy_port", 0),
+                json.optBoolean("proxy_running", false),
+                json.optString("proxy_summary"),
+                json.optInt("token_count", 0),
+                json.optString("last_error")
         );
     }
 

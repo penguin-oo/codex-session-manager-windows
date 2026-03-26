@@ -179,6 +179,26 @@ class TokenPoolForwardingTests(unittest.TestCase):
         self.assertGreater(state.cooldown_until, self.now)
         self.assertIn('quota exceeded', state.last_error)
 
+    def test_model_capacity_error_tries_next_token(self) -> None:
+        calls: list[str] = []
+
+        def upstream(token_state: token_pool_proxy.TokenState) -> token_pool_proxy.ForwardResponse:
+            calls.append(token_state.file_name)
+            if token_state.file_name == 'a.json':
+                raise token_pool_proxy.TokenPoolUpstreamError(
+                    'Selected model is at capacity. Please try a different model.',
+                    status_code=400,
+                )
+            return token_pool_proxy.ForwardResponse(status_code=200, body=b'ok', headers={})
+
+        response = self.forwarder.forward_with_failover(upstream)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(['a.json', 'b.json'], calls)
+        state = self.pool.state_for('a.json')
+        self.assertGreater(state.cooldown_until, self.now)
+        self.assertIn('at capacity', state.last_error)
+
     def test_forward_request_sanitizes_token_from_terminal_error(self) -> None:
         def upstream(token_state: token_pool_proxy.TokenState) -> token_pool_proxy.ForwardResponse:
             raise token_pool_proxy.TokenPoolUpstreamError(f'auth failed for {token_state.access_token}', status_code=401)

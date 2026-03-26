@@ -10,6 +10,7 @@ public final class AccountSlotsPayload {
     public final String quotaSummary;
     public final String quotaState;
     public final boolean hasRunningJobs;
+    public final BackendStatusPayload backend;
     public final List<AccountSlotSummary> slots;
 
     public AccountSlotsPayload(
@@ -20,6 +21,7 @@ public final class AccountSlotsPayload {
             String quotaSummary,
             String quotaState,
             boolean hasRunningJobs,
+            BackendStatusPayload backend,
             List<AccountSlotSummary> slots
     ) {
         this.activeSlot = activeSlot;
@@ -29,6 +31,7 @@ public final class AccountSlotsPayload {
         this.quotaSummary = quotaSummary;
         this.quotaState = quotaState;
         this.hasRunningJobs = hasRunningJobs;
+        this.backend = backend;
         this.slots = slots;
     }
 }

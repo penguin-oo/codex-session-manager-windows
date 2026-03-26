@@ -20,6 +20,14 @@ public final class AccountSlotsPayloadParsingTest {
                 .put("quota", new JSONObject()
                         .put("summary", "Weekly quota: 76% used")
                         .put("state", "ok"))
+                .put("backend", new JSONObject()
+                        .put("backend_mode", "built_in_token_pool")
+                        .put("token_dir", "C:\\Users\\MECHREVO\\.cli-proxy-api")
+                        .put("proxy_port", 8317)
+                        .put("proxy_running", true)
+                        .put("proxy_summary", "http://127.0.0.1:8317")
+                        .put("token_count", 3)
+                        .put("last_error", ""))
                 .put("slots", new JSONArray()
                         .put(new JSONObject()
                                 .put("slot_id", "slot-1")
@@ -41,6 +49,8 @@ public final class AccountSlotsPayloadParsingTest {
         assertEquals("slot-2", payload.activeSlot);
         assertEquals("b@example.com", payload.currentEmail);
         assertEquals("Weekly quota: 76% used", payload.quotaSummary);
+        assertEquals("built_in_token_pool", payload.backend.backendMode);
+        assertEquals(3, payload.backend.tokenCount);
         assertEquals(2, payload.slots.size());
         assertTrue(payload.slots.get(1).active);
         assertTrue(payload.slots.get(0).bound);

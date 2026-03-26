@@ -75,6 +75,7 @@ public final class ChatActivity extends AppCompatActivity {
     private boolean isActivityVisible = false;
     private boolean suppressDraftPersistence = false;
     private int heartbeatFailureCount = 0;
+    private int watchFailureCount = 0;
     private List<String> sessionModelOptions = new ArrayList<>();
     private List<String> sessionApprovalOptions = new ArrayList<>();
     private List<String> sessionSandboxOptions = new ArrayList<>();
@@ -362,7 +363,8 @@ public final class ChatActivity extends AppCompatActivity {
     }
 
     private void sendMessage() {
-        String prompt = binding.messageInput.getText() == null ? "" : binding.messageInput.getText().toString().trim();
+        ComposerInputSnapshot inputSnapshot = ComposerInputSnapshot.capture(binding.messageInput.getText());
+        String prompt = inputSnapshot.prompt;
         ChatImageAttachment imageAttachment = selectedImageAttachment;
         if (prompt.isEmpty() && imageAttachment == null) {
             showBanner(getString(R.string.banner_message_or_image_needed));
@@ -381,7 +383,7 @@ public final class ChatActivity extends AppCompatActivity {
             return;
         }
 
-        String draftText = binding.messageInput.getText() == null ? "" : binding.messageInput.getText().toString();
+        String draftText = inputSnapshot.draftText;
         Uri draftImageUri = selectedImageUri;
         ChatImageAttachment draftImageAttachment = selectedImageAttachment;
         String draftImageDisplayName = selectedImageDisplayName;
@@ -495,6 +497,7 @@ public final class ChatActivity extends AppCompatActivity {
         }
         attachedJobId = job.jobId;
         watchingJobId = job.jobId;
+        watchFailureCount = 0;
         setComposerEnabled(false);
         int generation = ++watchGeneration;
         jobExecutor.execute(() -> watchJobLoop(job.jobId, generation));
@@ -502,10 +505,26 @@ public final class ChatActivity extends AppCompatActivity {
 
     private void watchJobLoop(String jobId, int generation) {
         try {
-            PortalJob finalJob = apiClient.fetchJob(endpoint, jobId);
-            while (generation == watchGeneration && finalJob.isRunning()) {
-                Thread.sleep(1800L);
-                finalJob = apiClient.fetchJob(endpoint, jobId);
+            PortalJob finalJob = null;
+            while (generation == watchGeneration) {
+                try {
+                    finalJob = apiClient.fetchJob(endpoint, jobId);
+                    watchFailureCount = ChatWatchState.nextFailureCount(true, watchFailureCount);
+                } catch (Exception pollException) {
+                    watchFailureCount = ChatWatchState.nextFailureCount(false, watchFailureCount);
+                    if (generation != watchGeneration) {
+                        return;
+                    }
+                    if (ChatWatchState.shouldInvalidateWatch(watchFailureCount)) {
+                        throw pollException;
+                    }
+                    runOnUiThread(() -> showBanner("Connection lost. Retrying..."));
+                    Thread.sleep(1800L);
+                    continue;
+                }
+                if (!finalJob.isRunning()) {
+                    break;
+                }
                 PortalJob streamingJob = finalJob;
                 int callbackGeneration = generation;
                 runOnUiThread(() -> {
@@ -514,10 +533,15 @@ public final class ChatActivity extends AppCompatActivity {
                     }
                     renderLiveJob(streamingJob);
                 });
+                Thread.sleep(1800L);
             }
             if (generation != watchGeneration) {
                 return;
             }
+            if (finalJob == null) {
+                throw new IllegalStateException("Job state unavailable.");
+            }
+            watchFailureCount = 0;
             if (finalJob.isCancelled()) {
                 String cancelledSessionId = finalJob.sessionId == null || finalJob.sessionId.isEmpty() ? sessionId : finalJob.sessionId;
                 SessionPayload payload = apiClient.fetchSession(endpoint, cancelledSessionId);
@@ -872,25 +896,57 @@ public final class ChatActivity extends AppCompatActivity {
     }
 
     private void presentAccountsDialog(AccountSlotsPayload payload) {
-        List<AccountSlotSummary> slots = payload.slots;
-        CharSequence[] items = new CharSequence[slots.size()];
-        for (int index = 0; index < slots.size(); index++) {
-            AccountSlotSummary slot = slots.get(index);
-            items[index] = describeAccountSlot(slot);
-        }
-        String currentIdentity = payload.currentEmail.isEmpty() ? payload.currentAccountId : payload.currentEmail;
-        String mode = payload.currentAuthMode == null || payload.currentAuthMode.isEmpty() ? "" : "\nMode: " + payload.currentAuthMode;
-        String quota = payload.quotaSummary == null || payload.quotaSummary.isEmpty()
-                ? getString(R.string.label_quota_unavailable)
-                : payload.quotaSummary;
-        String message = (currentIdentity.isEmpty() ? "" : currentIdentity) + mode + "\n" + quota;
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.title_accounts)
-                .setMessage(message)
-                .setItems(items, (dialog, which) -> showAccountSlotActions(slots.get(which)))
-                .setPositiveButton(R.string.action_new_slot, (dialog, which) -> promptCreateAccountSlot())
-                .setNegativeButton(android.R.string.cancel, null)
-                .show();
+        AccountCenterDialogSupport.show(this, payload, new AccountCenterDialogSupport.Callbacks() {
+            @Override
+            public void onRefresh() {
+                showAccountsDialog();
+            }
+
+            @Override
+            public void onCreateSlot() {
+                promptCreateAccountSlot();
+            }
+
+            @Override
+            public void onBindCurrent(AccountSlotSummary slot) {
+                bindCurrentAccount(slot);
+            }
+
+            @Override
+            public void onSwitch(AccountSlotSummary slot) {
+                switchAccount(slot);
+            }
+
+            @Override
+            public void onRename(AccountSlotSummary slot) {
+                promptRenameAccountSlot(slot);
+            }
+
+            @Override
+            public void onDelete(AccountSlotSummary slot) {
+                confirmDeleteAccountSlot(slot);
+            }
+
+            @Override
+            public void onToggleBackendMode(BackendStatusPayload backend) {
+                toggleBackendMode(backend);
+            }
+
+            @Override
+            public void onStartBackend() {
+                startBackendProxy();
+            }
+
+            @Override
+            public void onStopBackend() {
+                stopBackendProxy();
+            }
+
+            @Override
+            public void onRestartBackend() {
+                restartBackendProxy();
+            }
+        });
     }
 
     private void showAccountSlotActions(AccountSlotSummary slot) {
@@ -947,7 +1003,10 @@ public final class ChatActivity extends AppCompatActivity {
         executor.execute(() -> {
             try {
                 apiClient.bindCurrentAccount(endpoint, slot.slotId);
-                runOnUiThread(() -> showBanner(getString(R.string.banner_account_bound, slotDisplayName(slot))));
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_account_bound, slotDisplayName(slot)));
+                    showAccountsDialog();
+                });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
             }
@@ -966,6 +1025,7 @@ public final class ChatActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     showBanner(getString(R.string.banner_account_switched, slotDisplayName(slot)));
                     loadSession();
+                    showAccountsDialog();
                 });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
@@ -983,7 +1043,10 @@ public final class ChatActivity extends AppCompatActivity {
         executor.execute(() -> {
             try {
                 apiClient.createAccountSlot(endpoint, label);
-                runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_created, label)));
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_account_slot_created, label));
+                    showAccountsDialog();
+                });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
             }
@@ -1000,7 +1063,10 @@ public final class ChatActivity extends AppCompatActivity {
         executor.execute(() -> {
             try {
                 apiClient.renameAccountSlot(endpoint, slot.slotId, label);
-                runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_renamed, label)));
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_account_slot_renamed, label));
+                    showAccountsDialog();
+                });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));
             }
@@ -1016,7 +1082,10 @@ public final class ChatActivity extends AppCompatActivity {
                     executor.execute(() -> {
                         try {
                             apiClient.deleteAccountSlot(endpoint, slot.slotId);
-                            runOnUiThread(() -> showBanner(getString(R.string.banner_account_slot_deleted, slotDisplayName(slot))));
+                            runOnUiThread(() -> {
+                                showBanner(getString(R.string.banner_account_slot_deleted, slotDisplayName(slot)));
+                                showAccountsDialog();
+                            });
                         } catch (Exception exception) {
                             runOnUiThread(() -> showBanner(exception.getMessage()));
                         }
@@ -1024,6 +1093,68 @@ public final class ChatActivity extends AppCompatActivity {
                 })
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
+    }
+
+    private void toggleBackendMode(BackendStatusPayload backend) {
+        String nextMode = backend.isTokenPoolMode() ? "codex_auth" : "built_in_token_pool";
+        int proxyPort = backend.proxyPort > 0 ? backend.proxyPort : 8317;
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.saveBackendStatus(endpoint, nextMode, backend.tokenDir, proxyPort);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_backend_mode_saved, nextMode));
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void startBackendProxy() {
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.startBackendProxy(endpoint);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_backend_proxy_started));
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void stopBackendProxy() {
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.stopBackendProxy(endpoint);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_backend_proxy_stopped));
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void restartBackendProxy() {
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.restartBackendProxy(endpoint);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_backend_proxy_restarted));
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
     }
 
     private CharSequence describeAccountSlot(AccountSlotSummary slot) {
