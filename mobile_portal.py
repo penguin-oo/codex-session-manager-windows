@@ -638,6 +638,34 @@ def sanitize_assistant_message_text(text: str) -> str:
     return clean[: first_match.start()].rstrip()
 
 
+def conda_env_available(conda_executable: str, env_name: str = "codex-accel") -> bool:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            [conda_executable, "env", "list", "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=4.0,
+            creationflags=creationflags,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return False
+    envs = payload.get("envs", []) if isinstance(payload, dict) else []
+    if not isinstance(envs, list):
+        return False
+    target = env_name.strip().lower()
+    return any(Path(str(item)).name.strip().lower() == target for item in envs)
+
+
 def build_token_pool_proxy_command(
     *,
     executable: str,
@@ -647,7 +675,7 @@ def build_token_pool_proxy_command(
     token_dir: str,
 ) -> list[str]:
     conda_executable = shutil.which("conda")
-    if conda_executable:
+    if conda_executable and conda_env_available(conda_executable):
         command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
     else:
         command = [executable, app_path]
@@ -731,6 +759,11 @@ def start_token_pool_backend(
         cwd=str(APP_DIR),
         env=build_codex_subprocess_env(settings_file=proxy_settings_file, backend_settings_file=backend_settings_file),
         creationflags=creationflags,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     save_token_pool_proxy_state(
         {
@@ -745,6 +778,18 @@ def start_token_pool_backend(
         health = token_pool_proxy_is_healthy(port)
         if health:
             return health
+        return_code = proc.poll()
+        if return_code is not None:
+            output = ""
+            if proc.stdout is not None:
+                try:
+                    output = (proc.stdout.read() or "").strip()
+                except OSError:
+                    output = ""
+            message = f"Built-in token pool proxy exited early with code {return_code}."
+            if output:
+                message = f"{message} {output}"
+            raise RuntimeError(message)
         time.sleep(0.2)
     raise RuntimeError("Built-in token pool proxy did not become ready.")
 
@@ -3539,5 +3584,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
 

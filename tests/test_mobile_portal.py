@@ -1,4 +1,5 @@
-﻿import queue
+import io
+import queue
 import subprocess
 import tempfile
 import threading
@@ -1124,6 +1125,66 @@ class ProxyEnvTests(unittest.TestCase):
             )
 
         self.assertEqual("pool-api-key", env["CODEX_TOKEN_POOL_API_KEY"])
+
+
+class TokenPoolBackendStartupTests(unittest.TestCase):
+    def test_build_token_pool_proxy_command_falls_back_to_current_python_when_conda_env_missing(self) -> None:
+        with mock.patch.object(mobile_portal.shutil, "which", return_value="C:\Miniconda\Scripts\conda.exe"), \
+             mock.patch.object(mobile_portal, "conda_env_available", return_value=False):
+            command = mobile_portal.build_token_pool_proxy_command(
+                executable="C:\Python311\python.exe",
+                app_path="D:\codex\manger\mobile_portal.py",
+                port=8317,
+                api_key="pool-api-key",
+                token_dir="C:\tokens",
+            )
+
+        self.assertEqual("C:\Python311\python.exe", command[0])
+        self.assertNotIn("conda.exe", " ".join(command))
+
+    def test_build_token_pool_proxy_command_uses_conda_when_target_env_exists(self) -> None:
+        with mock.patch.object(mobile_portal.shutil, "which", return_value="C:\Miniconda\Scripts\conda.exe"), \
+             mock.patch.object(mobile_portal, "conda_env_available", return_value=True):
+            command = mobile_portal.build_token_pool_proxy_command(
+                executable="C:\Python311\python.exe",
+                app_path="D:\codex\manger\mobile_portal.py",
+                port=8317,
+                api_key="pool-api-key",
+                token_dir="C:\tokens",
+            )
+
+        self.assertEqual("C:\Miniconda\Scripts\conda.exe", command[0])
+        self.assertIn("codex-accel", command)
+
+    def test_start_token_pool_backend_surfaces_early_process_exit_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            proxy_settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            token_dir.mkdir()
+            (token_dir / "token-a.json").write_text('{"token":"abc"}', encoding="utf-8")
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+                settings_file=backend_settings_path,
+                token_dir=token_dir,
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+            )
+            fake_proc = mock.Mock()
+            fake_proc.pid = 4321
+            fake_proc.poll.return_value = 7
+            fake_proc.returncode = 7
+            fake_proc.stdout = io.StringIO("ModuleNotFoundError: no module named x")
+
+            with mock.patch.object(mobile_portal, "token_pool_proxy_is_healthy", return_value=None), \
+                 mock.patch.object(mobile_portal, "build_token_pool_proxy_command", return_value=["python", "mobile_portal.py"]), \
+                 mock.patch.object(mobile_portal, "save_token_pool_proxy_state"), \
+                 mock.patch.object(mobile_portal.subprocess, "Popen", return_value=fake_proc):
+                with self.assertRaisesRegex(RuntimeError, "ModuleNotFoundError"):
+                    mobile_portal.start_token_pool_backend(
+                        backend_settings_file=backend_settings_path,
+                        proxy_settings_file=proxy_settings_path,
+                    )
 
 
 class BackendOverrideArgsTests(unittest.TestCase):
