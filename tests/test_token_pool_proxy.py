@@ -2,6 +2,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import token_pool_proxy
 import token_pool_settings
@@ -127,6 +128,29 @@ class TokenPoolCoreTests(unittest.TestCase):
         self.assertEqual(0.0, state.cooldown_until)
         self.assertIn('upstream 502', state.last_error)
 
+    def test_quota_failure_persists_cooldown_across_restart(self) -> None:
+        state_file = self.token_dir / '.token-pool-state'
+        pool = token_pool_proxy.TokenPool(
+            token_dir=self.token_dir,
+            cooldown_seconds=1800,
+            time_fn=lambda: self.now,
+            state_file=state_file,
+        )
+        first = pool.select_token()
+
+        pool.mark_quota_failure(first.file_name, 'quota exceeded')
+
+        reloaded = token_pool_proxy.TokenPool(
+            token_dir=self.token_dir,
+            cooldown_seconds=1800,
+            time_fn=lambda: self.now,
+            state_file=state_file,
+        )
+
+        next_selected = reloaded.select_token()
+        self.assertEqual('b.json', next_selected.file_name)
+        self.assertGreater(reloaded.state_for('a.json').cooldown_until, self.now)
+
 
 class TokenPoolForwardingTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -209,6 +233,52 @@ class TokenPoolForwardingTests(unittest.TestCase):
         self.assertNotIn('token-a', str(ctx.exception))
         self.assertNotIn('token-b', str(ctx.exception))
 
+    def test_default_failover_scans_all_available_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            token_dir = Path(temp_dir)
+            for index in range(70):
+                (token_dir / f'{index:03d}.json').write_text(
+                    json.dumps({'access_token': f'token-{index:03d}'}),
+                    encoding='utf-8',
+                )
+            pool = token_pool_proxy.TokenPool(token_dir=token_dir, cooldown_seconds=1800, time_fn=lambda: self.now)
+            forwarder = token_pool_proxy.TokenPoolForwarder(pool)
+            calls: list[str] = []
+
+            def upstream(token_state: token_pool_proxy.TokenState) -> token_pool_proxy.ForwardResponse:
+                calls.append(token_state.file_name)
+                if token_state.file_name != '069.json':
+                    raise token_pool_proxy.TokenPoolUpstreamError('temporary upstream failure', retryable=True, status_code=502)
+                return token_pool_proxy.ForwardResponse(status_code=200, body=b'ok', headers={})
+
+            response = forwarder.forward_with_failover(upstream)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(70, len(calls))
+        self.assertEqual('069.json', calls[-1])
+
+    def test_failover_attempt_limit_can_be_lowered_by_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            token_dir = Path(temp_dir)
+            for index in range(5):
+                (token_dir / f'{index:03d}.json').write_text(
+                    json.dumps({'access_token': f'token-{index:03d}'}),
+                    encoding='utf-8',
+                )
+            pool = token_pool_proxy.TokenPool(token_dir=token_dir, cooldown_seconds=1800, time_fn=lambda: self.now)
+            forwarder = token_pool_proxy.TokenPoolForwarder(pool)
+            calls: list[str] = []
+
+            def upstream(token_state: token_pool_proxy.TokenState) -> token_pool_proxy.ForwardResponse:
+                calls.append(token_state.file_name)
+                raise token_pool_proxy.TokenPoolUpstreamError('temporary upstream failure', retryable=True, status_code=502)
+
+            with mock.patch.dict(token_pool_proxy.os.environ, {"TOKEN_POOL_MAX_FAILOVER_ATTEMPTS": "3"}, clear=False):
+                with self.assertRaises(token_pool_proxy.TokenPoolForwardingError):
+                    forwarder.forward_with_failover(upstream)
+
+        self.assertEqual(['000.json', '001.json', '002.json'], calls)
+
 
 class TokenPoolProtocolTests(unittest.TestCase):
     def test_translate_codex_request_forwards_responses_compatible_payload(self) -> None:
@@ -236,7 +306,7 @@ class TokenPoolProtocolTests(unittest.TestCase):
         self.assertFalse(translated['store'])
         self.assertTrue(translated['parallel_tool_calls'])
         self.assertEqual(['reasoning.encrypted_content'], translated['include'])
-        self.assertEqual('', translated['instructions'])
+        self.assertEqual(token_pool_proxy.DEFAULT_FALLBACK_INSTRUCTIONS, translated['instructions'])
         self.assertEqual('message', translated['input'][0]['type'])
         self.assertEqual('user', translated['input'][0]['role'])
         self.assertEqual('input_text', translated['input'][0]['content'][0]['type'])

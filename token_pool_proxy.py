@@ -6,14 +6,29 @@ from argparse import ArgumentParser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
+from urllib import error as url_error
+from urllib import request as url_request
 
 DEFAULT_MODEL_IDS = (
+    "gpt-5",
     "gpt-5.4",
     "gpt-5.3-codex",
     "gpt-5.2",
 )
 DEFAULT_UPSTREAM_BASE_URL = "https://chatgpt.com/backend-api/codex"
+DEFAULT_FALLBACK_INSTRUCTIONS = "You are Codex, a coding assistant."
+
+
+def _resolve_max_failover_attempts(total_states: int) -> int:
+    raw = os.environ.get("TOKEN_POOL_MAX_FAILOVER_ATTEMPTS", "").strip()
+    if not raw:
+        return max(1, total_states)
+    try:
+        value = int(raw)
+    except ValueError:
+        value = total_states
+    return max(1, min(max(1, total_states), value))
 
 
 @dataclass
@@ -30,6 +45,15 @@ class ForwardResponse:
     status_code: int
     body: bytes
     headers: dict[str, str]
+
+
+@dataclass
+class StreamingForwardResponse:
+    """Response that streams body chunks from upstream."""
+    status_code: int
+    headers: dict[str, str]
+    chunk_iterator: Iterator[bytes]
+    raw_response: object  # holds the requests.Response for cleanup
 
 
 class TokenPoolUpstreamError(RuntimeError):
@@ -57,10 +81,12 @@ class TokenPool:
         token_dir: Path,
         cooldown_seconds: int = 1800,
         time_fn: Callable[[], float] | None = None,
+        state_file: Path | None = None,
     ) -> None:
         self.token_dir = Path(token_dir)
         self.cooldown_seconds = cooldown_seconds
         self.time_fn = time_fn or time.time
+        self.state_file = Path(state_file) if state_file is not None else self.token_dir / '.token-pool-state'
         self._cursor = 0
         self._states: list[TokenState] = self._load_states()
 
@@ -84,7 +110,50 @@ class TokenPool:
             if not access_token:
                 continue
             states.append(TokenState(file_name=path.name, access_token=access_token, source_path=path))
+        persisted = self._load_persisted_state()
+        for state in states:
+            saved = persisted.get(state.file_name)
+            if not isinstance(saved, dict):
+                continue
+            try:
+                state.cooldown_until = float(saved.get('cooldown_until', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                state.cooldown_until = 0.0
+            state.last_error = str(saved.get('last_error', '') or '').strip()
         return states
+
+    def _load_persisted_state(self) -> dict[str, dict[str, object]]:
+        if not self.state_file.exists():
+            return {}
+        try:
+            payload = json.loads(self.state_file.read_text(encoding='utf-8'))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        result: dict[str, dict[str, object]] = {}
+        for key, value in payload.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                result[key] = value
+        return result
+
+    def _save_persisted_state(self) -> None:
+        payload = {
+            state.file_name: {
+                'cooldown_until': state.cooldown_until,
+                'last_error': state.last_error,
+            }
+            for state in self._states
+            if state.cooldown_until > 0.0 or state.last_error
+        }
+        try:
+            if payload:
+                self.state_file.parent.mkdir(parents=True, exist_ok=True)
+                self.state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            elif self.state_file.exists():
+                self.state_file.unlink()
+        except OSError:
+            pass
 
     def states(self) -> list[TokenState]:
         return list(self._states)
@@ -113,10 +182,12 @@ class TokenPool:
         state = self.state_for(file_name)
         state.cooldown_until = self.time_fn() + float(self.cooldown_seconds)
         state.last_error = message.strip()
+        self._save_persisted_state()
 
     def mark_retryable_failure(self, file_name: str, message: str) -> None:
         state = self.state_for(file_name)
         state.last_error = message.strip()
+        self._save_persisted_state()
 
 
 class TokenPoolForwarder:
@@ -138,12 +209,13 @@ class TokenPoolForwarder:
             or 'please try a different model' in text
         )
 
-    def forward_with_failover(self, upstream_fn: Callable[[TokenState], ForwardResponse]) -> ForwardResponse:
+    def forward_with_failover(self, upstream_fn: Callable[[TokenState], ForwardResponse | StreamingForwardResponse]) -> ForwardResponse | StreamingForwardResponse:
         states = self.pool.states()
         if not states:
             raise TokenPoolForwardingError('No token files available.')
         last_error = 'No usable tokens available.'
-        for _ in range(len(states)):
+        max_attempts = _resolve_max_failover_attempts(len(states))
+        for _ in range(max_attempts):
             try:
                 state = self.pool.select_token()
             except RuntimeError as exc:
@@ -191,7 +263,8 @@ def translate_codex_request(payload: dict[str, object]) -> dict[str, object]:
     translated['store'] = False
     translated['parallel_tool_calls'] = True
     translated['include'] = ['reasoning.encrypted_content']
-    translated.setdefault('instructions', '')
+    instructions = str(translated.get('instructions', '') or '').strip()
+    translated['instructions'] = instructions or DEFAULT_FALLBACK_INSTRUCTIONS
     if translated.get('service_tier') != 'priority':
         translated.pop('service_tier', None)
     for key in (
@@ -244,6 +317,72 @@ class TokenPoolProxyApp:
             'port': self.proxy_port,
         }
 
+    def _build_sse_failed_event(self, message: str) -> bytes:
+        payload = {
+            'type': 'response.failed',
+            'error': {
+                'message': message,
+            },
+        }
+        data = json.dumps(payload, ensure_ascii=False)
+        return f'event: response.failed\ndata: {data}\n\n'.encode('utf-8')
+
+    def _safe_stream_iterator(self, response: object) -> Iterator[bytes]:
+        iterator = response.iter_content(chunk_size=4096)
+        try:
+            for chunk in iterator:
+                if chunk:
+                    yield chunk
+        except Exception as exc:
+            message = self._build_sse_failed_event(f'Upstream stream interrupted: {exc}')
+            yield message
+
+    def _forward_to_upstream_with_urllib(self, token_state: TokenState, payload: dict[str, object], path: str) -> ForwardResponse | StreamingForwardResponse:
+        url = f'{self.upstream_base_url}{path}'
+        headers = {
+            'Authorization': f'Bearer {token_state.access_token}',
+            'Accept': 'text/event-stream',
+            'Content-Type': 'application/json',
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        req = url_request.Request(url, data=body, headers=headers, method='POST')
+        try:
+            upstream = url_request.urlopen(req, timeout=620)
+        except url_error.HTTPError as exc:
+            status_code = int(getattr(exc, 'code', 500) or 500)
+            error_body = exc.read().decode('utf-8', errors='ignore') or str(exc)
+            if status_code in {401, 403, 429}:
+                raise TokenPoolUpstreamError(error_body, quota_exhausted=True, status_code=status_code) from exc
+            if status_code >= 500:
+                raise TokenPoolUpstreamError(error_body, retryable=True, status_code=status_code) from exc
+            raise TokenPoolUpstreamError(error_body, status_code=status_code) from exc
+        except OSError as exc:
+            raise TokenPoolUpstreamError(str(exc), retryable=True, status_code=502) from exc
+
+        class _UrllibResponseAdapter:
+            def __init__(self, raw_response: object) -> None:
+                self._raw_response = raw_response
+
+            def iter_content(self, chunk_size: int = 4096) -> Iterator[bytes]:
+                while True:
+                    chunk = self._raw_response.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+
+            def close(self) -> None:
+                self._raw_response.close()
+
+        status_code = int(getattr(upstream, 'status', upstream.getcode()) or 200)
+        content_type = str(upstream.headers.get('content-type', 'application/json'))
+        adapter = _UrllibResponseAdapter(upstream)
+        return StreamingForwardResponse(
+            status_code=status_code,
+            headers={'content-type': content_type},
+            chunk_iterator=self._safe_stream_iterator(adapter),
+            raw_response=adapter,
+        )
+
     def is_authorized(self, auth_header: str) -> bool:
         expected = f'Bearer {self.local_api_key}'
         return bool(self.local_api_key) and auth_header.strip() == expected
@@ -259,9 +398,9 @@ class TokenPoolProxyApp:
         *,
         auth_header: str,
         body_bytes: bytes,
-        upstream_fn: Callable[[TokenState, dict[str, object], str], ForwardResponse],
+        upstream_fn: Callable[[TokenState, dict[str, object], str], ForwardResponse | StreamingForwardResponse],
         path: str = '/responses',
-    ) -> ForwardResponse:
+    ) -> ForwardResponse | StreamingForwardResponse:
         if not self.is_authorized(auth_header):
             return ForwardResponse(
                 status_code=401,
@@ -291,8 +430,11 @@ class TokenPoolProxyApp:
             body = json.dumps({'error': {'message': str(exc)}}).encode('utf-8')
             return ForwardResponse(status_code=502, body=body, headers={'content-type': 'application/json'})
 
-    def _forward_to_upstream(self, token_state: TokenState, payload: dict[str, object], path: str) -> ForwardResponse:
-        import requests
+    def _forward_to_upstream(self, token_state: TokenState, payload: dict[str, object], path: str) -> ForwardResponse | StreamingForwardResponse:
+        try:
+            import requests
+        except ModuleNotFoundError:
+            return self._forward_to_upstream_with_urllib(token_state, payload, path)
 
         url = f'{self.upstream_base_url}{path}'
         headers = {
@@ -301,23 +443,32 @@ class TokenPoolProxyApp:
             'Content-Type': 'application/json',
         }
         try:
-            response = requests.post(url, json=payload, headers=headers, timeout=(20, 600))
+            response = requests.post(url, json=payload, headers=headers, timeout=(20, 600), stream=True)
         except requests.RequestException as exc:
             raise TokenPoolUpstreamError(str(exc), retryable=True, status_code=502) from exc
         content_type = response.headers.get('content-type', 'application/json')
         if response.status_code in {401, 403, 429}:
-            raise TokenPoolUpstreamError(response.text or response.reason, quota_exhausted=True, status_code=response.status_code)
+            error_body = response.text or response.reason
+            response.close()
+            raise TokenPoolUpstreamError(error_body, quota_exhausted=True, status_code=response.status_code)
         if response.status_code >= 500:
-            raise TokenPoolUpstreamError(response.text or response.reason, retryable=True, status_code=response.status_code)
+            error_body = response.text or response.reason
+            response.close()
+            raise TokenPoolUpstreamError(error_body, retryable=True, status_code=response.status_code)
         if response.status_code >= 400:
-            raise TokenPoolUpstreamError(response.text or response.reason, status_code=response.status_code)
-        return ForwardResponse(
+            error_body = response.text or response.reason
+            response.close()
+            raise TokenPoolUpstreamError(error_body, status_code=response.status_code)
+        # For successful responses, return a streaming response so SSE data
+        # is forwarded chunk-by-chunk instead of buffered in memory.
+        return StreamingForwardResponse(
             status_code=response.status_code,
-            body=response.content,
             headers={'content-type': content_type},
+            chunk_iterator=self._safe_stream_iterator(response),
+            raw_response=response,
         )
 
-    def forward_to_upstream(self, auth_header: str, body_bytes: bytes, path: str = '/responses') -> ForwardResponse:
+    def forward_to_upstream(self, auth_header: str, body_bytes: bytes, path: str = '/responses') -> ForwardResponse | StreamingForwardResponse:
         return self.forward_responses_request(
             auth_header=auth_header,
             body_bytes=body_bytes,
@@ -328,6 +479,7 @@ class TokenPoolProxyApp:
 
 class TokenPoolProxyHandler(BaseHTTPRequestHandler):
     server_version = 'CodexTokenPoolProxy/1.0'
+    protocol_version = 'HTTP/1.1'
 
     @property
     def app(self) -> TokenPoolProxyApp:
@@ -341,6 +493,31 @@ class TokenPoolProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if response.body:
             self.wfile.write(response.body)
+
+    def _write_streaming_response(self, response: StreamingForwardResponse) -> None:
+        self.send_response(response.status_code)
+        for key, value in response.headers.items():
+            self.send_header(key, value)
+        self.send_header('Transfer-Encoding', 'chunked')
+        self.end_headers()
+        try:
+            for chunk in response.chunk_iterator:
+                if not chunk:
+                    continue
+                # HTTP chunked encoding: size in hex, CRLF, data, CRLF
+                self.wfile.write(f'{len(chunk):x}\r\n'.encode('ascii'))
+                self.wfile.write(chunk)
+                self.wfile.write(b'\r\n')
+                self.wfile.flush()
+            # Final zero-length chunk to signal end
+            self.wfile.write(b'0\r\n\r\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            raw = getattr(response, 'raw_response', None)
+            if raw and hasattr(raw, 'close'):
+                raw.close()
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get('Content-Length', '0') or '0')
@@ -366,7 +543,10 @@ class TokenPoolProxyHandler(BaseHTTPRequestHandler):
                 self._read_body(),
                 path=self.path,
             )
-            self._write_response(response)
+            if isinstance(response, StreamingForwardResponse):
+                self._write_streaming_response(response)
+            else:
+                self._write_response(response)
             return
         self._write_response(ForwardResponse(404, b'{"error":{"message":"Not found"}}', {'content-type': 'application/json'}))
 

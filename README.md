@@ -84,6 +84,62 @@ It supports:
 
 Keep `run-mobile.bat` open while the phone is connected.
 
+## Controlled Browser Attach
+This repository now includes fixed-port helpers for the two supported controlled browsers:
+
+- `C:\Users\MECHREVO\Desktop\启动受控Edge.cmd` -> `http://127.0.0.1:9222`
+- `C:\Users\MECHREVO\Desktop\启动代理Chrome.cmd` -> `http://127.0.0.1:9223`
+
+Supported workflow:
+
+1. Start one of the controlled-browser launchers.
+2. Log in to the target site manually in that browser.
+3. Inspect the already logged-in browser instance later from the project.
+
+Quick verification examples:
+
+```powershell
+python -c "import mobile_portal; print(mobile_portal.describe_controlled_browser_attach('edge', hostname='dash.cloudflare.com'))"
+python -c "import mobile_portal; print(mobile_portal.describe_controlled_browser_attach('chrome', hostname='github.com'))"
+```
+
+Current limitation:
+
+- only the two controlled browsers on `9222` and `9223` are supported
+- arbitrary user-opened browsers are not supported
+
+## Controlled Browser Actions
+The project also exposes browser-control APIs through `mobile_portal.py` for the same two controlled browsers.
+
+Available routes:
+
+- `GET /api/browser/attach`
+- `POST /api/browser/info`
+- `POST /api/browser/html`
+- `POST /api/browser/navigate`
+- `POST /api/browser/evaluate`
+- `POST /api/browser/click`
+- `POST /api/browser/type`
+- `POST /api/browser/press`
+- `POST /api/browser/wait-text`
+
+Example attach request:
+
+```text
+/api/browser/attach?browser=edge&hostname=dash.cloudflare.com&token=...
+```
+
+Example Python verification:
+
+```powershell
+python -c "import mobile_portal; svc = mobile_portal.PortalService('127.0.0.1', 8765, 'token'); print(svc.browser_attach_payload('edge', hostname='dash.cloudflare.com'))"
+```
+
+Dependency note:
+
+- real browser actions require the `websocket-client` Python package
+- if it is missing, browser action calls fail with a direct error telling you to install it
+
 ## Android App
 The Android app is a native chat-style client for the local portal.
 
@@ -96,7 +152,10 @@ Supported behavior:
 - stop current reply
 - create new chat with folder browsing
 
-## Cross-Network Use With Tailscale
+## Cross-Network Use
+You can expose the mobile portal either through Tailscale or through a public reverse-proxy entry such as Cloudflare Tunnel.
+
+### Option 1: Tailscale
 Use this when the phone and PC are not on the same Wi-Fi.
 
 1. Install Tailscale on the PC and phone.
@@ -106,7 +165,30 @@ Use this when the phone and PC are not on the same Wi-Fi.
 3. Start `run-mobile.bat`.
 4. Use the printed `Tailscale (cross-network)` URL in the Android app.
 
-If Tailscale is unavailable, the launcher still prints LAN URLs for same-network use.
+### Option 2: Cloudflare Tunnel or another public URL
+If you already have a public hostname that forwards to the portal, add it to:
+
+- `%USERPROFILE%\\.codex\\mobile_portal_settings.json`
+
+Example:
+
+```json
+{
+  "proxy_enabled": true,
+  "proxy_port": 7897,
+  "public_urls": [
+    "https://chat.example.com"
+  ]
+}
+```
+
+Notes:
+- store the base URL only; the portal adds the current `?token=...` automatically
+- you can list more than one public URL
+- `run-mobile.bat` will print a `Public (Cloudflare/custom)` section when this is configured
+- the browser portal homepage also shows these entry links in the header
+
+If neither Tailscale nor a public URL is configured, the launcher still prints LAN URLs for same-network use.
 
 ## Clone And Run From Source
 ```powershell

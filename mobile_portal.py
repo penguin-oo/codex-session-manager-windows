@@ -1,6 +1,7 @@
 import argparse
 import auth_slots
 import base64
+import controlled_browser
 import ipaddress
 import json
 import mimetypes
@@ -21,7 +22,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
 from urllib import error as url_error
 from urllib import request as url_request
 
@@ -57,6 +58,8 @@ CODEX_BIN = "codex.cmd" if os.name == "nt" else "codex"
 RUNNING_JOB_GRACE_SECONDS = 8
 OWNER_HEARTBEAT_TIMEOUT_SECONDS = 30
 PROCESS_EXIT_GRACE_SECONDS = 1.0
+PROCESS_STARTUP_NO_OUTPUT_TIMEOUT_SECONDS = 300.0
+PROCESS_MAX_RUNTIME_SECONDS = 1800.0
 TAILSCALE_WINDOWS_PATH = Path(r"C:\Program Files\Tailscale\tailscale.exe")
 FILE_SHARE_TTL_SECONDS = 30 * 60
 SUPPORTED_SHARED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf"}
@@ -68,6 +71,10 @@ TOKEN_POOL_ENV_KEY_NAME = "CODEX_TOKEN_POOL_API_KEY"
 INTERNAL_ASSISTANT_PROTOCOL_RE = re.compile(
     r"(?im)^\s*(?:user|assistant)\s+to=(?:functions|multi_tool_use|all|web|shell|commentary)\b.*$"
 )
+CONTROLLED_BROWSER_DEBUG_URLS = {
+    "edge": "http://127.0.0.1:9222",
+    "chrome": "http://127.0.0.1:9223",
+}
 
 
 @dataclass
@@ -461,6 +468,116 @@ def find_tailscale_cli() -> str:
     return ""
 
 
+def get_controlled_browser_debug_url(browser_name: str) -> str:
+    key = str(browser_name).strip().lower()
+    try:
+        return CONTROLLED_BROWSER_DEBUG_URLS[key]
+    except KeyError as exc:
+        raise ValueError("Unsupported controlled browser.") from exc
+
+
+def fetch_json_text(url: str, timeout_seconds: float = 2.0) -> str:
+    request = url_request.Request(url, headers={"Accept": "application/json"})
+    with url_request.urlopen(request, timeout=timeout_seconds) as response:
+        return response.read().decode("utf-8", errors="ignore")
+
+
+def list_controlled_browser_pages(browser_name: str, timeout_seconds: float = 2.0) -> list[dict[str, object]]:
+    debug_url = get_controlled_browser_debug_url(browser_name)
+    payload = json.loads(fetch_json_text(f"{debug_url}/json/list", timeout_seconds=timeout_seconds))
+    if not isinstance(payload, list):
+        return []
+    pages: list[dict[str, object]] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")).strip().lower() != "page":
+            continue
+        pages.append(dict(entry))
+    return pages
+
+
+def select_controlled_browser_page(
+    pages: list[dict[str, object]],
+    url_prefix: str = "",
+    hostname: str = "",
+) -> dict[str, object]:
+    clean_prefix = str(url_prefix).strip()
+    clean_hostname = str(hostname).strip().lower()
+    candidates = [dict(page) for page in pages if isinstance(page, dict)]
+
+    if clean_prefix:
+        for page in candidates:
+            page_url = str(page.get("url", "")).strip()
+            if page_url.startswith(clean_prefix):
+                return page
+
+    if clean_hostname:
+        for page in candidates:
+            page_url = str(page.get("url", "")).strip()
+            parsed = urlparse(page_url)
+            if parsed.hostname and parsed.hostname.lower() == clean_hostname:
+                return page
+
+    for page in candidates:
+        page_url = str(page.get("url", "")).strip()
+        if page_url and page_url.lower() != "about:blank":
+            return page
+
+    raise RuntimeError("No usable controlled browser page found.")
+
+
+def describe_controlled_browser_attach(
+    browser_name: str,
+    url_prefix: str = "",
+    hostname: str = "",
+    timeout_seconds: float = 2.0,
+) -> dict[str, object]:
+    debug_url = get_controlled_browser_debug_url(browser_name)
+    try:
+        pages = list_controlled_browser_pages(browser_name, timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        return {
+            "browser": str(browser_name).strip().lower(),
+            "debug_url": debug_url,
+            "running": False,
+            "matched": False,
+            "page_count": 0,
+            "selected_page": None,
+            "candidate_pages": [],
+            "error": str(exc) or "Controlled browser is unavailable.",
+        }
+
+    result = {
+        "browser": str(browser_name).strip().lower(),
+        "debug_url": debug_url,
+        "running": True,
+        "matched": False,
+        "page_count": len(pages),
+        "selected_page": None,
+        "candidate_pages": pages,
+        "error": "",
+    }
+    try:
+        result["selected_page"] = select_controlled_browser_page(pages, url_prefix=url_prefix, hostname=hostname)
+        result["matched"] = True
+    except Exception as exc:
+        result["error"] = str(exc) or "No usable controlled browser page found."
+    return result
+
+
+BROWSER_ACTION_ROUTE_MAP = {
+    "/api/browser/info": "info",
+    "/api/browser/html": "html",
+    "/api/browser/navigate": "navigate",
+    "/api/browser/evaluate": "evaluate",
+    "/api/browser/click": "click",
+    "/api/browser/type": "type",
+    "/api/browser/press": "press",
+    "/api/browser/wait-text": "wait_text",
+}
+
+
 def run_text_command(args: list[str], timeout_seconds: float = 3.0) -> str:
     try:
         result = subprocess.run(
@@ -510,10 +627,58 @@ def build_history_entry_text(prompt: str, image_paths: list[Path] | None = None)
     return "\n".join(labels).strip()
 
 
+def normalize_public_urls(raw_urls: object) -> list[str]:
+    if isinstance(raw_urls, str):
+        candidates = [raw_urls]
+    elif isinstance(raw_urls, (list, tuple, set)):
+        candidates = list(raw_urls)
+    else:
+        candidates = []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        parsed = urlsplit(text)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        filtered_query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key.lower() != "token"]
+        normalized_url = urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path or "/",
+                urlencode(filtered_query, doseq=True),
+                "",
+            )
+        )
+        if normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        normalized.append(normalized_url)
+    return normalized
+
+
+def build_public_access_url(base_url: str, token: str) -> str:
+    parsed = urlsplit(base_url)
+    filtered_query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key.lower() != "token"]
+    filtered_query.append(("token", token))
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path or "/",
+            urlencode(filtered_query, doseq=True),
+            "",
+        )
+    )
+
+
 def load_proxy_settings(settings_file: Path = PORTAL_SETTINGS_FILE) -> dict[str, object]:
     if settings_file.exists():
         try:
-            raw = json.loads(settings_file.read_text(encoding="utf-8"))
+            raw = json.loads(settings_file.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, json.JSONDecodeError):
             raw = {}
         if isinstance(raw, dict):
@@ -523,15 +688,29 @@ def load_proxy_settings(settings_file: Path = PORTAL_SETTINGS_FILE) -> dict[str,
             except (TypeError, ValueError):
                 port = DEFAULT_PROXY_PORT
             if 1 <= port <= 65535:
-                return {"proxy_enabled": enabled, "proxy_port": port}
-    return {"proxy_enabled": DEFAULT_PROXY_ENABLED, "proxy_port": DEFAULT_PROXY_PORT}
+                return {
+                    "proxy_enabled": enabled,
+                    "proxy_port": port,
+                    "public_urls": normalize_public_urls(raw.get("public_urls", [])),
+                }
+    return {"proxy_enabled": DEFAULT_PROXY_ENABLED, "proxy_port": DEFAULT_PROXY_PORT, "public_urls": []}
 
 
-def save_proxy_settings(proxy_enabled: bool, proxy_port: int, settings_file: Path = PORTAL_SETTINGS_FILE) -> dict[str, object]:
+def save_proxy_settings(
+    proxy_enabled: bool,
+    proxy_port: int,
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+    public_urls: list[str] | None = None,
+) -> dict[str, object]:
     port = int(proxy_port)
     if port < 1 or port > 65535:
         raise ValueError("Proxy port must be between 1 and 65535.")
-    payload = {"proxy_enabled": bool(proxy_enabled), "proxy_port": port}
+    existing = load_proxy_settings(settings_file)
+    payload = {
+        "proxy_enabled": bool(proxy_enabled),
+        "proxy_port": port,
+        "public_urls": normalize_public_urls(existing.get("public_urls", []) if public_urls is None else public_urls),
+    }
     settings_file.parent.mkdir(parents=True, exist_ok=True)
     settings_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
@@ -1999,7 +2178,11 @@ class JobRunner:
         pump_thread = threading.Thread(target=pump_stdout, daemon=True)
         pump_thread.start()
 
+        started_at = time.monotonic()
+        startup_no_output_deadline = started_at + PROCESS_STARTUP_NO_OUTPUT_TIMEOUT_SECONDS
+        max_runtime_deadline = started_at + PROCESS_MAX_RUNTIME_SECONDS
         completion_deadline = 0.0
+        saw_any_output = False
         while True:
             timeout = 0.2
             if completion_deadline > 0.0:
@@ -2014,12 +2197,26 @@ class JobRunner:
                     break
                 if completion_deadline > 0.0:
                     break
+                now_mono = time.monotonic()
+                if not saw_any_output and now_mono >= startup_no_output_deadline:
+                    self._append_log(job_id, "Codex produced no startup output for too long; terminating job.")
+                    exit_code = self._stop_process_after_grace(process)
+                    raise RuntimeError(
+                        f"Codex produced no startup output for {int(PROCESS_STARTUP_NO_OUTPUT_TIMEOUT_SECONDS)} seconds (exit {exit_code})."
+                    )
+                if now_mono >= max_runtime_deadline:
+                    self._append_log(job_id, "Codex job exceeded max runtime; terminating job.")
+                    exit_code = self._stop_process_after_grace(process)
+                    raise RuntimeError(
+                        f"Codex job exceeded {int(PROCESS_MAX_RUNTIME_SECONDS)} seconds (exit {exit_code})."
+                    )
                 continue
             if raw_line is None:
                 break
             line = raw_line.strip()
             if not line:
                 continue
+            saw_any_output = True
             self._append_log(job_id, line)
             try:
                 event = json.loads(line)
@@ -2269,11 +2466,80 @@ class PortalService:
             "proxy_scheme": "socks5h",
             "proxy_host": "127.0.0.1",
             "proxy_summary": current_proxy_summary_from_settings(settings),
+            "public_urls": list(settings.get("public_urls", [])),
         }
 
     def update_proxy_settings(self, proxy_enabled: bool, proxy_port: int) -> dict[str, object]:
         save_proxy_settings(proxy_enabled, proxy_port, self.proxy_settings_file)
         return self.proxy_settings_payload()
+
+    def browser_attach_payload(self, browser_name: str, url_prefix: str = "", hostname: str = "") -> dict[str, object]:
+        return describe_controlled_browser_attach(browser_name, url_prefix=url_prefix, hostname=hostname)
+
+    def _resolve_controlled_browser_page(
+        self,
+        browser_name: str,
+        url_prefix: str = "",
+        hostname: str = "",
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        attach = self.browser_attach_payload(browser_name, url_prefix=url_prefix, hostname=hostname)
+        if not bool(attach.get("running")):
+            raise controlled_browser.ControlledBrowserError(str(attach.get("error", "Controlled browser is unavailable.")))
+        if not bool(attach.get("matched")):
+            raise controlled_browser.ControlledBrowserError(str(attach.get("error", "No matching controlled browser page found.")))
+        selected_page = attach.get("selected_page")
+        if not isinstance(selected_page, dict):
+            raise controlled_browser.ControlledBrowserError("No matching controlled browser page found.")
+        return attach, dict(selected_page)
+
+    def perform_browser_action(
+        self,
+        *,
+        browser_name: str,
+        action: str,
+        url_prefix: str = "",
+        hostname: str = "",
+        url: str = "",
+        expression: str = "",
+        selector: str = "",
+        text: str = "",
+        key: str = "",
+        timeout_ms: int = 5000,
+    ) -> dict[str, object]:
+        attach, selected_page = self._resolve_controlled_browser_page(
+            browser_name,
+            url_prefix=url_prefix,
+            hostname=hostname,
+        )
+        page_ws_url = str(selected_page.get("webSocketDebuggerUrl", "")).strip()
+        if not page_ws_url:
+            raise controlled_browser.ControlledBrowserError("Selected page does not expose a DevTools WebSocket URL.")
+        with controlled_browser.connect_to_page(page_ws_url) as session:
+            if action == "info":
+                result = session.get_page_info()
+            elif action == "html":
+                result = {"html": session.get_html()}
+            elif action == "navigate":
+                result = session.navigate(url)
+            elif action == "evaluate":
+                result = {"value": session.evaluate(expression)}
+            elif action == "click":
+                result = session.click(selector)
+            elif action == "type":
+                result = session.type(selector, text)
+            elif action == "press":
+                result = session.press(key)
+            elif action == "wait_text":
+                result = session.wait_for_text(text, timeout_ms=timeout_ms)
+            else:
+                raise controlled_browser.ControlledBrowserError("Unsupported browser action.")
+        return {
+            "browser": str(browser_name).strip().lower(),
+            "action": action,
+            "selected_page": selected_page,
+            "attach": attach,
+            "result": result,
+        }
 
     def backend_status_payload(self) -> dict[str, object]:
         settings = token_pool_settings.load_backend_settings(self.backend_settings_file)
@@ -2375,6 +2641,7 @@ class PortalService:
             "reasoning_options": list(REASONING_EFFORT_OPTIONS),
             "recent_cwds": self.jobs.list_recent_cwds(),
             "proxy_summary": proxy_summary,
+            "startup_url_groups": [{"label": label, "urls": list(urls)} for label, urls in self.startup_url_groups()],
         }
 
     def session_payload(self, session_id: str) -> dict[str, object] | None:
@@ -2500,6 +2767,10 @@ class PortalService:
                 urls.append(url)
         return urls
 
+    def public_urls(self) -> list[str]:
+        settings = load_proxy_settings(self.proxy_settings_file)
+        return [build_public_access_url(base_url, self.token) for base_url in normalize_public_urls(settings.get("public_urls", []))]
+
     def lan_urls(self) -> list[str]:
         urls = [f"http://127.0.0.1:{self.port}/?token={self.token}"]
         try:
@@ -2520,6 +2791,9 @@ class PortalService:
 
     def startup_url_groups(self) -> list[tuple[str, list[str]]]:
         groups: list[tuple[str, list[str]]] = []
+        public_urls = self.public_urls()
+        if public_urls:
+            groups.append(("Public (Cloudflare/custom)", public_urls))
         tailscale_urls = self.tailscale_urls()
         if tailscale_urls:
             groups.append(("Tailscale (cross-network)", tailscale_urls))
@@ -2578,6 +2852,10 @@ INDEX_HTML = """<!doctype html>
       background: rgba(255, 255, 255, 0.04);
       color: var(--muted);
       font-size: 0.84rem;
+    }
+    a.pill {
+      color: var(--text);
+      text-decoration: none;
     }
     .layout { display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 14px; }
     .panel-head {
@@ -2688,6 +2966,7 @@ INDEX_HTML = """<!doctype html>
       <h1>Codex Mobile Portal</h1>
       <p>Browse local Codex sessions from your phone and continue them by calling real <code>codex exec resume</code> jobs on this computer.</p>
       <div class="meta" id="heroMeta"></div>
+      <div class="meta" id="heroLinks"></div>
     </section>
     <div class="layout">
       <aside class="panel">
@@ -2887,6 +3166,12 @@ INDEX_HTML = """<!doctype html>
         <span class="pill">MCP: ${b.mcp.length}</span>
         <span class="pill">Skills: ${b.skills.length}</span>
         <span class="pill">Auth: token protected</span>`;
+      const groups = Array.isArray(b.startup_url_groups) ? b.startup_url_groups : [];
+      document.getElementById("heroLinks").innerHTML = groups.flatMap((group) =>
+        (Array.isArray(group.urls) ? group.urls : []).map((url) =>
+          `<a class="pill" href="${esc(url)}" target="_blank" rel="noreferrer">${esc(group.label)}: ${esc(url)}</a>`
+        )
+      ).join("");
     }
 
     function renderSessions() {
@@ -3195,6 +3480,19 @@ class PortalHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/proxy-settings":
             self._send_json(self.portal.proxy_settings_payload())
             return
+        if parsed.path == "/api/browser/attach":
+            query = parse_qs(parsed.query)
+            try:
+                payload = self.portal.browser_attach_payload(
+                    str(query.get("browser", ["edge"])[0]),
+                    url_prefix=str(query.get("url_prefix", [""])[0]),
+                    hostname=str(query.get("hostname", [""])[0]),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(payload)
+            return
         if parsed.path.startswith("/api/sessions/"):
             session_id = parsed.path.removeprefix("/api/sessions/")
             payload = self.portal.session_payload(session_id)
@@ -3230,6 +3528,26 @@ class PortalHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         payload = self._read_json_body()
+        browser_action = BROWSER_ACTION_ROUTE_MAP.get(parsed.path)
+        if browser_action:
+            try:
+                result = self.portal.perform_browser_action(
+                    browser_name=str(payload.get("browser", "edge")),
+                    action=browser_action,
+                    url_prefix=str(payload.get("url_prefix", "")),
+                    hostname=str(payload.get("hostname", "")),
+                    url=str(payload.get("url", "")),
+                    expression=str(payload.get("expression", "")),
+                    selector=str(payload.get("selector", "")),
+                    text=str(payload.get("text", "")),
+                    key=str(payload.get("key", "")),
+                    timeout_ms=int(payload.get("timeout_ms", 5000)),
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
         if parsed.path == "/api/files/share":
             try:
                 result = self.portal.create_file_share(
@@ -3577,7 +3895,10 @@ def main(argv: list[str] | None = None) -> int:
     server = ThreadingHTTPServer((args.host, args.port), PortalHandler)
     server.portal = portal  # type: ignore[attr-defined]
     startup_groups = portal.startup_url_groups()
-    has_tailscale = any(label.startswith("Tailscale") and urls for label, urls in startup_groups)
+    has_cross_network = any(
+        (label.startswith("Tailscale") or label.startswith("Public")) and urls
+        for label, urls in startup_groups
+    )
 
     print(APP_TITLE)
     print(f"Access token: {token}")
@@ -3586,8 +3907,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{label}:")
         for url in urls:
             print(f"  {url}")
-    if not has_tailscale:
-        print("Tip: install and sign in to Tailscale on both devices for cross-network access.")
+    if not has_cross_network:
+        print(
+            "Tip: install and sign in to Tailscale on both devices, or add public_urls to "
+            f"{PORTAL_SETTINGS_FILE} for Cloudflare/custom cross-network access."
+        )
     print("Press Ctrl+C to stop.")
 
     try:

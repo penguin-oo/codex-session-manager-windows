@@ -1,4 +1,6 @@
+import codecs
 import io
+import json
 import queue
 import subprocess
 import tempfile
@@ -9,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import controlled_browser
 import mobile_portal
 import token_pool_settings
 
@@ -63,6 +66,53 @@ class ProxySettingsTests(unittest.TestCase):
 
             self.assertTrue(settings["proxy_enabled"])
             self.assertEqual(7897, settings["proxy_port"])
+            self.assertEqual([], settings["public_urls"])
+
+    def test_load_proxy_settings_normalizes_public_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "proxy_enabled": True,
+                        "proxy_port": 7897,
+                        "public_urls": [
+                            " https://chat.pyguin.us.ci ",
+                            "https://chat.pyguin.us.ci/?token=stale#fragment",
+                            "https://chat.pyguin.us.ci/path?foo=1",
+                            "not-a-url",
+                            "",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            settings = mobile_portal.load_proxy_settings(settings_path)
+
+            self.assertEqual(
+                [
+                    "https://chat.pyguin.us.ci/",
+                    "https://chat.pyguin.us.ci/path?foo=1",
+                ],
+                settings["public_urls"],
+            )
+
+    def test_load_proxy_settings_accepts_utf8_bom_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            payload = json.dumps(
+                {
+                    "proxy_enabled": True,
+                    "proxy_port": 7897,
+                    "public_urls": ["https://chat.pyguin.us.ci"],
+                }
+            ).encode("utf-8")
+            settings_path.write_bytes(codecs.BOM_UTF8 + payload)
+
+            settings = mobile_portal.load_proxy_settings(settings_path)
+
+            self.assertEqual(["https://chat.pyguin.us.ci/"], settings["public_urls"])
 
     def test_save_proxy_settings_validates_port(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -632,6 +682,148 @@ class JobRunnerOwnershipTests(unittest.TestCase):
                     "session-1",
                 )
 
+    def test_run_codex_process_times_out_when_no_startup_output(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "resume",
+            "session_id": "session-1",
+            "created_at": mobile_portal.now_ts(),
+            "heartbeat_at": mobile_portal.now_ts(),
+            "pid": 0,
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+        }
+
+        class _SilentStdout:
+            def __init__(self) -> None:
+                self._queue: queue.Queue[str | None] = queue.Queue()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> str:
+                item = self._queue.get()
+                if item is None:
+                    raise StopIteration
+                return item
+
+            def finish(self) -> None:
+                self._queue.put(None)
+
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 888
+                self.stdout = _SilentStdout()
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.terminate_calls > 0 or self.kill_calls > 0:
+                    return 0
+                if timeout is None:
+                    return 0
+                raise subprocess.TimeoutExpired("codex.cmd", timeout)
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+                self.stdout.finish()
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.stdout.finish()
+
+        fake_process = _FakeProcess()
+
+        with mock.patch.object(mobile_portal, "PROCESS_STARTUP_NO_OUTPUT_TIMEOUT_SECONDS", 0.05), \
+             mock.patch.object(mobile_portal, "PROCESS_EXIT_GRACE_SECONDS", 0.05), \
+             mock.patch("mobile_portal.subprocess.Popen", return_value=fake_process):
+            with self.assertRaisesRegex(RuntimeError, "produced no startup output"):
+                runner._run_codex_process(
+                    "job-1",
+                    ["codex.cmd", "exec"],
+                    str(Path.cwd()),
+                    "session-1",
+                )
+
+        self.assertEqual(1, fake_process.terminate_calls)
+
+    def test_run_codex_process_uses_max_runtime_after_initial_output(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "resume",
+            "session_id": "session-1",
+            "created_at": mobile_portal.now_ts(),
+            "heartbeat_at": mobile_portal.now_ts(),
+            "pid": 0,
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+        }
+
+        class _BlockingStdout:
+            def __init__(self) -> None:
+                self._queue: queue.Queue[str | None] = queue.Queue()
+                self._queue.put('{"type":"thread.started","thread_id":"session-1"}\n')
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> str:
+                item = self._queue.get()
+                if item is None:
+                    raise StopIteration
+                return item
+
+            def finish(self) -> None:
+                self._queue.put(None)
+
+        class _FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 889
+                self.stdout = _BlockingStdout()
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.terminate_calls > 0 or self.kill_calls > 0:
+                    return 0
+                if timeout is None:
+                    return 0
+                raise subprocess.TimeoutExpired("codex.cmd", timeout)
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+                self.stdout.finish()
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.stdout.finish()
+
+        fake_process = _FakeProcess()
+
+        with mock.patch.object(mobile_portal, "PROCESS_STARTUP_NO_OUTPUT_TIMEOUT_SECONDS", 0.05), \
+             mock.patch.object(mobile_portal, "PROCESS_MAX_RUNTIME_SECONDS", 0.1), \
+             mock.patch.object(mobile_portal, "PROCESS_EXIT_GRACE_SECONDS", 0.05), \
+             mock.patch("mobile_portal.subprocess.Popen", return_value=fake_process):
+            with self.assertRaisesRegex(RuntimeError, "exceeded"):
+                runner._run_codex_process(
+                    "job-1",
+                    ["codex.cmd", "exec"],
+                    str(Path.cwd()),
+                    "session-1",
+                )
+
+        self.assertEqual(1, fake_process.terminate_calls)
+
     def test_run_new_chat_job_records_opening_message_for_created_session(self) -> None:
         runner = mobile_portal.JobRunner(_FakeStore())
         runner.jobs["job-1"] = {
@@ -736,6 +928,50 @@ class PortalServiceBootstrapTests(unittest.TestCase):
         self.assertTrue(payload["sessions"][0]["is_replying"])
         self.assertEqual(mobile_portal.current_proxy_summary(), payload["proxy_summary"])
 
+    def test_startup_url_groups_include_configured_public_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "proxy_enabled": True,
+                        "proxy_port": 7897,
+                        "public_urls": ["https://chat.pyguin.us.ci"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "verify-token")
+            service.proxy_settings_file = settings_path
+
+            with mock.patch.object(service, "tailscale_urls", return_value=["http://100.64.0.1:8765/?token=verify-token"]), \
+                 mock.patch.object(service, "lan_urls", return_value=["http://127.0.0.1:8765/?token=verify-token"]):
+                groups = service.startup_url_groups()
+
+        self.assertEqual(
+            [
+                ("Public (Cloudflare/custom)", ["https://chat.pyguin.us.ci/?token=verify-token"]),
+                ("Tailscale (cross-network)", ["http://100.64.0.1:8765/?token=verify-token"]),
+                ("LAN", ["http://127.0.0.1:8765/?token=verify-token"]),
+            ],
+            groups,
+        )
+
+    def test_bootstrap_payload_includes_startup_url_groups(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+
+        with mock.patch.object(
+            service,
+            "startup_url_groups",
+            return_value=[("Public (Cloudflare/custom)", ["https://chat.pyguin.us.ci/?token=token"])],
+        ):
+            payload = service.bootstrap_payload()
+
+        self.assertEqual(
+            [{"label": "Public (Cloudflare/custom)", "urls": ["https://chat.pyguin.us.ci/?token=token"]}],
+            payload["startup_url_groups"],
+        )
+
     def test_update_session_settings_changes_follow_up_defaults(self) -> None:
         session = mobile_portal.SessionItem(
             session_id="session-1",
@@ -766,6 +1002,16 @@ class PortalServiceBootstrapTests(unittest.TestCase):
     def test_proxy_settings_payload_and_update_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "proxy_enabled": True,
+                        "proxy_port": 7897,
+                        "public_urls": ["https://chat.pyguin.us.ci"],
+                    }
+                ),
+                encoding="utf-8",
+            )
             service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
             service.proxy_settings_file = settings_path
 
@@ -776,9 +1022,11 @@ class PortalServiceBootstrapTests(unittest.TestCase):
         self.assertEqual(7897, initial["proxy_port"])
         self.assertEqual("socks5h", initial["proxy_scheme"])
         self.assertEqual("127.0.0.1", initial["proxy_host"])
+        self.assertEqual(["https://chat.pyguin.us.ci/"], initial["public_urls"])
         self.assertFalse(updated["proxy_enabled"])
         self.assertEqual(9010, updated["proxy_port"])
         self.assertEqual("direct", updated["proxy_summary"])
+        self.assertEqual(["https://chat.pyguin.us.ci/"], updated["public_urls"])
 
 
 class PortalPageTemplateTests(unittest.TestCase):
@@ -1037,6 +1285,76 @@ class PortalAuthorizationTests(unittest.TestCase):
         handler = self._make_handler(portal_token="令牌-测试", path="/api/bootstrap?token=%E4%BB%A4%E7%89%8C-%E6%B5%8B%E8%AF%95")
 
         self.assertTrue(handler._is_authorized())
+
+
+class PortalBrowserControlTests(unittest.TestCase):
+    def _make_handler(self, *, path: str, portal: object) -> mobile_portal.PortalHandler:
+        handler = mobile_portal.PortalHandler.__new__(mobile_portal.PortalHandler)
+        handler.headers = {}
+        handler.path = path
+        handler.server = SimpleNamespace(portal=portal)
+        return handler
+
+    def test_do_get_browser_attach_returns_attach_payload(self) -> None:
+        portal = SimpleNamespace(
+            token="token",
+            browser_attach_payload=mock.Mock(return_value={"running": True, "matched": True}),
+        )
+        handler = self._make_handler(
+            path="/api/browser/attach?browser=edge&hostname=dash.cloudflare.com&token=token",
+            portal=portal,
+        )
+
+        with mock.patch.object(handler, "_send_json") as send_json:
+            handler.do_GET()
+
+        portal.browser_attach_payload.assert_called_once_with("edge", url_prefix="", hostname="dash.cloudflare.com")
+        send_json.assert_called_once_with({"running": True, "matched": True})
+
+    def test_do_post_browser_navigate_dispatches_action(self) -> None:
+        portal = SimpleNamespace(
+            token="token",
+            perform_browser_action=mock.Mock(return_value={"ok": True}),
+        )
+        handler = self._make_handler(path="/api/browser/navigate?token=token", portal=portal)
+
+        with mock.patch.object(
+            handler,
+            "_read_json_body",
+            return_value={"browser": "edge", "hostname": "dash.cloudflare.com", "url": "https://example.com"},
+        ), mock.patch.object(handler, "_send_json") as send_json:
+            handler.do_POST()
+
+        portal.perform_browser_action.assert_called_once_with(
+            browser_name="edge",
+            action="navigate",
+            url_prefix="",
+            hostname="dash.cloudflare.com",
+            url="https://example.com",
+            expression="",
+            selector="",
+            text="",
+            key="",
+            timeout_ms=5000,
+        )
+        send_json.assert_called_once_with({"ok": True})
+
+    def test_do_post_browser_click_surfaces_bad_request(self) -> None:
+        portal = SimpleNamespace(
+            token="token",
+            perform_browser_action=mock.Mock(side_effect=controlled_browser.ControlledBrowserError("Selector not found.")),
+        )
+        handler = self._make_handler(path="/api/browser/click?token=token", portal=portal)
+
+        with mock.patch.object(handler, "_read_json_body", return_value={"browser": "edge", "selector": "#missing"}), \
+             mock.patch.object(handler, "_send_json") as send_json:
+            handler.do_POST()
+
+        send_json.assert_called_once()
+        payload = send_json.call_args.args[0]
+        status = send_json.call_args.kwargs.get("status")
+        self.assertEqual({"error": "Selector not found."}, payload)
+        self.assertEqual(mobile_portal.HTTPStatus.BAD_REQUEST, status)
 
 
 class ResumeArgsTests(unittest.TestCase):
@@ -1330,6 +1648,102 @@ class TailscaleHelpersTests(unittest.TestCase):
         dns_name = mobile_portal.extract_tailscale_dns_name("not-json")
 
         self.assertEqual("", dns_name)
+
+
+class ControlledBrowserAttachTests(unittest.TestCase):
+    def test_get_controlled_browser_debug_url_returns_expected_ports(self) -> None:
+        self.assertEqual("http://127.0.0.1:9222", mobile_portal.get_controlled_browser_debug_url("edge"))
+        self.assertEqual("http://127.0.0.1:9223", mobile_portal.get_controlled_browser_debug_url("chrome"))
+
+    def test_list_controlled_browser_pages_filters_only_page_entries(self) -> None:
+        payload = """
+        [
+          {"type": "page", "url": "https://example.com", "title": "Example", "id": "1"},
+          {"type": "iframe", "url": "https://ignored.example", "title": "Ignored", "id": "2"}
+        ]
+        """
+
+        with mock.patch("mobile_portal.fetch_json_text", return_value=payload):
+            pages = mobile_portal.list_controlled_browser_pages("edge")
+
+        self.assertEqual(1, len(pages))
+        self.assertEqual("https://example.com", pages[0]["url"])
+
+    def test_select_controlled_browser_page_prefers_url_prefix_match(self) -> None:
+        pages = [
+            {"type": "page", "url": "https://example.com/login", "title": "Login"},
+            {"type": "page", "url": "https://dash.cloudflare.com/one/", "title": "Cloudflare"},
+        ]
+
+        selected = mobile_portal.select_controlled_browser_page(
+            pages,
+            url_prefix="https://dash.cloudflare.com/",
+        )
+
+        self.assertEqual("https://dash.cloudflare.com/one/", selected["url"])
+
+    def test_select_controlled_browser_page_prefers_hostname_match_when_prefix_missing(self) -> None:
+        pages = [
+            {"type": "page", "url": "https://example.com/login", "title": "Login"},
+            {"type": "page", "url": "https://dash.cloudflare.com/one/", "title": "Cloudflare"},
+        ]
+
+        selected = mobile_portal.select_controlled_browser_page(pages, hostname="dash.cloudflare.com")
+
+        self.assertEqual("https://dash.cloudflare.com/one/", selected["url"])
+
+    def test_select_controlled_browser_page_falls_back_to_first_non_blank_page(self) -> None:
+        pages = [
+            {"type": "page", "url": "about:blank", "title": ""},
+            {"type": "page", "url": "https://example.com", "title": "Example"},
+        ]
+
+        selected = mobile_portal.select_controlled_browser_page(pages)
+
+        self.assertEqual("https://example.com", selected["url"])
+
+    def test_select_controlled_browser_page_raises_when_no_usable_page_exists(self) -> None:
+        pages = [{"type": "page", "url": "about:blank", "title": ""}]
+
+        with self.assertRaisesRegex(RuntimeError, "No usable controlled browser page found"):
+            mobile_portal.select_controlled_browser_page(pages)
+
+    def test_describe_controlled_browser_attach_returns_running_match_status(self) -> None:
+        pages = [
+            {"type": "page", "url": "https://dash.cloudflare.com/one/", "title": "Cloudflare", "id": "abc"}
+        ]
+
+        with mock.patch("mobile_portal.list_controlled_browser_pages", return_value=pages):
+            result = mobile_portal.describe_controlled_browser_attach(
+                "edge",
+                url_prefix="https://dash.cloudflare.com/",
+            )
+
+        self.assertTrue(result["running"])
+        self.assertTrue(result["matched"])
+        self.assertEqual("https://dash.cloudflare.com/one/", result["selected_page"]["url"])
+
+    def test_describe_controlled_browser_attach_reports_unavailable_browser(self) -> None:
+        with mock.patch("mobile_portal.list_controlled_browser_pages", side_effect=RuntimeError("debug endpoint unavailable")):
+            result = mobile_portal.describe_controlled_browser_attach("edge")
+
+        self.assertFalse(result["running"])
+        self.assertFalse(result["matched"])
+        self.assertEqual("debug endpoint unavailable", result["error"])
+
+    def test_describe_controlled_browser_attach_reports_running_browser_without_match(self) -> None:
+        pages = [{"type": "page", "url": "about:blank", "title": "", "id": "blank"}]
+
+        with mock.patch("mobile_portal.list_controlled_browser_pages", return_value=pages):
+            result = mobile_portal.describe_controlled_browser_attach(
+                "edge",
+                url_prefix="https://dash.cloudflare.com/",
+            )
+
+        self.assertTrue(result["running"])
+        self.assertFalse(result["matched"])
+        self.assertEqual(1, result["page_count"])
+        self.assertIn("No usable controlled browser page found", result["error"])
 
 
 class CacheHelperTests(unittest.TestCase):
