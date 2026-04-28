@@ -204,6 +204,32 @@ class _FakeStore:
         return []
 
 
+class _FakeUrlResponse:
+    def __init__(self, body: str, status: int = 200, headers: dict[str, str] | None = None) -> None:
+        self.status = status
+        self.headers = headers or {"content-type": "application/json"}
+        self._body = body.encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeUrlResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _FakeUrlOpener:
+    def __init__(self, response: _FakeUrlResponse) -> None:
+        self.response = response
+        self.requests: list[tuple[object, float | None]] = []
+
+    def open(self, request: object, timeout: float | None = None) -> _FakeUrlResponse:
+        self.requests.append((request, timeout))
+        return self.response
+
+
 class JobRunnerOwnershipTests(unittest.TestCase):
     def test_claim_session_rejects_conflicting_owner(self) -> None:
         runner = mobile_portal.JobRunner(_FakeStore())
@@ -251,6 +277,55 @@ class JobRunnerOwnershipTests(unittest.TestCase):
         self.assertIn("job_id", result)
         self.assertIn("session-1", runner.active_sessions)
         self.assertNotIn("dead-job", runner.jobs)
+
+    def test_active_job_for_session_keeps_job_when_wrapper_pid_is_gone_but_exec_process_still_exists(self) -> None:
+        runner = mobile_portal.JobRunner(_FakeStore())
+        runner.active_sessions.add("session-1")
+        runner.jobs["job-1"] = {
+            "job_id": "job-1",
+            "status": "running",
+            "kind": "resume",
+            "session_id": "session-1",
+            "created_at": 1,
+            "heartbeat_at": 1,
+            "pid": 1744,
+            "output_file": r"C:\Users\windows\AppData\Local\Temp\codex-mobile-out-test.txt",
+            "error": "",
+            "last_message": "",
+            "log_tail": [],
+            "live_text": "",
+            "live_chunks_version": 0,
+        }
+        processes = [
+            {
+                "ProcessId": 23372,
+                "Name": "node.exe",
+                "CommandLine": (
+                    '"node" "C:\\Users\\windows\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js" '
+                    'exec --json -o C:\\Users\\windows\\AppData\\Local\\Temp\\codex-mobile-out-test.txt '
+                    "resume session-1 -"
+                ),
+            },
+            {
+                "ProcessId": 12376,
+                "Name": "codex.exe",
+                "CommandLine": (
+                    "C:\\Users\\windows\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\codex.exe "
+                    "exec --json -o C:\\Users\\windows\\AppData\\Local\\Temp\\codex-mobile-out-test.txt "
+                    "resume session-1 -"
+                ),
+            },
+        ]
+
+        with mock.patch.object(runner, "_is_pid_running", return_value=False), \
+             mock.patch.object(mobile_portal, "list_windows_process_rows", return_value=processes), \
+             mock.patch.object(mobile_portal, "now_ts", return_value=100):
+            job = runner.active_job_for_session("session-1")
+
+        self.assertIsNotNone(job)
+        self.assertEqual("job-1", job["job_id"])
+        self.assertEqual(23372, runner.jobs["job-1"]["pid"])
+        self.assertIn("session-1", runner.active_sessions)
 
     def test_append_live_text_tracks_incremental_preview(self) -> None:
         runner = mobile_portal.JobRunner(_FakeStore())
@@ -1083,20 +1158,176 @@ class PortalAccountSlotsTests(unittest.TestCase):
             deleted = service.delete_account_slot("slot-3")
         self.assertEqual([], deleted["slots"])
 
+    def test_refresh_current_chatgpt_auth_updates_auth_file_with_rotated_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir) / ".codex"
+            codex_home.mkdir(parents=True, exist_ok=True)
+            auth_path = codex_home / "auth.json"
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "OPENAI_API_KEY": None,
+                        "last_refresh": "2026-04-20T00:00:00Z",
+                        "tokens": {
+                            "account_id": "acct-1",
+                            "access_token": "old-access",
+                            "refresh_token": "old-refresh",
+                            "id_token": "old-id",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            opener = _FakeUrlOpener(
+                _FakeUrlResponse(
+                    json.dumps(
+                        {
+                            "access_token": "new-access",
+                            "refresh_token": "new-refresh",
+                            "id_token": "new-id",
+                            "expires_in": 3600,
+                            "scope": "openid profile email",
+                            "token_type": "Bearer",
+                        }
+                    )
+                )
+            )
+
+            with mock.patch.object(mobile_portal.url_request, "build_opener", return_value=opener):
+                result = mobile_portal.refresh_current_chatgpt_auth(
+                    auth_file=auth_path,
+                    settings_file=codex_home / "mobile_portal_settings.json",
+                )
+            self.assertEqual("ok", result["status"])
+            updated = json.loads(auth_path.read_text(encoding="utf-8"))
+            self.assertEqual("new-access", updated["tokens"]["access_token"])
+            self.assertEqual("new-refresh", updated["tokens"]["refresh_token"])
+            self.assertEqual("new-id", updated["tokens"]["id_token"])
+            self.assertEqual("acct-1", updated["tokens"]["account_id"])
+            request, timeout = opener.requests[0]
+            self.assertEqual("https://auth.openai.com/oauth/token", request.full_url)
+            self.assertEqual(8.0, timeout)
+            self.assertEqual(
+                {
+                    "grant_type": "refresh_token",
+                    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                    "refresh_token": "old-refresh",
+                },
+                json.loads(request.data.decode("utf-8")),
+            )
+
+    def test_refresh_current_account_syncs_active_slot_after_refresh(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+
+        with mock.patch.object(mobile_portal, "refresh_current_chatgpt_auth", return_value={"status": "ok"}), \
+             mock.patch.object(mobile_portal.auth_slots, "detect_active_slot", return_value="slot-2"), \
+             mock.patch.object(mobile_portal.auth_slots, "save_current_auth_to_slot") as save_current_auth_to_slot, \
+             mock.patch.object(service, "account_slots_payload", return_value={"active_slot": "slot-2"}) as account_slots_payload:
+            payload = service.refresh_current_account()
+
+        self.assertEqual({"active_slot": "slot-2"}, payload)
+        save_current_auth_to_slot.assert_called_once_with("slot-2")
+        account_slots_payload.assert_called_once_with()
+
     def test_read_current_weekly_quota_extracts_status_summary(self) -> None:
         output = "Plan: ChatGPT Plus\nWeekly quota: 76% used (resets in 3 days)\n"
 
-        with mock.patch.object(mobile_portal, "run_text_command", return_value=output):
+        with mock.patch.object(mobile_portal, "read_current_usage_quota", return_value={"state": "unavailable", "summary": "Quota unavailable"}), \
+             mock.patch.object(mobile_portal, "run_text_command", return_value=output):
             quota = mobile_portal.read_current_weekly_quota()
 
         self.assertEqual("ok", quota["state"])
         self.assertIn("Weekly quota: 76% used", quota["summary"])
 
-    def test_read_current_weekly_quota_uses_plain_status_command(self) -> None:
+    def test_read_current_weekly_quota_includes_5h_and_weekly_lines(self) -> None:
+        output = (
+            "Plan: ChatGPT Plus\n"
+            "5h quota: 12% used (resets in 2h)\n"
+            "Weekly quota: 76% used (resets in 3 days)\n"
+        )
+
+        with mock.patch.object(mobile_portal, "read_current_usage_quota", return_value={"state": "unavailable", "summary": "Quota unavailable"}), \
+             mock.patch.object(mobile_portal, "run_text_command", return_value=output):
+            quota = mobile_portal.read_current_weekly_quota()
+
+        self.assertEqual("ok", quota["state"])
+        self.assertEqual(
+            "5h quota: 12% used (resets in 2h)\nWeekly quota: 76% used (resets in 3 days)",
+            quota["summary"],
+        )
+
+    def test_read_current_weekly_quota_prefers_usage_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            auth_path = Path(temp_dir) / "auth.json"
+            auth_path.write_text(json.dumps({"tokens": {"access_token": "test-token"}}), encoding="utf-8")
+            settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            mobile_portal.save_proxy_settings(True, 9003, settings_path)
+            opener = _FakeUrlOpener(
+                _FakeUrlResponse(
+                    json.dumps(
+                        {
+                            "rate_limit": {
+                                "primary_window": {
+                                    "used_percent": 24,
+                                    "limit_window_seconds": 18000,
+                                    "reset_after_seconds": 16974,
+                                },
+                                "secondary_window": {
+                                    "used_percent": 19,
+                                    "limit_window_seconds": 604800,
+                                    "reset_after_seconds": 582818,
+                                },
+                            }
+                        }
+                    )
+                )
+            )
+
+            with mock.patch.object(mobile_portal.url_request, "build_opener", return_value=opener), \
+                 mock.patch.object(mobile_portal, "run_text_command", return_value="") as run_text_command:
+                quota = mobile_portal.read_current_weekly_quota(auth_file=auth_path, settings_file=settings_path)
+
+        self.assertEqual("ok", quota["state"])
+        self.assertEqual(
+            "5h quota: 24% used (resets in 4h 42m)\nWeekly quota: 19% used (resets in 6d 17h)",
+            quota["summary"],
+        )
+        self.assertFalse(run_text_command.called)
+        request, timeout = opener.requests[0]
+        self.assertEqual("Bearer test-token", request.headers["Authorization"])
+        self.assertEqual(4.0, timeout)
+
+    def test_read_current_weekly_quota_falls_back_to_plain_status_command(self) -> None:
         with mock.patch.object(mobile_portal, "run_text_command", return_value="") as run_text_command:
-            mobile_portal.read_current_weekly_quota()
+            mobile_portal.read_current_weekly_quota(auth_file=Path("missing-auth.json"))
 
         run_text_command.assert_called_once_with([mobile_portal.CODEX_BIN, "status"], timeout_seconds=4.0)
+
+    def test_load_available_models_includes_gpt_5_5_even_when_cache_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            models_path = Path(temp_dir) / "models_cache.json"
+            models_path.write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {"slug": "gpt-5.4", "visibility": "list"},
+                            {"slug": "gpt-5.4-mini", "visibility": "list"},
+                            {"slug": "gpt-5.3-codex", "visibility": "list"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = mobile_portal.CodexDataStore()
+
+            with mock.patch.object(mobile_portal, "MODELS_CACHE_FILE", models_path):
+                models = store.load_available_models()
+
+        self.assertEqual(
+            ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2", "gpt-5"],
+            models,
+        )
 
     def test_account_slots_payload_includes_backend_status(self) -> None:
         service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
@@ -2177,6 +2408,105 @@ class LoadMessagesTests(unittest.TestCase):
             [
                 {"role": "user", "text": "same link again"},
                 {"role": "assistant", "text": "service still on 8877"},
+            ],
+            [{"role": item["role"], "text": item["text"]} for item in messages],
+        )
+
+    def test_load_messages_keeps_task_complete_fallback_when_user_message_already_exists_in_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            history_file = temp_root / "history.jsonl"
+            history_file.write_text(
+                mobile_portal.json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "ts": mobile_portal.iso_to_ts("2026-03-19T07:00:01.000Z"),
+                        "text": "测试啊。是卡住了吗",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            sessions_dir = temp_root / "sessions" / "2026" / "03" / "19"
+            sessions_dir.mkdir(parents=True)
+            session_file = sessions_dir / "rollout-session-1.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"id": "session-1"},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:01.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "测试啊。是卡住了吗"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:02.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "commentary",
+                                    "content": [{"type": "output_text", "text": "没卡住，轻量测试已经跑完并且通过了。"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:03.000Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "final_answer",
+                                    "content": [{"type": "output_text", "text": ""}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        mobile_portal.json.dumps(
+                            {
+                                "timestamp": "2026-03-19T07:00:04.000Z",
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "task_complete",
+                                    "turn_id": "turn-1",
+                                    "last_agent_message": "没卡住，轻量测试已经跑完并且通过了。",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(mobile_portal, "HISTORY_FILE", history_file), \
+                    mock.patch.object(mobile_portal, "SESSIONS_DIR", temp_root / "sessions"):
+                store = mobile_portal.CodexDataStore()
+                messages = store.load_messages("session-1")
+
+        self.assertEqual(
+            [
+                {"role": "user", "text": "测试啊。是卡住了吗"},
+                {"role": "assistant", "text": "没卡住，轻量测试已经跑完并且通过了。"},
             ],
             [{"role": item["role"], "text": item["text"]} for item in messages],
         )

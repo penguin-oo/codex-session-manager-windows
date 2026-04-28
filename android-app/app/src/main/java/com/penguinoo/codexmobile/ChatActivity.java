@@ -899,7 +899,7 @@ public final class ChatActivity extends AppCompatActivity {
         AccountCenterDialogSupport.show(this, payload, new AccountCenterDialogSupport.Callbacks() {
             @Override
             public void onRefresh() {
-                showAccountsDialog();
+                refreshCurrentAccount();
             }
 
             @Override
@@ -1006,6 +1006,21 @@ public final class ChatActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     showBanner(getString(R.string.banner_account_bound, slotDisplayName(slot)));
                     showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void refreshCurrentAccount() {
+        showBanner(getString(R.string.banner_refreshing_current_login));
+        executor.execute(() -> {
+            try {
+                AccountSlotsPayload payload = apiClient.refreshCurrentAccount(endpoint);
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_current_login_refreshed));
+                    presentAccountsDialog(payload);
                 });
             } catch (Exception exception) {
                 runOnUiThread(() -> showBanner(exception.getMessage()));

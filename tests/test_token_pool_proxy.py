@@ -353,6 +353,7 @@ class TokenPoolProtocolTests(unittest.TestCase):
 
         self.assertEqual('list', payload['object'])
         model_ids = [item['id'] for item in payload['data']]
+        self.assertIn('gpt-5.5', model_ids)
         self.assertIn('gpt-5.4', model_ids)
         self.assertIn('gpt-5.3-codex', model_ids)
 

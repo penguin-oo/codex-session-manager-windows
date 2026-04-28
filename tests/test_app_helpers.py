@@ -117,6 +117,35 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertEqual("Weekly quota: 76% used", summary)
 
+    def test_account_dialog_dimensions_fit_within_screen(self) -> None:
+        width, height = app.account_dialog_dimensions(screen_width=1920, screen_height=1080)
+
+        self.assertEqual((720, 820), (width, height))
+
+    def test_account_dialog_dimensions_keep_small_screens_usable(self) -> None:
+        width, height = app.account_dialog_dimensions(screen_width=640, screen_height=480)
+
+        self.assertEqual((560, 400), (width, height))
+
+    def test_merge_available_models_promotes_gpt_5_5_without_losing_cached_entries(self) -> None:
+        models = app.merge_available_models(["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"])
+
+        self.assertEqual(
+            ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2", "gpt-5"],
+            models,
+        )
+
+    def test_build_codex_new_args_defaults_backend_override_to_gpt_5_5(self) -> None:
+        manager = object.__new__(app.SessionManagerApp)
+        manager.model_var = mock.Mock()
+        manager.model_var.get.return_value = "default"
+        manager._build_codex_override_args = mock.Mock(return_value=[])
+        manager._build_backend_override_args = mock.Mock(return_value=[])
+
+        app.SessionManagerApp._build_codex_new_args(manager)
+
+        manager._build_backend_override_args.assert_called_once_with("gpt-5.5")
+
     def test_build_token_pool_provider_override_args_points_codex_to_local_proxy(self) -> None:
         args = app.build_token_pool_provider_override_args(
             model="gpt-5.4",

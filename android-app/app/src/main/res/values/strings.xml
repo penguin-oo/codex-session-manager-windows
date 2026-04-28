@@ -108,6 +108,8 @@
     <string name="banner_saving_session_settings">Saving session settings...</string>
     <string name="banner_session_settings_saved">Session settings saved.</string>
     <string name="banner_loading_accounts">Loading accounts...</string>
+    <string name="banner_refreshing_current_login">Refreshing current login...</string>
+    <string name="banner_current_login_refreshed">Current login refreshed.</string>
     <string name="banner_loading_proxy_settings">Loading proxy settings...</string>
     <string name="banner_saving_proxy_settings">Saving proxy settings...</string>
     <string name="banner_proxy_settings_saved">Proxy settings saved: %1$s</string>

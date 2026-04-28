@@ -106,6 +106,11 @@ public final class PortalApiClient {
         return parseAccountSlotsPayload(json);
     }
 
+    public AccountSlotsPayload refreshCurrentAccount(PortalEndpoint endpoint) throws IOException {
+        JSONObject json = postJson(endpoint, "/api/accounts/refresh-current", new JSONObject());
+        return parseAccountSlotsPayload(json);
+    }
+
     public AccountSlotsPayload createAccountSlot(PortalEndpoint endpoint, String label) throws IOException {
         JSONObject body = new JSONObject();
         try {

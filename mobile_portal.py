@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -40,6 +40,7 @@ DEFAULT_PROXY_URL = "socks5h://127.0.0.1:7897"
 DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1"
 REASONING_EFFORT_OPTIONS = ["default", "low", "medium", "high", "xhigh"]
 CODEX_HOME = Path(os.environ.get("USERPROFILE", "")) / ".codex"
+AUTH_FILE = CODEX_HOME / "auth.json"
 HISTORY_FILE = CODEX_HOME / "history.jsonl"
 NOTES_FILE = CODEX_HOME / "session_notes.json"
 SETTINGS_FILE = CODEX_HOME / "session_settings.json"
@@ -60,6 +61,14 @@ OWNER_HEARTBEAT_TIMEOUT_SECONDS = 30
 PROCESS_EXIT_GRACE_SECONDS = 1.0
 PROCESS_STARTUP_NO_OUTPUT_TIMEOUT_SECONDS = 300.0
 PROCESS_MAX_RUNTIME_SECONDS = 1800.0
+DEFAULT_PRIMARY_MODEL = "gpt-5.5"
+FALLBACK_MODEL_OPTIONS = (
+    DEFAULT_PRIMARY_MODEL,
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5",
+)
 TAILSCALE_WINDOWS_PATH = Path(r"C:\Program Files\Tailscale\tailscale.exe")
 FILE_SHARE_TTL_SECONDS = 30 * 60
 SUPPORTED_SHARED_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf"}
@@ -68,6 +77,9 @@ DEFAULT_PROXY_ENABLED = True
 DEFAULT_PROXY_PORT = 7897
 TOKEN_POOL_PROVIDER_NAME = "built_in_token_pool"
 TOKEN_POOL_ENV_KEY_NAME = "CODEX_TOKEN_POOL_API_KEY"
+WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+OPENAI_AUTH_REFRESH_URL = "https://auth.openai.com/oauth/token"
+OPENAI_CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 INTERNAL_ASSISTANT_PROTOCOL_RE = re.compile(
     r"(?im)^\s*(?:user|assistant)\s+to=(?:functions|multi_tool_use|all|web|shell|commentary)\b.*$"
 )
@@ -600,19 +612,238 @@ def parse_weekly_quota_summary(status_output: str) -> dict[str, str]:
     text = (status_output or "").strip()
     if not text:
         return {"state": "unavailable", "summary": "Quota unavailable"}
+    five_hour_line = ""
+    weekly_line = ""
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if "weekly quota" in line.lower():
-            return {"state": "ok", "summary": line}
+        lower_line = line.lower()
+        if not five_hour_line and ("5h" in lower_line or "5 h" in lower_line or "5-hour" in lower_line or "5 hour" in lower_line):
+            five_hour_line = line
+        if not weekly_line and "weekly quota" in lower_line:
+            weekly_line = line
+    summary_lines = [line for line in (five_hour_line, weekly_line) if line]
+    if summary_lines:
+        return {"state": "ok", "summary": "\n".join(summary_lines)}
     first_line = text.splitlines()[0].strip()
     if first_line:
         return {"state": "ok", "summary": first_line}
     return {"state": "unavailable", "summary": "Quota unavailable"}
 
 
-def read_current_weekly_quota(timeout_seconds: float = 4.0) -> dict[str, str]:
+def _compact_duration_text(total_seconds: object) -> str:
+    try:
+        remaining = max(0, int(total_seconds))
+    except (TypeError, ValueError):
+        return ""
+    if remaining < 60:
+        return "<1m"
+    parts: list[str] = []
+    for suffix, unit_seconds in (("d", 86400), ("h", 3600), ("m", 60)):
+        value, remaining = divmod(remaining, unit_seconds)
+        if value <= 0:
+            continue
+        parts.append(f"{value}{suffix}")
+        if len(parts) >= 2:
+            break
+    return " ".join(parts) or "<1m"
+
+
+def _format_rate_limit_window(label: str, window: object) -> str:
+    if not isinstance(window, dict):
+        return ""
+    try:
+        used_percent = int(window.get("used_percent"))
+    except (TypeError, ValueError):
+        return ""
+    summary = f"{label}: {used_percent}% used"
+    reset_after_text = _compact_duration_text(window.get("reset_after_seconds"))
+    if reset_after_text:
+        summary += f" (resets in {reset_after_text})"
+    return summary
+
+
+def parse_wham_usage_summary(payload: object) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {"state": "unavailable", "summary": "Quota unavailable"}
+    rate_limit = payload.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return {"state": "unavailable", "summary": "Quota unavailable"}
+    summary_lines = [
+        _format_rate_limit_window("5h quota", rate_limit.get("primary_window")),
+        _format_rate_limit_window("Weekly quota", rate_limit.get("secondary_window")),
+    ]
+    summary_lines = [line for line in summary_lines if line]
+    if not summary_lines:
+        return {"state": "unavailable", "summary": "Quota unavailable"}
+    return {"state": "ok", "summary": "\n".join(summary_lines)}
+
+
+def load_auth_payload(auth_file: Path = AUTH_FILE) -> dict[str, object]:
+    try:
+        payload = json.loads(auth_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def load_auth_access_token(auth_file: Path = AUTH_FILE) -> str:
+    payload = load_auth_payload(auth_file)
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return ""
+    return str(tokens.get("access_token", "")).strip()
+
+
+def build_proxy_aware_opener(settings_file: Path = PORTAL_SETTINGS_FILE) -> object:
+    proxy_settings = load_proxy_settings(settings_file)
+    proxies: dict[str, str] = {}
+    if bool(proxy_settings.get("proxy_enabled", DEFAULT_PROXY_ENABLED)):
+        proxy_port = int(proxy_settings.get("proxy_port", DEFAULT_PROXY_PORT))
+        proxy_url = f"socks5h://127.0.0.1:{proxy_port}"
+        proxies = {"http": proxy_url, "https": proxy_url}
+    return url_request.build_opener(url_request.ProxyHandler(proxies))
+
+
+def _utc_now_iso_z() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _refresh_error_message(response_text: str) -> str:
+    try:
+        payload = json.loads(response_text)
+    except (ValueError, json.JSONDecodeError):
+        payload = {}
+    if isinstance(payload, dict):
+        error_code = str(payload.get("error", "")).strip().lower()
+        if error_code in {
+            "invalid_grant",
+            "refresh_token_expired",
+            "refresh_token_invalidated",
+            "refresh_token_inused",
+            "unauthorized_client",
+        }:
+            return "Current login needs re-login."
+        description = str(payload.get("error_description", "")).strip()
+        if description:
+            return description
+    lowered = response_text.lower()
+    if "refresh_token" in lowered or "invalid_grant" in lowered:
+        return "Current login needs re-login."
+    return "Failed to refresh current login."
+
+
+def refresh_current_chatgpt_auth(
+    timeout_seconds: float = 8.0,
+    auth_file: Path = AUTH_FILE,
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+    refresh_url: str = "",
+) -> dict[str, str]:
+    payload = load_auth_payload(auth_file)
+    if not payload:
+        raise RuntimeError("Current login credentials are missing. Re-login required.")
+    auth_mode = str(payload.get("auth_mode", "")).strip().lower()
+    if auth_mode and auth_mode != "chatgpt":
+        raise RuntimeError("Current login is not using ChatGPT auth.")
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        raise RuntimeError("Current login token data is missing. Re-login required.")
+    refresh_token = str(tokens.get("refresh_token", "")).strip()
+    if not refresh_token:
+        raise RuntimeError("Current login needs re-login.")
+
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "client_id": OPENAI_CHATGPT_CLIENT_ID,
+            "refresh_token": refresh_token,
+        }
+    ).encode("utf-8")
+    target_url = str(refresh_url or os.environ.get("CODEX_REFRESH_TOKEN_URL_OVERRIDE", OPENAI_AUTH_REFRESH_URL)).strip()
+    opener = build_proxy_aware_opener(settings_file)
+    request = url_request.Request(
+        target_url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "codex-session-manager-mobile-portal",
+        },
+        method="POST",
+    )
+    try:
+        with opener.open(request, timeout=timeout_seconds) as response:
+            response_text = response.read().decode("utf-8", errors="ignore")
+    except url_error.HTTPError as exc:
+        response_text = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(_refresh_error_message(response_text)) from exc
+    except (OSError, ValueError, url_error.URLError) as exc:
+        raise RuntimeError("Failed to refresh current login.") from exc
+    try:
+        refreshed = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid refresh response from auth server.") from exc
+    if not isinstance(refreshed, dict):
+        raise RuntimeError("Invalid refresh response from auth server.")
+    new_access_token = str(refreshed.get("access_token", "")).strip()
+    new_refresh_token = str(refreshed.get("refresh_token", refresh_token)).strip()
+    new_id_token = str(refreshed.get("id_token", tokens.get("id_token", ""))).strip()
+    if not new_access_token or not new_refresh_token or not new_id_token:
+        raise RuntimeError("Invalid refresh response from auth server.")
+
+    updated_tokens = dict(tokens)
+    updated_tokens["access_token"] = new_access_token
+    updated_tokens["refresh_token"] = new_refresh_token
+    updated_tokens["id_token"] = new_id_token
+    payload["tokens"] = updated_tokens
+    payload["last_refresh"] = _utc_now_iso_z()
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"status": "ok"}
+
+
+def read_current_usage_quota(
+    timeout_seconds: float = 4.0,
+    auth_file: Path = AUTH_FILE,
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> dict[str, str]:
+    access_token = load_auth_access_token(auth_file)
+    if not access_token:
+        return {"state": "unavailable", "summary": "Quota unavailable"}
+    opener = build_proxy_aware_opener(settings_file)
+    request = url_request.Request(
+        WHAM_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": "codex-session-manager-mobile-portal",
+        },
+    )
+    try:
+        with opener.open(request, timeout=timeout_seconds) as response:
+            response_text = response.read().decode("utf-8", errors="ignore")
+    except (OSError, ValueError, url_error.URLError):
+        return {"state": "unavailable", "summary": "Quota unavailable"}
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError:
+        return {"state": "unavailable", "summary": "Quota unavailable"}
+    return parse_wham_usage_summary(payload)
+
+
+def read_current_weekly_quota(
+    timeout_seconds: float = 4.0,
+    auth_file: Path = AUTH_FILE,
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> dict[str, str]:
+    usage_quota = read_current_usage_quota(
+        timeout_seconds=timeout_seconds,
+        auth_file=auth_file,
+        settings_file=settings_file,
+    )
+    if usage_quota.get("state") == "ok":
+        return usage_quota
     output = run_text_command([CODEX_BIN, "status"], timeout_seconds=timeout_seconds)
     return parse_weekly_quota_summary(output)
 
@@ -1032,6 +1263,64 @@ def list_windows_process_rows() -> list[dict[str, object]]:
     return []
 
 
+def merge_available_models(models: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for model in (DEFAULT_PRIMARY_MODEL, *models, *FALLBACK_MODEL_OPTIONS[1:]):
+        clean_model = str(model).strip()
+        if not clean_model or clean_model in seen:
+            continue
+        seen.add(clean_model)
+        merged.append(clean_model)
+    return merged
+
+
+def _normalize_process_match_text(value: object) -> str:
+    return str(value or "").strip().lower().replace("/", "\\")
+
+
+def find_running_mobile_job_pid(job: dict[str, object], processes: list[dict[str, object]]) -> int:
+    output_file = _normalize_process_match_text(job.get("output_file", ""))
+    session_id = str(job.get("session_id", "")).strip().lower()
+    if not output_file and not session_id:
+        return 0
+    best_pid = 0
+    best_score = -1
+    best_priority = -1
+    for item in processes:
+        try:
+            pid = int(item.get("ProcessId", 0))
+        except (TypeError, ValueError):
+            continue
+        if not pid or pid == os.getpid():
+            continue
+        command_line = _normalize_process_match_text(item.get("CommandLine", ""))
+        if not command_line:
+            continue
+        if "codex" not in command_line or "exec --json" not in command_line:
+            continue
+        score = 0
+        if output_file and output_file in command_line:
+            score += 100
+        if session_id and session_id in command_line:
+            score += 10
+        if score <= 0:
+            continue
+        name = str(item.get("Name", "")).strip().lower()
+        priority = 0
+        if name == "node.exe":
+            priority = 3
+        elif name == "codex.exe":
+            priority = 2
+        elif name == "cmd.exe":
+            priority = 1
+        if score > best_score or (score == best_score and priority > best_priority):
+            best_pid = pid
+            best_score = score
+            best_priority = priority
+    return best_pid
+
+
 def find_conflicting_interactive_session_pids(session_id: str, processes: list[dict[str, object]]) -> list[int]:
     clean_session_id = session_id.strip()
     if not clean_session_id:
@@ -1284,6 +1573,15 @@ class CodexDataStore:
                     )
             current_turn = None
 
+        def begin_turn() -> None:
+            nonlocal current_turn
+            flush_pending_assistant()
+            current_turn = {
+                "has_final_answer": False,
+                "last_assistant_text": "",
+                "last_assistant_ts": 0,
+            }
+
         if HISTORY_FILE.exists():
             with HISTORY_FILE.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -1342,14 +1640,10 @@ class CodexDataStore:
                         if role == "user":
                             if is_internal_session_user_text(text):
                                 continue
-                            if is_duplicate_user_message(seen_user_messages, text, ts):
+                            duplicate_user = is_duplicate_user_message(seen_user_messages, text, ts)
+                            begin_turn()
+                            if duplicate_user:
                                 continue
-                            flush_pending_assistant()
-                            current_turn = {
-                                "has_final_answer": False,
-                                "last_assistant_text": "",
-                                "last_assistant_ts": 0,
-                            }
                             messages.append({"role": "user", "ts": ts, "text": text})
                             normalized = normalize_message_text(text)
                             if normalized:
@@ -1532,14 +1826,7 @@ class CodexDataStore:
                             models.append(slug)
             except Exception:
                 models = []
-        if not models:
-            models = ["gpt-5.3-codex", "gpt-5"]
-        unique: list[str] = []
-        seen: set[str] = set()
-        for model in models:
-            if model not in seen:
-                seen.add(model)
-                unique.append(model)
+        unique = merge_available_models(models)
         with self.cache_lock:
             self._models_signature = models_signature
             self._models_cache = list(unique)
@@ -2023,6 +2310,10 @@ class JobRunner:
         image_paths: list[Path] | None = None,
     ) -> None:
         output_file = Path(tempfile.mkstemp(prefix="codex-mobile-out-", suffix=".txt")[1])
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job:
+                job["output_file"] = str(output_file)
         ensure_token_pool_backend_ready(
             backend_settings_file=self.backend_settings_file,
             proxy_settings_file=self.proxy_settings_file,
@@ -2079,6 +2370,10 @@ class JobRunner:
         reasoning_effort: str,
     ) -> None:
         output_file = Path(tempfile.mkstemp(prefix="codex-mobile-out-", suffix=".txt")[1])
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job:
+                job["output_file"] = str(output_file)
         ensure_token_pool_backend_ready(
             backend_settings_file=self.backend_settings_file,
             proxy_settings_file=self.proxy_settings_file,
@@ -2362,6 +2657,13 @@ class JobRunner:
             return True
         if latest_activity and now_ts() - latest_activity < RUNNING_JOB_GRACE_SECONDS:
             return True
+        if os.name == "nt":
+            # codex.cmd can exit before the real node/codex worker finishes.
+            recovered_pid = find_running_mobile_job_pid(job, list_windows_process_rows())
+            if recovered_pid > 0:
+                job["pid"] = recovered_pid
+                job["heartbeat_at"] = now_ts()
+                return True
         return False
 
     def _is_pid_running(self, pid: int) -> bool:
@@ -2449,6 +2751,14 @@ class PortalService:
 
     def bind_current_account(self, slot_id: str) -> dict[str, object]:
         auth_slots.save_current_auth_to_slot(slot_id)
+        return self.account_slots_payload()
+
+    def refresh_current_account(self) -> dict[str, object]:
+        active_slot = auth_slots.detect_active_slot()
+        refresh_current_chatgpt_auth(settings_file=self.proxy_settings_file)
+        if active_slot:
+            auth_slots.save_current_auth_to_slot(active_slot)
+        self.request_desktop_refresh(source="account_refresh")
         return self.account_slots_payload()
 
     def switch_account(self, slot_id: str) -> dict[str, object]:
@@ -3676,6 +3986,17 @@ class PortalHandler(BaseHTTPRequestHandler):
                 result = self.portal.bind_current_account(slot_id)
             except FileNotFoundError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
+        if parsed.path == "/api/accounts/refresh-current":
+            try:
+                result = self.portal.refresh_current_account()
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
                 return
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)

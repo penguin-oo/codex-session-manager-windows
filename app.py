@@ -40,6 +40,14 @@ TERMINAL_PROXY_SCHEMES = ("http", "socks5", "socks5h")
 DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1,.local,.ts.net"
 TOKEN_POOL_PROVIDER_NAME = "built_in_token_pool"
 TOKEN_POOL_ENV_KEY_NAME = "CODEX_TOKEN_POOL_API_KEY"
+DEFAULT_PRIMARY_MODEL = "gpt-5.5"
+FALLBACK_MODEL_OPTIONS = (
+    DEFAULT_PRIMARY_MODEL,
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5",
+)
 @dataclass
 class SessionItem:
     session_id: str
@@ -298,6 +306,24 @@ def format_account_quota_summary(quota: dict[str, str]) -> str:
     if summary:
         return summary
     return "Quota unavailable"
+
+
+def merge_available_models(models: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for model in (DEFAULT_PRIMARY_MODEL, *models, *FALLBACK_MODEL_OPTIONS[1:]):
+        clean_model = str(model).strip()
+        if not clean_model or clean_model in seen:
+            continue
+        seen.add(clean_model)
+        merged.append(clean_model)
+    return merged
+
+
+def account_dialog_dimensions(screen_width: int, screen_height: int) -> tuple[int, int]:
+    usable_width = max(360, int(screen_width) - 80)
+    usable_height = max(360, int(screen_height) - 80)
+    return min(720, usable_width), min(820, usable_height)
 
 
 class SessionManagerApp:
@@ -886,21 +912,12 @@ class SessionManagerApp:
                         visibility = str(item.get("visibility", ""))
                         if visibility and visibility != "list":
                             continue
-                        slug = str(item.get("slug", "")).strip()
-                        if slug:
-                            models.append(slug)
+                            slug = str(item.get("slug", "")).strip()
+                            if slug:
+                                models.append(slug)
             except Exception:
                 models = []
-        if not models:
-            models = ["gpt-5.3-codex", "gpt-5"]
-        # Keep unique order
-        seen: set[str] = set()
-        uniq: list[str] = []
-        for m in models:
-            if m not in seen:
-                seen.add(m)
-                uniq.append(m)
-        return uniq
+        return merge_available_models(models)
 
     def _render_models(self) -> None:
         values = ["default", *self.available_models]
@@ -1163,14 +1180,18 @@ class SessionManagerApp:
     def _build_codex_resume_args(self, item: SessionItem) -> list[str]:
         args: list[str] = ["codex.cmd", "resume", item.session_id]
         args.extend(self._build_codex_override_args())
-        args.extend(self._build_backend_override_args(item.model.strip() or "gpt-5.4"))
+        args.extend(self._build_backend_override_args(item.model.strip() or DEFAULT_PRIMARY_MODEL))
         return args
 
     def _build_codex_new_args(self) -> list[str]:
         args: list[str] = ["codex.cmd"]
         args.extend(self._build_codex_override_args())
         selected_model = self.model_var.get().strip()
-        args.extend(self._build_backend_override_args(selected_model if selected_model and selected_model != "default" else "gpt-5.4"))
+        args.extend(
+            self._build_backend_override_args(
+                selected_model if selected_model and selected_model != "default" else DEFAULT_PRIMARY_MODEL
+            )
+        )
         return args
 
     def _toggle_launch_overrides(self) -> None:
@@ -1381,11 +1402,38 @@ class SessionManagerApp:
         dialog = tk.Toplevel(self.root)
         dialog.title("Accounts")
         dialog.transient(self.root)
-        dialog.resizable(False, False)
+        dialog.resizable(True, True)
         dialog.grab_set()
+        width, height = account_dialog_dimensions(dialog.winfo_screenwidth(), dialog.winfo_screenheight())
+        dialog.geometry(f"{width}x{height}")
+        dialog.minsize(min(560, width), min(360, height))
 
-        container = ttk.Frame(dialog, padding=12)
-        container.pack(fill=tk.BOTH, expand=True)
+        body = ttk.Frame(dialog)
+        body.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(body, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        container = ttk.Frame(canvas, padding=12)
+        container_window = canvas.create_window((0, 0), window=container, anchor="nw")
+
+        def update_scroll_region(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_container(event: tk.Event) -> None:
+            canvas.itemconfigure(container_window, width=event.width)
+
+        def scroll_with_wheel(event: tk.Event) -> None:
+            if event.delta:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        container.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", resize_container)
+        canvas.bind("<Enter>", lambda _event: canvas.bind_all("<MouseWheel>", scroll_with_wheel))
+        canvas.bind("<Leave>", lambda _event: canvas.unbind_all("<MouseWheel>"))
+        dialog.bind("<Destroy>", lambda event: canvas.unbind_all("<MouseWheel>") if event.widget == dialog else None)
 
         current_var = tk.StringVar(value="")
         quota_var = tk.StringVar(value="Quota unavailable")
@@ -1443,6 +1491,7 @@ class SessionManagerApp:
             backend_mode_var.set(str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)))
             token_dir_var.set(str(token_dir))
             token_pool_status_var.set(self._token_pool_status_summary())
+            dialog.after_idle(update_scroll_region)
 
         def apply_backend_mode() -> None:
             settings = self._token_pool_settings()
@@ -1523,6 +1572,7 @@ class SessionManagerApp:
             if not slots:
                 ttk.Label(slots_frame, text="No account slots yet. Create one, then bind the current login.").pack(anchor="w")
                 refresh_token_pool_section()
+                dialog.after_idle(update_scroll_region)
                 return
             for index, slot_info in enumerate(slots):
                 slot_id = str(slot_info.get("slot_id", ""))
@@ -1547,6 +1597,7 @@ class SessionManagerApp:
                 ttk.Button(button_row, text="Delete", command=lambda value=slot_id, label=slot_info.get("label", ""): delete_slot(value, label)).pack(side=tk.LEFT, padx=(8, 0))
             slots_frame.grid_columnconfigure(0, weight=1)
             refresh_token_pool_section()
+            dialog.after_idle(update_scroll_region)
 
         def create_slot() -> None:
             label = simpledialog.askstring("New Slot", "Slot label:", parent=dialog)

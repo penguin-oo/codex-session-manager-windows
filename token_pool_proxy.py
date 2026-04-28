@@ -11,10 +11,11 @@ from urllib import error as url_error
 from urllib import request as url_request
 
 DEFAULT_MODEL_IDS = (
-    "gpt-5",
+    "gpt-5.5",
     "gpt-5.4",
     "gpt-5.3-codex",
     "gpt-5.2",
+    "gpt-5",
 )
 DEFAULT_UPSTREAM_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_FALLBACK_INSTRUCTIONS = "You are Codex, a coding assistant."
