@@ -1,4 +1,5 @@
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -112,6 +113,11 @@ class AppHelperTests(unittest.TestCase):
         self.assertIn("Travel", summary)
         self.assertNotIn("slot-3", summary)
 
+    def test_slot_supports_direct_login_only_for_unbound_slots(self) -> None:
+        self.assertTrue(app.slot_supports_direct_login({}))
+        self.assertTrue(app.slot_supports_direct_login({"fingerprint": ""}))
+        self.assertFalse(app.slot_supports_direct_login({"fingerprint": "bound"}))
+
     def test_format_quota_summary_uses_backend_text(self) -> None:
         summary = app.format_account_quota_summary({"summary": "Weekly quota: 76% used", "state": "ok"})
 
@@ -170,6 +176,56 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertIn("$env:CODEX_TOKEN_POOL_API_KEY='local-proxy-key'", prefix)
 
+    def test_build_openai_compatible_provider_override_args_points_codex_to_custom_base_url(self) -> None:
+        args = app.build_openai_compatible_provider_override_args(
+            model="gpt-5.5",
+            base_url="https://api.openai.com/v1",
+            provider_name="openai_compatible",
+            env_key_name="CODEX_OPENAI_COMPATIBLE_API_KEY",
+        )
+
+        rendered = " ".join(args)
+        self.assertIn('model_provider="openai_compatible"', rendered)
+        self.assertIn('model_providers.openai_compatible.base_url="https://api.openai.com/v1"', rendered)
+        self.assertIn('model_providers.openai_compatible.env_key="CODEX_OPENAI_COMPATIBLE_API_KEY"', rendered)
+        self.assertIn('model_providers.openai_compatible.wire_api="responses"', rendered)
+
+    def test_load_backend_settings_preserves_openai_compatible_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "token_pool_settings.json"
+
+            saved = app.token_pool_settings.save_backend_settings(
+                app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                settings_file=settings_file,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-test",
+                openai_model="gpt-5.5",
+                openai_models=["gpt-5.5", "gpt-5.4"],
+            )
+            loaded = app.token_pool_settings.load_backend_settings(settings_file)
+
+        self.assertEqual(app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE, saved["backend_mode"])
+        self.assertEqual("https://api.openai.com/v1", loaded["openai_base_url"])
+        self.assertEqual("sk-test", loaded["openai_api_key"])
+        self.assertEqual("gpt-5.5", loaded["openai_model"])
+        self.assertEqual(["gpt-5.5", "gpt-5.4"], loaded["openai_models"])
+
+    def test_load_available_models_prefers_openai_compatible_cache_when_backend_enabled(self) -> None:
+        manager = object.__new__(app.SessionManagerApp)
+        manager.backend_settings = {
+            "backend_mode": "openai_compatible",
+            "openai_models": ["gpt-5.5", "gpt-4.1"],
+        }
+        manager._reload_backend_settings = mock.Mock(return_value=manager.backend_settings)
+
+        with mock.patch.object(app, "MODELS_CACHE_FILE", Path("missing-models-cache.json")):
+            models = app.SessionManagerApp._load_available_models(manager)
+
+        self.assertEqual(["gpt-5.5", "gpt-4.1", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5"], models)
+
     def test_build_token_pool_proxy_command_uses_app_script_in_source_mode(self) -> None:
         with mock.patch.object(app.shutil, "which", return_value=None):
             command = app.build_token_pool_proxy_command(
@@ -213,6 +269,63 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertEqual("D:\\codex\\manger\\codex-session-manager.exe", command[0])
         self.assertNotIn("D:\\codex\\manger\\app.py", command)
+
+    def test_run_codex_browser_login_uses_default_login_command(self) -> None:
+        completed = subprocess.CompletedProcess(["codex.cmd", "login"], 0, stdout="ok")
+
+        with mock.patch.object(app.subprocess, "run", return_value=completed) as run:
+            result = app.run_codex_browser_login()
+
+        self.assertIs(result, completed)
+        run.assert_called_once_with(
+            ["codex.cmd", "login"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+
+    def test_start_codex_browser_login_process_uses_default_login_command(self) -> None:
+        fake_process = mock.Mock()
+
+        with mock.patch.object(app.subprocess, "Popen", return_value=fake_process) as popen:
+            result = app.start_codex_browser_login_process()
+
+        self.assertIs(result, fake_process)
+        popen.assert_called_once_with(
+            ["codex.cmd", "login"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+    def test_login_and_bind_account_slot_saves_new_current_auth(self) -> None:
+        completed = subprocess.CompletedProcess(["codex.cmd", "login"], 0, stdout="ok")
+
+        with mock.patch.object(app.auth_slots, "load_slot_registry", return_value=[{"slot_id": "slot-9"}]), \
+             mock.patch.object(app.auth_slots, "current_auth_info", side_effect=[{"fingerprint": "old"}, {"fingerprint": "new"}]), \
+             mock.patch.object(app, "run_codex_browser_login", return_value=completed) as run_login, \
+             mock.patch.object(app.auth_slots, "save_current_auth_to_slot", return_value={"slot_id": "slot-9", "email": "new@example.com"}) as save:
+            result = app.login_and_bind_account_slot("slot-9")
+
+        self.assertEqual("slot-9", result["slot_id"])
+        run_login.assert_called_once_with()
+        save.assert_called_once_with("slot-9")
+
+    def test_login_and_bind_account_slot_rejects_unchanged_auth(self) -> None:
+        completed = subprocess.CompletedProcess(["codex.cmd", "login"], 0, stdout="ok")
+
+        with mock.patch.object(app.auth_slots, "load_slot_registry", return_value=[{"slot_id": "slot-9"}]), \
+             mock.patch.object(app.auth_slots, "current_auth_info", side_effect=[{"fingerprint": "same"}, {"fingerprint": "same"}]), \
+             mock.patch.object(app, "run_codex_browser_login", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "did not produce a new login"):
+                app.login_and_bind_account_slot("slot-9")
 
     def test_main_dispatches_token_pool_proxy_mode(self) -> None:
         with mock.patch.object(app, "sys") as mocked_sys, mock.patch.object(app.token_pool_proxy, "main", return_value=7) as proxy_main:

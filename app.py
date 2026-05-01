@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
 import tomllib
 import tkinter as tk
 import auth_slots
@@ -40,6 +41,8 @@ TERMINAL_PROXY_SCHEMES = ("http", "socks5", "socks5h")
 DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1,.local,.ts.net"
 TOKEN_POOL_PROVIDER_NAME = "built_in_token_pool"
 TOKEN_POOL_ENV_KEY_NAME = "CODEX_TOKEN_POOL_API_KEY"
+OPENAI_COMPAT_PROVIDER_NAME = "openai_compatible"
+OPENAI_COMPAT_ENV_KEY_NAME = "CODEX_OPENAI_COMPATIBLE_API_KEY"
 DEFAULT_PRIMARY_MODEL = "gpt-5.5"
 FALLBACK_MODEL_OPTIONS = (
     DEFAULT_PRIMARY_MODEL,
@@ -155,6 +158,10 @@ def build_token_pool_environment_ps_prefix(env_key_name: str, api_key_value: str
     return f"$env:{clean_name}='{escaped_value}'; "
 
 
+def build_openai_compatible_environment_ps_prefix(env_key_name: str, api_key_value: str) -> str:
+    return build_token_pool_environment_ps_prefix(env_key_name=env_key_name, api_key_value=api_key_value)
+
+
 def build_token_pool_provider_override_args(
     model: str,
     proxy_port: int,
@@ -173,6 +180,38 @@ def build_token_pool_provider_override_args(
         f'model_providers.{clean_provider}.name="Built-in Token Pool"',
         "-c",
         f'model_providers.{clean_provider}.base_url="http://127.0.0.1:{int(proxy_port)}"',
+        "-c",
+        f'model_providers.{clean_provider}.env_key="{clean_env_key}"',
+        "-c",
+        f'model_providers.{clean_provider}.wire_api="responses"',
+        "-c",
+        f'model_providers.{clean_provider}.requires_openai_auth=false',
+        "-c",
+        f'model_providers.{clean_provider}.supports_websockets=false',
+    ]
+
+
+def build_openai_compatible_provider_override_args(
+    model: str,
+    base_url: str,
+    provider_name: str = OPENAI_COMPAT_PROVIDER_NAME,
+    env_key_name: str = OPENAI_COMPAT_ENV_KEY_NAME,
+) -> list[str]:
+    clean_provider = provider_name.strip() or OPENAI_COMPAT_PROVIDER_NAME
+    clean_env_key = env_key_name.strip() or OPENAI_COMPAT_ENV_KEY_NAME
+    clean_model = model.strip()
+    clean_base_url = base_url.strip().rstrip("/")
+    if not clean_model:
+        raise ValueError("A model is required for OpenAI-compatible launches.")
+    if not clean_base_url:
+        raise ValueError("A base URL is required for OpenAI-compatible launches.")
+    return [
+        "-c",
+        f'model_provider="{clean_provider}"',
+        "-c",
+        f'model_providers.{clean_provider}.name="OpenAI Compatible"',
+        "-c",
+        f'model_providers.{clean_provider}.base_url="{clean_base_url}"',
         "-c",
         f'model_providers.{clean_provider}.env_key="{clean_env_key}"',
         "-c",
@@ -263,6 +302,70 @@ def read_current_weekly_quota(timeout_seconds: float = 4.0) -> dict[str, str]:
     return {"state": "ok", "summary": first_line or "Quota unavailable"}
 
 
+def run_codex_browser_login() -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["codex.cmd", "login"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("Failed to start Codex login.") from exc
+
+
+def start_codex_browser_login_process() -> subprocess.Popen[str]:
+    try:
+        return subprocess.Popen(
+            ["codex.cmd", "login"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("Failed to start Codex login.") from exc
+
+
+def summarize_login_failure(result: subprocess.CompletedProcess[str]) -> str:
+    lines = [line.strip() for line in str(result.stdout or "").splitlines() if line.strip()]
+    if lines:
+        return lines[-1]
+    return f"Codex login failed with exit code {result.returncode}."
+
+
+def ensure_account_slot_exists(slot_id: str) -> None:
+    registry = auth_slots.load_slot_registry()
+    if not any(str(item.get("slot_id", "")).strip() == slot_id for item in registry):
+        raise FileNotFoundError(f"Account slot '{slot_id}' not found.")
+
+
+def finalize_login_and_bind_account_slot(
+    slot_id: str,
+    before_fingerprint: str,
+    result: subprocess.CompletedProcess[str],
+) -> dict[str, str]:
+    if result.returncode != 0:
+        raise RuntimeError(summarize_login_failure(result))
+    after_fingerprint = str(auth_slots.current_auth_info().get("fingerprint", "")).strip()
+    if not after_fingerprint or after_fingerprint == before_fingerprint:
+        raise RuntimeError("Codex login finished but did not produce a new login.")
+    return auth_slots.save_current_auth_to_slot(slot_id)
+
+
+def login_and_bind_account_slot(slot_id: str) -> dict[str, str]:
+    ensure_account_slot_exists(slot_id)
+    before_fingerprint = str(auth_slots.current_auth_info().get("fingerprint", "")).strip()
+    result = run_codex_browser_login()
+    return finalize_login_and_bind_account_slot(slot_id, before_fingerprint, result)
+
+
 def format_account_slot_name(slot_id: str | None, slot_info: dict[str, str] | None = None) -> str:
     if not slot_id:
         return "Unbound"
@@ -306,6 +409,10 @@ def format_account_quota_summary(quota: dict[str, str]) -> str:
     if summary:
         return summary
     return "Quota unavailable"
+
+
+def slot_supports_direct_login(slot_info: dict[str, str]) -> bool:
+    return not bool(str(slot_info.get("fingerprint", "")).strip())
 
 
 def merge_available_models(models: list[str]) -> list[str]:
@@ -899,6 +1006,12 @@ class SessionManagerApp:
         return items
 
     def _load_available_models(self) -> list[str]:
+        settings_loader = getattr(self, "_reload_backend_settings", None)
+        settings = settings_loader() if callable(settings_loader) else getattr(self, "backend_settings", {})
+        if isinstance(settings, dict) and settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            openai_models = settings.get("openai_models", [])
+            if isinstance(openai_models, list) and openai_models:
+                return merge_available_models([str(item).strip() for item in openai_models if str(item).strip()])
         models: list[str] = []
         if MODELS_CACHE_FILE.exists():
             try:
@@ -1180,17 +1293,17 @@ class SessionManagerApp:
     def _build_codex_resume_args(self, item: SessionItem) -> list[str]:
         args: list[str] = ["codex.cmd", "resume", item.session_id]
         args.extend(self._build_codex_override_args())
-        args.extend(self._build_backend_override_args(item.model.strip() or DEFAULT_PRIMARY_MODEL))
+        backend_model = item.model.strip() or self._configured_backend_model() or DEFAULT_PRIMARY_MODEL
+        args.extend(self._build_backend_override_args(backend_model))
         return args
 
     def _build_codex_new_args(self) -> list[str]:
         args: list[str] = ["codex.cmd"]
         args.extend(self._build_codex_override_args())
         selected_model = self.model_var.get().strip()
+        backend_model = selected_model if selected_model and selected_model != "default" else self._configured_backend_model() or DEFAULT_PRIMARY_MODEL
         args.extend(
-            self._build_backend_override_args(
-                selected_model if selected_model and selected_model != "default" else DEFAULT_PRIMARY_MODEL
-            )
+            self._build_backend_override_args(backend_model)
         )
         return args
 
@@ -1225,11 +1338,24 @@ class SessionManagerApp:
     def _token_pool_settings(self) -> dict[str, object]:
         return self._reload_backend_settings()
 
+    def _configured_backend_model(self) -> str:
+        settings = self._token_pool_settings()
+        if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            return str(settings.get("openai_model", "")).strip()
+        return ""
+
     def _build_token_pool_ps_prefix(self) -> str:
         settings = self._token_pool_settings()
         return build_token_pool_environment_ps_prefix(
             env_key_name=TOKEN_POOL_ENV_KEY_NAME,
             api_key_value=str(settings.get("proxy_api_key", "")),
+        )
+
+    def _build_openai_compatible_ps_prefix(self) -> str:
+        settings = self._token_pool_settings()
+        return build_openai_compatible_environment_ps_prefix(
+            env_key_name=OPENAI_COMPAT_ENV_KEY_NAME,
+            api_key_value=str(settings.get("openai_api_key", "")),
         )
 
     def _token_pool_health(self, port: int | None = None) -> dict[str, object] | None:
@@ -1345,19 +1471,40 @@ class SessionManagerApp:
         port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
         health = self._token_pool_health(port)
         mode = str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH))
+        if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            base_url = str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
+            model = str(settings.get("openai_model", "")).strip() or "default"
+            model_count = len(settings.get("openai_models", []) or [])
+            has_key = bool(str(settings.get("openai_api_key", "")).strip())
+            return (
+                f"Mode: {mode}\n"
+                f"Base URL: {base_url}\n"
+                f"Saved model: {model}\n"
+                f"Discovered models: {model_count}\n"
+                f"API key: {'configured' if has_key else 'missing'}"
+            )
         running = "running" if health else "stopped"
         return f"Mode: {mode}\nToken files: {token_count}\nPort: {port}\nProxy: {running}"
 
     def _build_backend_override_args(self, fallback_model: str) -> list[str]:
         settings = self._token_pool_settings()
-        if settings.get("backend_mode") != token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+        mode = settings.get("backend_mode")
+        if mode == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+            return build_token_pool_provider_override_args(
+                model=fallback_model,
+                proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+                provider_name=TOKEN_POOL_PROVIDER_NAME,
+                env_key_name=TOKEN_POOL_ENV_KEY_NAME,
+            )
+        if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            return build_openai_compatible_provider_override_args(
+                model=fallback_model,
+                base_url=str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)),
+                provider_name=OPENAI_COMPAT_PROVIDER_NAME,
+                env_key_name=OPENAI_COMPAT_ENV_KEY_NAME,
+            )
             return []
-        return build_token_pool_provider_override_args(
-            model=fallback_model,
-            proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
-            provider_name=TOKEN_POOL_PROVIDER_NAME,
-            env_key_name=TOKEN_POOL_ENV_KEY_NAME,
-        )
+        return []
 
     def _ensure_backend_ready(self) -> None:
         settings = self._token_pool_settings()
@@ -1377,9 +1524,12 @@ class SessionManagerApp:
         cwd_escaped = cwd.replace("'", "''")
         proxy_prefix = self._build_proxy_ps_prefix()
         token_pool_prefix = ""
+        openai_compatible_prefix = ""
         settings = self._token_pool_settings()
         if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
             token_pool_prefix = self._build_token_pool_ps_prefix()
+        elif settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            openai_compatible_prefix = self._build_openai_compatible_ps_prefix()
         return (
             "chcp 65001 > $null; "
             "$utf8 = [System.Text.UTF8Encoding]::new($false); "
@@ -1388,6 +1538,7 @@ class SessionManagerApp:
             "$OutputEncoding = $utf8; "
             f"{proxy_prefix}"
             f"{token_pool_prefix}"
+            f"{openai_compatible_prefix}"
             f"Set-Location -LiteralPath '{cwd_escaped}'; "
             f"& {self._to_ps_arg_string(codex_args)}"
         )
@@ -1461,14 +1612,19 @@ class SessionManagerApp:
         backend_mode_var = tk.StringVar(value=str(self._token_pool_settings().get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)))
         token_dir_var = tk.StringVar(value="")
         token_pool_status_var = tk.StringVar(value="")
+        openai_base_url_var = tk.StringVar(value="")
+        openai_api_key_var = tk.StringVar(value="")
+        openai_model_var = tk.StringVar(value="")
+        openai_status_var = tk.StringVar(value="")
 
-        token_pool_frame = ttk.LabelFrame(container, text="Built-in Token Pool", padding=10)
+        token_pool_frame = ttk.LabelFrame(container, text="Backend", padding=10)
         token_pool_frame.pack(fill=tk.X, pady=(0, 10))
 
         mode_row = ttk.Frame(token_pool_frame)
         mode_row.pack(fill=tk.X)
         ttk.Radiobutton(mode_row, text="Use Codex Auth", variable=backend_mode_var, value=token_pool_settings.BACKEND_MODE_CODEX_AUTH).pack(side=tk.LEFT)
         ttk.Radiobutton(mode_row, text="Use Built-in Token Pool", variable=backend_mode_var, value=token_pool_settings.BACKEND_MODE_TOKEN_POOL).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(mode_row, text="Use OpenAI-Compatible API", variable=backend_mode_var, value=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(mode_row, text="Apply Mode", command=lambda: apply_backend_mode()).pack(side=tk.RIGHT)
 
         ttk.Label(token_pool_frame, text="Token folder", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 0))
@@ -1484,6 +1640,32 @@ class SessionManagerApp:
         ttk.Button(token_pool_button_row, text="Stop Proxy", command=lambda: stop_token_pool_proxy_dialog()).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(token_pool_button_row, text="Restart Proxy", command=lambda: restart_token_pool_proxy_dialog()).pack(side=tk.LEFT, padx=(8, 0))
 
+        ttk.Separator(token_pool_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(12, 10))
+        ttk.Label(token_pool_frame, text="OpenAI-Compatible API", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+
+        openai_base_url_row = ttk.Frame(token_pool_frame)
+        openai_base_url_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(openai_base_url_row, text="Base URL", width=16).pack(side=tk.LEFT)
+        ttk.Entry(openai_base_url_row, textvariable=openai_base_url_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        openai_api_key_row = ttk.Frame(token_pool_frame)
+        openai_api_key_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(openai_api_key_row, text="API Key", width=16).pack(side=tk.LEFT)
+        ttk.Entry(openai_api_key_row, textvariable=openai_api_key_var, show="*").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        openai_model_row = ttk.Frame(token_pool_frame)
+        openai_model_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(openai_model_row, text="Model", width=16).pack(side=tk.LEFT)
+        openai_model_box = ttk.Combobox(openai_model_row, textvariable=openai_model_var, state="readonly")
+        openai_model_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        ttk.Label(token_pool_frame, text="OpenAI status", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 0))
+        ttk.Label(token_pool_frame, textvariable=openai_status_var, justify=tk.LEFT, wraplength=540).pack(anchor="w", pady=(4, 8))
+
+        openai_button_row = ttk.Frame(token_pool_frame)
+        openai_button_row.pack(fill=tk.X)
+        ttk.Button(openai_button_row, text="Save / Refresh Models", command=lambda: save_openai_compatible_settings_dialog()).pack(side=tk.LEFT)
+
         def refresh_token_pool_section() -> None:
             settings = self._token_pool_settings()
             token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
@@ -1491,6 +1673,24 @@ class SessionManagerApp:
             backend_mode_var.set(str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)))
             token_dir_var.set(str(token_dir))
             token_pool_status_var.set(self._token_pool_status_summary())
+            openai_base_url_var.set(str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip())
+            openai_api_key_var.set(str(settings.get("openai_api_key", "")).strip())
+            openai_models = [str(item).strip() for item in settings.get("openai_models", []) if str(item).strip()]
+            openai_model_values = openai_models or merge_available_models([])
+            saved_openai_model = str(settings.get("openai_model", "")).strip()
+            if saved_openai_model and saved_openai_model not in openai_model_values:
+                openai_model_values = [saved_openai_model, *openai_model_values]
+            openai_model_box["values"] = openai_model_values
+            if saved_openai_model:
+                openai_model_var.set(saved_openai_model)
+            elif openai_model_values:
+                openai_model_var.set(openai_model_values[0])
+            else:
+                openai_model_var.set("")
+            openai_status_var.set(
+                f"Discovered models: {len(openai_models)}\n"
+                f"API key: {'configured' if str(settings.get('openai_api_key', '')).strip() else 'missing'}"
+            )
             dialog.after_idle(update_scroll_region)
 
         def apply_backend_mode() -> None:
@@ -1501,10 +1701,49 @@ class SessionManagerApp:
                 token_dir=token_dir,
                 proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
                 proxy_api_key=str(settings.get("proxy_api_key", "")),
+                openai_base_url=openai_base_url_var.get(),
+                openai_api_key=openai_api_key_var.get(),
+                openai_model=openai_model_var.get(),
+                openai_models=settings.get("openai_models", []),
             )
             self.backend_settings = updated
             refresh_token_pool_section()
             self.status_var.set(f"Auth backend set to {updated.get('backend_mode')}")
+
+        def save_openai_compatible_settings_dialog() -> None:
+            settings = self._token_pool_settings()
+            token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+            base_url = openai_base_url_var.get().strip() or token_pool_settings.DEFAULT_OPENAI_BASE_URL
+            api_key = openai_api_key_var.get().strip()
+            selected_model = openai_model_var.get().strip()
+            discovered_models = list(settings.get("openai_models", []) or [])
+            fetch_error = ""
+            if api_key:
+                try:
+                    discovered_models = token_pool_settings.fetch_openai_compatible_models(base_url, api_key)
+                except Exception as exc:
+                    fetch_error = str(exc)
+            if discovered_models and (not selected_model or selected_model not in discovered_models):
+                selected_model = discovered_models[0]
+            updated = token_pool_settings.save_backend_settings(
+                backend_mode=backend_mode_var.get(),
+                token_dir=token_dir,
+                proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+                proxy_api_key=str(settings.get("proxy_api_key", "")),
+                openai_base_url=base_url,
+                openai_api_key=api_key,
+                openai_model=selected_model,
+                openai_models=discovered_models,
+            )
+            self.backend_settings = updated
+            self.available_models = self._load_available_models()
+            self._render_models()
+            refresh_token_pool_section()
+            if fetch_error:
+                self.status_var.set("Saved OpenAI-compatible backend settings; model fetch failed")
+                messagebox.showwarning("OpenAI-Compatible Models", f"Settings saved, but model fetch failed.\n\n{fetch_error}", parent=dialog)
+                return
+            self.status_var.set(f"Saved OpenAI-compatible backend settings ({len(discovered_models)} model(s))")
 
         def import_token_files_dialog() -> None:
             settings = self._token_pool_settings()
@@ -1587,6 +1826,8 @@ class SessionManagerApp:
                 button_row = ttk.Frame(card)
                 button_row.pack(fill=tk.X, pady=(10, 0))
                 ttk.Button(button_row, text="Bind Current Here", command=lambda value=slot_id: bind_slot(value)).pack(side=tk.LEFT)
+                if slot_supports_direct_login(slot_info):
+                    ttk.Button(button_row, text="Login Here", command=lambda value=slot_id: login_bind_slot(value)).pack(side=tk.LEFT, padx=(8, 0))
                 ttk.Button(
                     button_row,
                     text="Switch Here",
@@ -1648,6 +1889,96 @@ class SessionManagerApp:
             refresh_dialog()
             self._refresh_account_status()
             self.status_var.set(f"Saved current login to {format_account_slot_name(slot_id, slot_info)}")
+
+        def login_bind_slot(slot_id: str) -> None:
+            initial_slot_info = auth_slots.get_slot_info(slot_id)
+            slot_name = format_account_slot_name(slot_id, initial_slot_info)
+            progress = tk.Toplevel(dialog)
+            progress.title("Login Here")
+            progress.transient(dialog)
+            progress.resizable(False, False)
+            ttk.Label(
+                progress,
+                text=(
+                    f"Waiting for Codex login for {slot_name}.\n\n"
+                    "If you close the browser or want to stop waiting, click Cancel."
+                ),
+                justify=tk.LEFT,
+                padding=12,
+            ).pack(anchor="w")
+            action_row = ttk.Frame(progress, padding=(12, 0, 12, 12))
+            action_row.pack(fill=tk.X)
+            state: dict[str, object] = {"cancelled": False, "process": None}
+
+            def close_progress() -> None:
+                if not progress.winfo_exists():
+                    return
+                try:
+                    progress.grab_release()
+                except tk.TclError:
+                    pass
+                progress.destroy()
+
+            def cancel_login() -> None:
+                state["cancelled"] = True
+                process = state.get("process")
+                if isinstance(process, subprocess.Popen) and process.poll() is None:
+                    try:
+                        process.terminate()
+                    except OSError:
+                        pass
+                self.status_var.set(f"Cancelled login for {slot_name}")
+                close_progress()
+
+            ttk.Button(action_row, text="Cancel", command=cancel_login).pack(side=tk.RIGHT)
+            progress.protocol("WM_DELETE_WINDOW", cancel_login)
+            progress.grab_set()
+            self.status_var.set(f"Waiting for Codex login to bind {slot_name}...")
+            progress.update_idletasks()
+
+            def on_success(bound_slot_info: dict[str, str]) -> None:
+                close_progress()
+                if dialog.winfo_exists():
+                    refresh_dialog()
+                self._refresh_account_status()
+                self.status_var.set(f"Logged in and bound {format_account_slot_name(slot_id, bound_slot_info)}")
+
+            def on_error(exc: Exception) -> None:
+                if state.get("cancelled"):
+                    return
+                close_progress()
+                if dialog.winfo_exists():
+                    refresh_dialog()
+                messagebox.showerror("Login Here", str(exc), parent=dialog if dialog.winfo_exists() else None)
+                self.status_var.set(str(exc))
+
+            def worker() -> None:
+                try:
+                    ensure_account_slot_exists(slot_id)
+                    before_fingerprint = str(auth_slots.current_auth_info().get("fingerprint", "")).strip()
+                    process = start_codex_browser_login_process()
+                    state["process"] = process
+                    stdout_text, _ = process.communicate()
+                    result = subprocess.CompletedProcess(
+                        process.args,
+                        process.returncode if process.returncode is not None else 1,
+                        stdout=stdout_text or "",
+                    )
+                    if state.get("cancelled"):
+                        return
+                    bound_slot_info = finalize_login_and_bind_account_slot(slot_id, before_fingerprint, result)
+                except Exception as exc:
+                    try:
+                        self.root.after(0, lambda error=exc: on_error(error))
+                    except tk.TclError:
+                        pass
+                    return
+                try:
+                    self.root.after(0, lambda info=bound_slot_info: on_success(info))
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
 
         def switch_slot(slot_id: str) -> None:
             slot_info = auth_slots.get_slot_info(slot_id)

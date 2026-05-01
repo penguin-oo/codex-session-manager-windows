@@ -1230,6 +1230,51 @@ class PortalAccountSlotsTests(unittest.TestCase):
         save_current_auth_to_slot.assert_called_once_with("slot-2")
         account_slots_payload.assert_called_once_with()
 
+    def test_login_and_bind_account_runs_browser_login_then_saves_current_auth(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+
+        login_result = subprocess.CompletedProcess([mobile_portal.CODEX_BIN, "login"], 0, stdout="logged in")
+        with mock.patch.object(service, "has_running_jobs", return_value=False), \
+             mock.patch.object(mobile_portal.auth_slots, "load_slot_registry", return_value=[{"slot_id": "slot-9"}]), \
+             mock.patch.object(mobile_portal.auth_slots, "current_auth_info", side_effect=[{"fingerprint": "old"}, {"fingerprint": "new"}]), \
+             mock.patch.object(mobile_portal, "run_codex_browser_login", return_value=login_result) as run_login, \
+             mock.patch.object(mobile_portal.auth_slots, "save_current_auth_to_slot") as save_current_auth_to_slot, \
+             mock.patch.object(service, "request_desktop_refresh") as request_desktop_refresh, \
+             mock.patch.object(service, "account_slots_payload", return_value={"active_slot": "slot-9"}) as account_slots_payload:
+            payload = service.login_and_bind_account("slot-9")
+
+        self.assertEqual({"active_slot": "slot-9"}, payload)
+        run_login.assert_called_once_with(settings_file=service.proxy_settings_file)
+        save_current_auth_to_slot.assert_called_once_with("slot-9")
+        request_desktop_refresh.assert_called_once_with(source="account_login_bind")
+        account_slots_payload.assert_called_once_with()
+
+    def test_login_and_bind_account_rejects_when_job_is_running(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+
+        with mock.patch.object(service, "has_running_jobs", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "Stop active replies"):
+                service.login_and_bind_account("slot-9")
+
+    def test_login_and_bind_account_requires_existing_slot(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+
+        with mock.patch.object(service, "has_running_jobs", return_value=False), \
+             mock.patch.object(mobile_portal.auth_slots, "load_slot_registry", return_value=[]):
+            with self.assertRaisesRegex(FileNotFoundError, "slot-9"):
+                service.login_and_bind_account("slot-9")
+
+    def test_login_and_bind_account_rejects_unchanged_auth_after_login(self) -> None:
+        service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+
+        login_result = subprocess.CompletedProcess([mobile_portal.CODEX_BIN, "login"], 0, stdout="logged in")
+        with mock.patch.object(service, "has_running_jobs", return_value=False), \
+             mock.patch.object(mobile_portal.auth_slots, "load_slot_registry", return_value=[{"slot_id": "slot-9"}]), \
+             mock.patch.object(mobile_portal.auth_slots, "current_auth_info", side_effect=[{"fingerprint": "same"}, {"fingerprint": "same"}]), \
+             mock.patch.object(mobile_portal, "run_codex_browser_login", return_value=login_result):
+            with self.assertRaisesRegex(RuntimeError, "did not produce a new login"):
+                service.login_and_bind_account("slot-9")
+
     def test_read_current_weekly_quota_extracts_status_summary(self) -> None:
         output = "Plan: ChatGPT Plus\nWeekly quota: 76% used (resets in 3 days)\n"
 
@@ -1329,6 +1374,28 @@ class PortalAccountSlotsTests(unittest.TestCase):
             models,
         )
 
+    def test_load_available_models_prefers_openai_compatible_cache_when_backend_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-test",
+                openai_model="gpt-5.5",
+                openai_models=["gpt-5.5", "gpt-4.1"],
+            )
+            store = mobile_portal.CodexDataStore()
+
+            with mock.patch.object(mobile_portal, "BACKEND_SETTINGS_FILE", backend_settings_path), \
+                 mock.patch.object(mobile_portal, "MODELS_CACHE_FILE", Path(temp_dir) / "missing-models-cache.json"):
+                models = store.load_available_models()
+
+        self.assertEqual(["gpt-5.5", "gpt-4.1", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5"], models)
+
     def test_account_slots_payload_includes_backend_status(self) -> None:
         service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
 
@@ -1393,6 +1460,56 @@ class PortalAccountSlotsTests(unittest.TestCase):
         self.assertEqual(token_pool_settings.BACKEND_MODE_TOKEN_POOL, updated["backend_mode"])
         self.assertEqual(8456, loaded["proxy_port"])
         self.assertEqual(str(token_dir), loaded["token_dir"])
+
+    def test_backend_status_payload_reports_openai_compatible_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-test",
+                openai_model="gpt-5.5",
+                openai_models=["gpt-5.5", "gpt-5.4"],
+            )
+            service.backend_settings_file = backend_settings_path
+
+            payload = service.backend_status_payload()
+
+        self.assertEqual("openai_compatible", payload["backend_mode"])
+        self.assertEqual("https://api.openai.com/v1", payload["openai_base_url"])
+        self.assertEqual("gpt-5.5", payload["openai_model"])
+        self.assertEqual(2, payload["openai_model_count"])
+        self.assertTrue(payload["has_openai_api_key"])
+
+    def test_update_backend_settings_persists_openai_compatible_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            service.backend_settings_file = backend_settings_path
+
+            updated = service.update_backend_settings(
+                backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                token_dir=str(token_dir),
+                proxy_port=8456,
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-test",
+                openai_model="gpt-5.5",
+                openai_models=["gpt-5.5", "gpt-5.4"],
+            )
+
+            loaded = token_pool_settings.load_backend_settings(backend_settings_path)
+
+        self.assertEqual(token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE, updated["backend_mode"])
+        self.assertEqual("https://api.openai.com/v1", loaded["openai_base_url"])
+        self.assertEqual("sk-test", loaded["openai_api_key"])
+        self.assertEqual("gpt-5.5", loaded["openai_model"])
+        self.assertEqual(["gpt-5.5", "gpt-5.4"], loaded["openai_models"])
 
 
 class PortalFileShareTests(unittest.TestCase):
@@ -1587,6 +1704,20 @@ class PortalBrowserControlTests(unittest.TestCase):
         self.assertEqual({"error": "Selector not found."}, payload)
         self.assertEqual(mobile_portal.HTTPStatus.BAD_REQUEST, status)
 
+    def test_do_post_account_login_bind_dispatches_action(self) -> None:
+        portal = SimpleNamespace(
+            token="token",
+            login_and_bind_account=mock.Mock(return_value={"active_slot": "slot-9"}),
+        )
+        handler = self._make_handler(path="/api/accounts/slot-9/login-bind?token=token", portal=portal)
+
+        with mock.patch.object(handler, "_read_json_body", return_value={}), \
+             mock.patch.object(handler, "_send_json") as send_json:
+            handler.do_POST()
+
+        portal.login_and_bind_account.assert_called_once_with("slot-9")
+        send_json.assert_called_once_with({"active_slot": "slot-9"})
+
 
 class ResumeArgsTests(unittest.TestCase):
     def test_build_resume_args_includes_image_attachment_after_resume_command(self) -> None:
@@ -1674,6 +1805,30 @@ class ProxyEnvTests(unittest.TestCase):
             )
 
         self.assertEqual("pool-api-key", env["CODEX_TOKEN_POOL_API_KEY"])
+
+    def test_build_codex_subprocess_env_includes_openai_compatible_api_key_when_backend_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proxy_settings_path = Path(temp_dir) / "mobile_portal_settings.json"
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            mobile_portal.save_proxy_settings(True, 9003, proxy_settings_path)
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-openai",
+                openai_model="gpt-5.5",
+                openai_models=["gpt-5.5"],
+            )
+
+            env = mobile_portal.build_codex_subprocess_env(
+                settings_file=proxy_settings_path,
+                backend_settings_file=backend_settings_path,
+            )
+
+        self.assertEqual("sk-openai", env["CODEX_OPENAI_COMPATIBLE_API_KEY"])
 
 
 class TokenPoolBackendStartupTests(unittest.TestCase):
@@ -1813,6 +1968,28 @@ class BackendOverrideArgsTests(unittest.TestCase):
         self.assertIn('model_provider="built_in_token_pool"', rendered)
         self.assertIn('model_providers.built_in_token_pool.base_url="http://127.0.0.1:8319"', rendered)
         self.assertIn('model_providers.built_in_token_pool.env_key="CODEX_TOKEN_POOL_API_KEY"', rendered)
+
+    def test_build_backend_override_args_points_codex_to_openai_compatible_base_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-openai",
+                openai_model="gpt-5.5",
+                openai_models=["gpt-5.5"],
+            )
+
+            args = mobile_portal.build_backend_override_args(backend_settings_file=backend_settings_path)
+
+        rendered = " ".join(args)
+        self.assertIn('model_provider="openai_compatible"', rendered)
+        self.assertIn('model_providers.openai_compatible.base_url="https://api.openai.com/v1"', rendered)
+        self.assertIn('model_providers.openai_compatible.env_key="CODEX_OPENAI_COMPATIBLE_API_KEY"', rendered)
 
 
 class SessionProcessDetectionTests(unittest.TestCase):

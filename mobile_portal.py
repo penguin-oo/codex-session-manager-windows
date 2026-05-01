@@ -77,6 +77,8 @@ DEFAULT_PROXY_ENABLED = True
 DEFAULT_PROXY_PORT = 7897
 TOKEN_POOL_PROVIDER_NAME = "built_in_token_pool"
 TOKEN_POOL_ENV_KEY_NAME = "CODEX_TOKEN_POOL_API_KEY"
+OPENAI_COMPAT_PROVIDER_NAME = "openai_compatible"
+OPENAI_COMPAT_ENV_KEY_NAME = "CODEX_OPENAI_COMPATIBLE_API_KEY"
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 OPENAI_AUTH_REFRESH_URL = "https://auth.openai.com/oauth/token"
 OPENAI_CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -342,8 +344,12 @@ def build_resume_args(
     backend_settings_file: Path = BACKEND_SETTINGS_FILE,
 ) -> list[str]:
     args = [CODEX_BIN, "exec", "--json", "-o", str(output_file), "--skip-git-repo-check"]
-    if model and model != "default":
-        args.extend(["-m", model])
+    resolved_model = model
+    backend_settings = token_pool_settings.load_backend_settings(backend_settings_file)
+    if (not resolved_model or resolved_model == "default") and backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        resolved_model = str(backend_settings.get("openai_model", "")).strip()
+    if resolved_model and resolved_model != "default":
+        args.extend(["-m", resolved_model])
     if sandbox and sandbox != "default":
         args.extend(["-s", sandbox])
     if approval and approval != "default":
@@ -371,8 +377,12 @@ def build_new_chat_args(
     backend_settings_file: Path = BACKEND_SETTINGS_FILE,
 ) -> list[str]:
     args = [CODEX_BIN, "exec", "--json", "-o", str(output_file)]
-    if model and model != "default":
-        args.extend(["-m", model])
+    resolved_model = model
+    backend_settings = token_pool_settings.load_backend_settings(backend_settings_file)
+    if (not resolved_model or resolved_model == "default") and backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        resolved_model = str(backend_settings.get("openai_model", "")).strip()
+    if resolved_model and resolved_model != "default":
+        args.extend(["-m", resolved_model])
     if sandbox and sandbox != "default":
         args.extend(["-s", sandbox])
     if approval and approval != "default":
@@ -606,6 +616,32 @@ def run_text_command(args: list[str], timeout_seconds: float = 3.0) -> str:
     if result.returncode != 0:
         return ""
     return (result.stdout or "").strip()
+
+
+def run_codex_browser_login(
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [CODEX_BIN, "login"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+            env=build_codex_subprocess_env(settings_file=settings_file),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("Failed to start Codex login.") from exc
+
+
+def summarize_login_failure(result: subprocess.CompletedProcess[str]) -> str:
+    lines = [line.strip() for line in str(result.stdout or "").splitlines() if line.strip()]
+    if lines:
+        return lines[-1]
+    return f"Codex login failed with exit code {result.returncode}."
 
 
 def parse_weekly_quota_summary(status_output: str) -> dict[str, str]:
@@ -995,17 +1031,52 @@ def build_token_pool_provider_override_args(
     ]
 
 
+def build_openai_compatible_provider_override_args(
+    base_url: str,
+    provider_name: str = OPENAI_COMPAT_PROVIDER_NAME,
+    env_key_name: str = OPENAI_COMPAT_ENV_KEY_NAME,
+) -> list[str]:
+    clean_provider = provider_name.strip() or OPENAI_COMPAT_PROVIDER_NAME
+    clean_env_key = env_key_name.strip() or OPENAI_COMPAT_ENV_KEY_NAME
+    clean_base_url = base_url.strip().rstrip("/")
+    if not clean_base_url:
+        raise ValueError("A base URL is required for OpenAI-compatible launches.")
+    return [
+        "-c",
+        f'model_provider="{clean_provider}"',
+        "-c",
+        f'model_providers.{clean_provider}.name="OpenAI Compatible"',
+        "-c",
+        f'model_providers.{clean_provider}.base_url="{clean_base_url}"',
+        "-c",
+        f'model_providers.{clean_provider}.env_key="{clean_env_key}"',
+        "-c",
+        f'model_providers.{clean_provider}.wire_api="responses"',
+        "-c",
+        f'model_providers.{clean_provider}.requires_openai_auth=false',
+        "-c",
+        f'model_providers.{clean_provider}.supports_websockets=false',
+    ]
+
+
 def build_backend_override_args(
     backend_settings_file: Path = BACKEND_SETTINGS_FILE,
 ) -> list[str]:
     settings = token_pool_settings.load_backend_settings(backend_settings_file)
-    if settings.get("backend_mode") != token_pool_settings.BACKEND_MODE_TOKEN_POOL:
-        return []
-    return build_token_pool_provider_override_args(
-        proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
-        provider_name=TOKEN_POOL_PROVIDER_NAME,
-        env_key_name=TOKEN_POOL_ENV_KEY_NAME,
-    )
+    mode = settings.get("backend_mode")
+    if mode == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+        return build_token_pool_provider_override_args(
+            proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+            provider_name=TOKEN_POOL_PROVIDER_NAME,
+            env_key_name=TOKEN_POOL_ENV_KEY_NAME,
+        )
+    if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        return build_openai_compatible_provider_override_args(
+            base_url=str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)),
+            provider_name=OPENAI_COMPAT_PROVIDER_NAME,
+            env_key_name=OPENAI_COMPAT_ENV_KEY_NAME,
+        )
+    return []
 
 
 def build_codex_subprocess_env(
@@ -1017,8 +1088,13 @@ def build_codex_subprocess_env(
     backend_settings = token_pool_settings.load_backend_settings(backend_settings_file)
     if backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
         env[TOKEN_POOL_ENV_KEY_NAME] = str(backend_settings.get("proxy_api_key", "")).strip()
+        env.pop(OPENAI_COMPAT_ENV_KEY_NAME, None)
+    elif backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        env[OPENAI_COMPAT_ENV_KEY_NAME] = str(backend_settings.get("openai_api_key", "")).strip()
+        env.pop(TOKEN_POOL_ENV_KEY_NAME, None)
     else:
         env.pop(TOKEN_POOL_ENV_KEY_NAME, None)
+        env.pop(OPENAI_COMPAT_ENV_KEY_NAME, None)
     return env
 
 
@@ -1805,6 +1881,16 @@ class CodexDataStore:
 
     def load_available_models(self) -> list[str]:
         models_signature = path_signature(MODELS_CACHE_FILE)
+        backend_settings_signature = path_signature(BACKEND_SETTINGS_FILE)
+        backend_settings = token_pool_settings.load_backend_settings(BACKEND_SETTINGS_FILE)
+        if backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            openai_models = backend_settings.get("openai_models", [])
+            if isinstance(openai_models, list) and openai_models:
+                unique = merge_available_models([str(item).strip() for item in openai_models if str(item).strip()])
+                with self.cache_lock:
+                    self._models_signature = (backend_settings_signature[0], backend_settings_signature[1]) if backend_settings_signature else None
+                    self._models_cache = list(unique)
+                return unique
         with self.cache_lock:
             if models_signature == self._models_signature and self._models_cache:
                 return list(self._models_cache)
@@ -2761,6 +2847,23 @@ class PortalService:
         self.request_desktop_refresh(source="account_refresh")
         return self.account_slots_payload()
 
+    def login_and_bind_account(self, slot_id: str) -> dict[str, object]:
+        if self.has_running_jobs():
+            raise RuntimeError("Stop active replies before logging into a new account.")
+        registry = auth_slots.load_slot_registry()
+        if not any(str(item.get("slot_id", "")).strip() == slot_id for item in registry):
+            raise FileNotFoundError(f"Account slot '{slot_id}' not found.")
+        before_fingerprint = str(auth_slots.current_auth_info().get("fingerprint", "")).strip()
+        result = run_codex_browser_login(settings_file=self.proxy_settings_file)
+        if result.returncode != 0:
+            raise RuntimeError(summarize_login_failure(result))
+        after_fingerprint = str(auth_slots.current_auth_info().get("fingerprint", "")).strip()
+        if not after_fingerprint or after_fingerprint == before_fingerprint:
+            raise RuntimeError("Codex login finished but did not produce a new login.")
+        auth_slots.save_current_auth_to_slot(slot_id)
+        self.request_desktop_refresh(source="account_login_bind")
+        return self.account_slots_payload()
+
     def switch_account(self, slot_id: str) -> dict[str, object]:
         if self.has_running_jobs():
             raise RuntimeError("Stop active replies before switching accounts.")
@@ -2857,6 +2960,7 @@ class PortalService:
         token_count = len(token_pool_settings.list_token_files(token_dir))
         proxy_port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
         health = token_pool_proxy_is_healthy(proxy_port)
+        openai_models = settings.get("openai_models", [])
         return {
             "backend_mode": str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)),
             "token_dir": str(token_dir),
@@ -2864,10 +2968,23 @@ class PortalService:
             "proxy_running": bool(health),
             "proxy_summary": f"http://127.0.0.1:{proxy_port}" if health else "stopped",
             "token_count": token_count,
+            "openai_base_url": str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip(),
+            "openai_model": str(settings.get("openai_model", "")).strip(),
+            "openai_model_count": len(openai_models) if isinstance(openai_models, list) else 0,
+            "has_openai_api_key": bool(str(settings.get("openai_api_key", "")).strip()),
             "last_error": "",
         }
 
-    def update_backend_settings(self, backend_mode: str, token_dir: str, proxy_port: int) -> dict[str, object]:
+    def update_backend_settings(
+        self,
+        backend_mode: str,
+        token_dir: str,
+        proxy_port: int,
+        openai_base_url: str = "",
+        openai_api_key: str = "",
+        openai_model: str = "",
+        openai_models: list[str] | None = None,
+    ) -> dict[str, object]:
         current = token_pool_settings.load_backend_settings(self.backend_settings_file)
         token_dir_path = Path(token_dir.strip() or str(current.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
         updated = token_pool_settings.save_backend_settings(
@@ -2876,6 +2993,10 @@ class PortalService:
             token_dir=token_dir_path,
             proxy_port=proxy_port,
             proxy_api_key=str(current.get("proxy_api_key", "")),
+            openai_base_url=openai_base_url.strip() or str(current.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)),
+            openai_api_key=openai_api_key.strip() or str(current.get("openai_api_key", "")),
+            openai_model=openai_model.strip() or str(current.get("openai_model", "")),
+            openai_models=openai_models if openai_models is not None else current.get("openai_models", []),
         )
         self.jobs.backend_settings_file = self.backend_settings_file
         return {
@@ -3986,6 +4107,22 @@ class PortalHandler(BaseHTTPRequestHandler):
                 result = self.portal.bind_current_account(slot_id)
             except FileNotFoundError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(result)
+            return
+        if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/login-bind"):
+            slot_id = parsed.path.split("/")[3]
+            try:
+                result = self.portal.login_and_bind_account(slot_id)
+            except FileNotFoundError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
+            except RuntimeError as exc:
+                status = HTTPStatus.CONFLICT if "Stop active replies" in str(exc) else HTTPStatus.BAD_REQUEST
+                self._send_json({"error": str(exc)}, status=status)
                 return
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
