@@ -8,6 +8,7 @@ import threading
 import tomllib
 import tkinter as tk
 import auth_slots
+import custom_provider_proxy
 import token_pool_proxy
 import token_pool_settings
 from dataclasses import dataclass, replace
@@ -232,18 +233,23 @@ def save_openai_compatible_backend_settings(
     base_url: str = token_pool_settings.DEFAULT_OPENAI_BASE_URL,
     api_key: str = "",
     model: str = "",
-    discovered_models: object = None,
 ) -> dict[str, object]:
+    resolved = token_pool_settings.resolve_openai_compatible_backend_config(
+        base_url,
+        api_key,
+        model,
+    )
     return token_pool_settings.save_backend_settings(
         backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
         settings_file=settings_file,
         token_dir=token_dir,
         proxy_port=proxy_port,
         proxy_api_key=proxy_api_key,
-        openai_base_url=base_url,
-        openai_api_key=api_key,
-        openai_model=model,
-        openai_models=[] if discovered_models is None else discovered_models,
+        openai_base_url=str(resolved.get("openai_base_url", base_url)),
+        openai_api_key=str(resolved.get("openai_api_key", api_key)),
+        openai_model=str(resolved.get("openai_model", model)),
+        openai_models=resolved.get("openai_models", []),
+        openai_protocol=str(resolved.get("openai_protocol", "")),
     )
 
 
@@ -275,6 +281,48 @@ def build_token_pool_proxy_command(
             token_dir,
         ]
     )
+    return command
+
+
+def build_custom_provider_proxy_command(
+    *,
+    executable: str,
+    app_path: str,
+    port: int,
+    api_key: str,
+    upstream_base_url: str,
+    upstream_api_key: str,
+    upstream_protocol: str,
+    model_ids: list[str],
+    frozen: bool,
+) -> list[str]:
+    if not frozen:
+        conda_executable = shutil.which("conda")
+        if conda_executable:
+            command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
+        else:
+            command = [executable, app_path]
+    else:
+        command = [executable]
+    command.extend(
+        [
+            "--custom-provider-proxy",
+            "--port",
+            str(int(port)),
+            "--api-key",
+            api_key,
+            "--upstream-base-url",
+            upstream_base_url.strip(),
+            "--upstream-api-key",
+            upstream_api_key,
+            "--upstream-protocol",
+            upstream_protocol.strip(),
+        ]
+    )
+    for model_id in model_ids:
+        clean_model = str(model_id).strip()
+        if clean_model:
+            command.extend(["--model", clean_model])
     return command
 
 
@@ -1379,7 +1427,7 @@ class SessionManagerApp:
         settings = self._token_pool_settings()
         return build_openai_compatible_environment_ps_prefix(
             env_key_name=OPENAI_COMPAT_ENV_KEY_NAME,
-            api_key_value=str(settings.get("openai_api_key", "")),
+            api_key_value=str(settings.get("proxy_api_key", "")),
         )
 
     def _token_pool_health(self, port: int | None = None) -> dict[str, object] | None:
@@ -1435,6 +1483,9 @@ class SessionManagerApp:
 
     def _start_token_pool_proxy(self) -> None:
         settings = self._token_pool_settings()
+        if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            self._start_openai_compatible_proxy()
+            return
         token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
         token_pool_settings.ensure_token_pool_dir(token_dir)
         token_files = token_pool_settings.list_token_files(token_dir)
@@ -1473,6 +1524,52 @@ class SessionManagerApp:
             time.sleep(0.2)
         raise RuntimeError("Built-in token pool proxy did not become ready.")
 
+    def _start_openai_compatible_proxy(self) -> None:
+        settings = self._token_pool_settings()
+        port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
+        health = self._token_pool_health(port)
+        if health:
+            return
+        upstream_base_url = str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
+        upstream_api_key = str(settings.get("openai_api_key", "")).strip()
+        upstream_protocol = str(settings.get("openai_protocol", "")).strip()
+        model_ids = [str(item).strip() for item in settings.get("openai_models", []) if str(item).strip()]
+        if not upstream_base_url or not upstream_api_key or not upstream_protocol:
+            raise RuntimeError("Save the OpenAI-Compatible API settings before using this backend.")
+        command = build_custom_provider_proxy_command(
+            executable=sys.executable,
+            app_path=str(Path(__file__).resolve()),
+            port=port,
+            api_key=str(settings.get("proxy_api_key", "")),
+            upstream_base_url=upstream_base_url,
+            upstream_api_key=upstream_api_key,
+            upstream_protocol=upstream_protocol,
+            model_ids=model_ids,
+            frozen=getattr(sys, "frozen", False),
+        )
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(APP_DIR),
+            env=self._build_token_pool_proxy_env(),
+            creationflags=creationflags,
+        )
+        save_token_pool_proxy_state(
+            {
+                "pid": proc.pid,
+                "port": port,
+                "backend_mode": token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                "upstream_protocol": upstream_protocol,
+                "started_at": time.time(),
+            }
+        )
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            if self._token_pool_health(port):
+                return
+            time.sleep(0.2)
+        raise RuntimeError("OpenAI-compatible backend proxy did not become ready.")
+
     def _stop_token_pool_proxy(self) -> None:
         state = load_token_pool_proxy_state()
         pid = int(state.get("pid", 0) or 0)
@@ -1500,12 +1597,16 @@ class SessionManagerApp:
             model = str(settings.get("openai_model", "")).strip() or "default"
             model_count = len(settings.get("openai_models", []) or [])
             has_key = bool(str(settings.get("openai_api_key", "")).strip())
+            protocol = str(settings.get("openai_protocol", "")).strip() or "unverified"
+            running = "running" if health else "stopped"
             return (
                 f"Mode: {mode}\n"
                 f"Base URL: {base_url}\n"
+                f"Protocol: {protocol}\n"
                 f"Saved model: {model}\n"
                 f"Discovered models: {model_count}\n"
-                f"API key: {'configured' if has_key else 'missing'}"
+                f"API key: {'configured' if has_key else 'missing'}\n"
+                f"Proxy: {running}"
             )
         running = "running" if health else "stopped"
         return f"Mode: {mode}\nToken files: {token_count}\nPort: {port}\nProxy: {running}"
@@ -1523,17 +1624,18 @@ class SessionManagerApp:
         if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
             return build_openai_compatible_provider_override_args(
                 model=fallback_model,
-                base_url=str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)),
+                base_url=f"http://127.0.0.1:{int(settings.get('proxy_port', token_pool_settings.DEFAULT_PROXY_PORT))}",
                 provider_name=OPENAI_COMPAT_PROVIDER_NAME,
                 env_key_name=OPENAI_COMPAT_ENV_KEY_NAME,
             )
-            return []
         return []
 
     def _ensure_backend_ready(self) -> None:
         settings = self._token_pool_settings()
         if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
             self._start_token_pool_proxy()
+        elif settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            self._start_openai_compatible_proxy()
 
     def _toggle_proxy_controls(self) -> None:
         proxy_controls_enabled = self.use_proxy_var.get()
@@ -1740,35 +1842,26 @@ class SessionManagerApp:
             base_url = openai_base_url_var.get().strip() or token_pool_settings.DEFAULT_OPENAI_BASE_URL
             api_key = openai_api_key_var.get().strip()
             selected_model = openai_model_var.get().strip()
-            discovered_models = list(settings.get("openai_models", []) or [])
-            fetch_error = ""
-            if api_key:
-                try:
-                    discovered_models = token_pool_settings.fetch_openai_compatible_models(base_url, api_key)
-                except Exception as exc:
-                    fetch_error = str(exc)
-            if discovered_models and (not selected_model or selected_model not in discovered_models):
-                selected_model = discovered_models[0]
-            updated = save_openai_compatible_backend_settings(
-                settings_file=token_pool_settings.DEFAULT_SETTINGS_FILE,
-                token_dir=token_dir,
-                proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
-                proxy_api_key=str(settings.get("proxy_api_key", "")),
-                base_url=base_url,
-                api_key=api_key,
-                model=selected_model,
-                discovered_models=discovered_models,
-            )
+            try:
+                updated = save_openai_compatible_backend_settings(
+                    settings_file=token_pool_settings.DEFAULT_SETTINGS_FILE,
+                    token_dir=token_dir,
+                    proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+                    proxy_api_key=str(settings.get("proxy_api_key", "")),
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=selected_model,
+                )
+            except Exception as exc:
+                messagebox.showerror("OpenAI-Compatible API", str(exc), parent=dialog)
+                return
             self.backend_settings = updated
             backend_mode_var.set(token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE)
             self.available_models = self._load_available_models()
             self._render_models()
             refresh_token_pool_section()
-            if fetch_error:
-                self.status_var.set("Saved OpenAI-compatible backend settings; model fetch failed")
-                messagebox.showwarning("OpenAI-Compatible Models", f"Settings saved, but model fetch failed.\n\n{fetch_error}", parent=dialog)
-                return
-            self.status_var.set(f"Saved OpenAI-compatible backend settings ({len(discovered_models)} model(s))")
+            saved_models = list(updated.get("openai_models", []) or [])
+            self.status_var.set(f"Saved OpenAI-compatible backend settings ({len(saved_models)} model(s))")
 
         def import_token_files_dialog() -> None:
             settings = self._token_pool_settings()

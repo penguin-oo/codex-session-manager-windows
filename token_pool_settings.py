@@ -17,6 +17,13 @@ BACKEND_MODE_CODEX_AUTH = 'codex_auth'
 BACKEND_MODE_TOKEN_POOL = 'built_in_token_pool'
 BACKEND_MODE_OPENAI_COMPATIBLE = 'openai_compatible'
 DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1'
+OPENAI_PROTOCOL_RESPONSES = 'responses'
+OPENAI_PROTOCOL_CHAT_COMPLETIONS = 'chat_completions'
+VALID_OPENAI_PROTOCOLS = {
+    '',
+    OPENAI_PROTOCOL_RESPONSES,
+    OPENAI_PROTOCOL_CHAT_COMPLETIONS,
+}
 VALID_BACKEND_MODES = {
     BACKEND_MODE_CODEX_AUTH,
     BACKEND_MODE_TOKEN_POOL,
@@ -48,7 +55,11 @@ def _build_backend_payload(
     openai_api_key: str,
     openai_model: str,
     openai_models: object,
+    openai_protocol: str,
 ) -> dict[str, object]:
+    clean_protocol = openai_protocol.strip()
+    if clean_protocol not in VALID_OPENAI_PROTOCOLS:
+        clean_protocol = ''
     return {
         'backend_mode': backend_mode,
         'token_dir': token_dir,
@@ -58,6 +69,7 @@ def _build_backend_payload(
         'openai_api_key': openai_api_key.strip(),
         'openai_model': openai_model.strip(),
         'openai_models': _normalize_openai_models(openai_models),
+        'openai_protocol': clean_protocol,
     }
 
 
@@ -77,6 +89,7 @@ def load_backend_settings(settings_file: Path = DEFAULT_SETTINGS_FILE) -> dict[s
             openai_api_key='',
             openai_model='',
             openai_models=[],
+            openai_protocol='',
         )
 
     if settings_file.exists():
@@ -103,6 +116,7 @@ def load_backend_settings(settings_file: Path = DEFAULT_SETTINGS_FILE) -> dict[s
                 openai_api_key=str(raw.get('openai_api_key', '')),
                 openai_model=str(raw.get('openai_model', '')),
                 openai_models=raw.get('openai_models', []),
+                openai_protocol=str(raw.get('openai_protocol', '')),
             )
     payload = default_payload()
     settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +134,7 @@ def save_backend_settings(
     openai_api_key: str = '',
     openai_model: str = '',
     openai_models: object = None,
+    openai_protocol: str = '',
 ) -> dict[str, object]:
     clean_mode = backend_mode.strip() or BACKEND_MODE_CODEX_AUTH
     if clean_mode not in VALID_BACKEND_MODES:
@@ -133,10 +148,142 @@ def save_backend_settings(
         openai_api_key=openai_api_key,
         openai_model=openai_model,
         openai_models=[] if openai_models is None else openai_models,
+        openai_protocol=openai_protocol,
     )
     settings_file.parent.mkdir(parents=True, exist_ok=True)
     settings_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     return payload
+
+
+def _build_openai_models_request(base_url: str, api_key: str) -> url_request.Request:
+    return url_request.Request(
+        f'{base_url}/models',
+        headers={
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {api_key}',
+            'User-Agent': 'codex-session-manager-openai-compatible',
+        },
+        method='GET',
+    )
+
+
+def _openai_compatible_json_request(
+    url: str,
+    api_key: str,
+    payload: dict[str, object],
+    timeout_seconds: float,
+) -> tuple[int, str]:
+    request = url_request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+        headers={
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'codex-session-manager-openai-compatible',
+        },
+        method='POST',
+    )
+    try:
+        with url_request.urlopen(request, timeout=timeout_seconds) as response:
+            return int(getattr(response, 'status', response.getcode()) or 200), response.read().decode('utf-8', errors='ignore')
+    except url_error.HTTPError as exc:
+        return int(getattr(exc, 'code', 500) or 500), exc.read().decode('utf-8', errors='ignore')
+    except (OSError, ValueError, url_error.URLError) as exc:
+        raise RuntimeError('Failed to connect to the configured endpoint.') from exc
+
+
+def _body_looks_like_json(body: str) -> bool:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict)
+
+
+def detect_openai_compatible_protocol(
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout_seconds: float = 8.0,
+) -> str:
+    clean_base_url = base_url.strip().rstrip('/')
+    clean_api_key = api_key.strip()
+    clean_model = model.strip()
+    if not clean_base_url:
+        raise ValueError('Base URL is required.')
+    if not clean_api_key:
+        raise ValueError('API key is required.')
+    if not clean_model:
+        raise ValueError('Model is required.')
+
+    responses_status, responses_body = _openai_compatible_json_request(
+        f'{clean_base_url}/responses',
+        clean_api_key,
+        {
+            'model': clean_model,
+            'input': 'ping',
+            'max_output_tokens': 1,
+            'stream': False,
+        },
+        timeout_seconds,
+    )
+    if 200 <= responses_status < 300 and _body_looks_like_json(responses_body):
+        return OPENAI_PROTOCOL_RESPONSES
+    if responses_status not in {404, 405, 501}:
+        detail = responses_body.strip()
+        if detail:
+            raise RuntimeError(f'Failed to validate /responses: HTTP {responses_status} {detail}')
+        raise RuntimeError(f'Failed to validate /responses: HTTP {responses_status}.')
+
+    chat_status, chat_body = _openai_compatible_json_request(
+        f'{clean_base_url}/chat/completions',
+        clean_api_key,
+        {
+            'model': clean_model,
+            'messages': [{'role': 'user', 'content': 'ping'}],
+            'max_tokens': 1,
+            'stream': False,
+        },
+        timeout_seconds,
+    )
+    if 200 <= chat_status < 300 and _body_looks_like_json(chat_body):
+        return OPENAI_PROTOCOL_CHAT_COMPLETIONS
+    detail = chat_body.strip()
+    if detail:
+        raise RuntimeError(f'Failed to validate chat/completions: HTTP {chat_status} {detail}')
+    raise RuntimeError(f'Failed to validate chat/completions: HTTP {chat_status}.')
+
+
+def resolve_openai_compatible_backend_config(
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout_seconds: float = 8.0,
+) -> dict[str, object]:
+    clean_base_url = base_url.strip() or DEFAULT_OPENAI_BASE_URL
+    clean_api_key = api_key.strip()
+    if not clean_api_key:
+        raise ValueError('API key is required.')
+    models = fetch_openai_compatible_models(clean_base_url, clean_api_key, timeout_seconds=timeout_seconds)
+    selected_model = model.strip()
+    if selected_model and selected_model not in models:
+        raise RuntimeError('Selected model is not returned by the configured endpoint.')
+    if not selected_model:
+        selected_model = models[0]
+    protocol = detect_openai_compatible_protocol(
+        clean_base_url,
+        clean_api_key,
+        selected_model,
+        timeout_seconds=timeout_seconds,
+    )
+    return {
+        'openai_base_url': clean_base_url.strip().rstrip('/') or DEFAULT_OPENAI_BASE_URL,
+        'openai_api_key': clean_api_key,
+        'openai_model': selected_model,
+        'openai_models': models,
+        'openai_protocol': protocol,
+    }
 
 
 def fetch_openai_compatible_models(base_url: str, api_key: str, timeout_seconds: float = 8.0) -> list[str]:
@@ -146,15 +293,7 @@ def fetch_openai_compatible_models(base_url: str, api_key: str, timeout_seconds:
         raise ValueError('Base URL is required.')
     if not clean_api_key:
         raise ValueError('API key is required.')
-    request = url_request.Request(
-        f'{clean_base_url}/models',
-        headers={
-            'Accept': 'application/json',
-            'Authorization': f'Bearer {clean_api_key}',
-            'User-Agent': 'codex-session-manager-openai-compatible',
-        },
-        method='GET',
-    )
+    request = _build_openai_models_request(clean_base_url, clean_api_key)
     try:
         with url_request.urlopen(request, timeout=timeout_seconds) as response:
             body = response.read().decode('utf-8', errors='ignore')

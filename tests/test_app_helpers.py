@@ -176,6 +176,21 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertIn("$env:CODEX_TOKEN_POOL_API_KEY='local-proxy-key'", prefix)
 
+    def test_build_openai_compatible_ps_prefix_uses_local_proxy_api_key(self) -> None:
+        manager = object.__new__(app.SessionManagerApp)
+        manager._token_pool_settings = mock.Mock(
+            return_value={
+                "backend_mode": app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                "proxy_api_key": "local-proxy-key",
+                "openai_api_key": "sk-upstream-key",
+            }
+        )
+
+        prefix = app.SessionManagerApp._build_openai_compatible_ps_prefix(manager)
+
+        self.assertIn("$env:CODEX_OPENAI_COMPATIBLE_API_KEY='local-proxy-key'", prefix)
+        self.assertNotIn("sk-upstream-key", prefix)
+
     def test_build_openai_compatible_provider_override_args_points_codex_to_custom_base_url(self) -> None:
         args = app.build_openai_compatible_provider_override_args(
             model="gpt-5.5",
@@ -204,6 +219,7 @@ class AppHelperTests(unittest.TestCase):
                 openai_api_key="sk-test",
                 openai_model="gpt-5.5",
                 openai_models=["gpt-5.5", "gpt-5.4"],
+                openai_protocol="responses",
             )
             loaded = app.token_pool_settings.load_backend_settings(settings_file)
 
@@ -212,6 +228,7 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual("sk-test", loaded["openai_api_key"])
         self.assertEqual("gpt-5.5", loaded["openai_model"])
         self.assertEqual(["gpt-5.5", "gpt-5.4"], loaded["openai_models"])
+        self.assertEqual("responses", loaded["openai_protocol"])
 
     def test_save_openai_compatible_backend_settings_forces_openai_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -226,24 +243,73 @@ class AppHelperTests(unittest.TestCase):
                 proxy_api_key="pool-api-key",
             )
 
-            updated = app.save_openai_compatible_backend_settings(
-                settings_file=settings_file,
-                token_dir=token_dir,
-                proxy_port=8317,
-                proxy_api_key="pool-api-key",
-                base_url="https://api.openai.com/v1",
-                api_key="sk-test",
-                model="gpt-5.5",
-                discovered_models=["gpt-5.5", "gpt-5.4"],
-            )
+            with mock.patch.object(
+                app.token_pool_settings,
+                "resolve_openai_compatible_backend_config",
+                return_value={
+                    "openai_base_url": "https://api.openai.com/v1",
+                    "openai_api_key": "sk-test",
+                    "openai_model": "gpt-5.5",
+                    "openai_models": ["gpt-5.5", "gpt-5.4"],
+                    "openai_protocol": "chat_completions",
+                },
+            ) as resolve_backend:
+                updated = app.save_openai_compatible_backend_settings(
+                    settings_file=settings_file,
+                    token_dir=token_dir,
+                    proxy_port=8317,
+                    proxy_api_key="pool-api-key",
+                    base_url="https://api.openai.com/v1",
+                    api_key="sk-test",
+                    model="gpt-5.5",
+                )
             reloaded = app.token_pool_settings.load_backend_settings(settings_file)
 
+        resolve_backend.assert_called_once_with(
+            "https://api.openai.com/v1",
+            "sk-test",
+            "gpt-5.5",
+        )
         self.assertEqual(app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE, updated["backend_mode"])
         self.assertEqual(app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE, reloaded["backend_mode"])
         self.assertEqual("https://api.openai.com/v1", reloaded["openai_base_url"])
         self.assertEqual("sk-test", reloaded["openai_api_key"])
         self.assertEqual("gpt-5.5", reloaded["openai_model"])
         self.assertEqual(["gpt-5.5", "gpt-5.4"], reloaded["openai_models"])
+        self.assertEqual("chat_completions", reloaded["openai_protocol"])
+
+    def test_save_openai_compatible_backend_settings_refuses_invalid_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "token_pool_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            token_dir.mkdir()
+            app.token_pool_settings.save_backend_settings(
+                app.token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                settings_file=settings_file,
+                token_dir=token_dir,
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+            )
+
+            with mock.patch.object(
+                app.token_pool_settings,
+                "resolve_openai_compatible_backend_config",
+                side_effect=RuntimeError("Protocol detection failed."),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Protocol detection failed"):
+                    app.save_openai_compatible_backend_settings(
+                        settings_file=settings_file,
+                        token_dir=token_dir,
+                        proxy_port=8317,
+                        proxy_api_key="pool-api-key",
+                        base_url="https://api.openai.com/v1",
+                        api_key="sk-test",
+                        model="gpt-5.5",
+                    )
+
+            reloaded = app.token_pool_settings.load_backend_settings(settings_file)
+
+        self.assertEqual(app.token_pool_settings.BACKEND_MODE_CODEX_AUTH, reloaded["backend_mode"])
 
     def test_load_available_models_prefers_openai_compatible_cache_when_backend_enabled(self) -> None:
         manager = object.__new__(app.SessionManagerApp)
@@ -257,6 +323,26 @@ class AppHelperTests(unittest.TestCase):
             models = app.SessionManagerApp._load_available_models(manager)
 
         self.assertEqual(["gpt-5.5", "gpt-4.1", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5"], models)
+
+    def test_build_backend_override_args_uses_local_adapter_url_for_openai_mode(self) -> None:
+        manager = object.__new__(app.SessionManagerApp)
+        manager._token_pool_settings = mock.Mock(
+            return_value={
+                "backend_mode": app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                "proxy_port": 8456,
+                "proxy_api_key": "local-proxy-key",
+                "openai_base_url": "https://token-plan-sgp.example.com/v1",
+                "openai_api_key": "sk-upstream-key",
+                "openai_model": "mimo-v2-pro",
+                "openai_protocol": "chat_completions",
+            }
+        )
+
+        args = app.SessionManagerApp._build_backend_override_args(manager, "mimo-v2-pro")
+
+        rendered = " ".join(args)
+        self.assertIn('model_provider="openai_compatible"', rendered)
+        self.assertIn('model_providers.openai_compatible.base_url="http://127.0.0.1:8456"', rendered)
 
     def test_build_token_pool_proxy_command_uses_app_script_in_source_mode(self) -> None:
         with mock.patch.object(app.shutil, "which", return_value=None):

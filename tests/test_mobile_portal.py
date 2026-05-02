@@ -1494,23 +1494,40 @@ class PortalAccountSlotsTests(unittest.TestCase):
             token_dir = Path(temp_dir) / "tokens"
             service.backend_settings_file = backend_settings_path
 
-            updated = service.update_backend_settings(
-                backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
-                token_dir=str(token_dir),
-                proxy_port=8456,
-                openai_base_url="https://api.openai.com/v1",
-                openai_api_key="sk-test",
-                openai_model="gpt-5.5",
-                openai_models=["gpt-5.5", "gpt-5.4"],
-            )
+            with mock.patch.object(
+                token_pool_settings,
+                "resolve_openai_compatible_backend_config",
+                return_value={
+                    "openai_base_url": "https://api.openai.com/v1",
+                    "openai_api_key": "sk-test",
+                    "openai_model": "gpt-5.5",
+                    "openai_models": ["gpt-5.5", "gpt-5.4"],
+                    "openai_protocol": "responses",
+                },
+            ) as resolve_backend:
+                updated = service.update_backend_settings(
+                    backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                    token_dir=str(token_dir),
+                    proxy_port=8456,
+                    openai_base_url="https://api.openai.com/v1",
+                    openai_api_key="sk-test",
+                    openai_model="gpt-5.5",
+                    openai_models=["gpt-5.5", "gpt-5.4"],
+                )
 
             loaded = token_pool_settings.load_backend_settings(backend_settings_path)
 
+        resolve_backend.assert_called_once_with(
+            "https://api.openai.com/v1",
+            "sk-test",
+            "gpt-5.5",
+        )
         self.assertEqual(token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE, updated["backend_mode"])
         self.assertEqual("https://api.openai.com/v1", loaded["openai_base_url"])
         self.assertEqual("sk-test", loaded["openai_api_key"])
         self.assertEqual("gpt-5.5", loaded["openai_model"])
         self.assertEqual(["gpt-5.5", "gpt-5.4"], loaded["openai_models"])
+        self.assertEqual("responses", loaded["openai_protocol"])
 
     def test_update_backend_settings_fetches_openai_models_when_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1520,9 +1537,15 @@ class PortalAccountSlotsTests(unittest.TestCase):
 
             with mock.patch.object(
                 token_pool_settings,
-                "fetch_openai_compatible_models",
-                return_value=["gpt-5.5", "gpt-4.1"],
-            ) as fetch_openai_models:
+                "resolve_openai_compatible_backend_config",
+                return_value={
+                    "openai_base_url": "https://api.openai.com/v1",
+                    "openai_api_key": "sk-test",
+                    "openai_model": "gpt-5.5",
+                    "openai_models": ["gpt-5.5", "gpt-4.1"],
+                    "openai_protocol": "chat_completions",
+                },
+            ) as resolve_backend:
                 updated = service.update_backend_settings(
                     backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
                     token_dir=str(Path(temp_dir) / "tokens"),
@@ -1534,9 +1557,42 @@ class PortalAccountSlotsTests(unittest.TestCase):
 
             loaded = token_pool_settings.load_backend_settings(backend_settings_path)
 
-        fetch_openai_models.assert_called_once_with("https://api.openai.com/v1", "sk-test")
+        resolve_backend.assert_called_once_with("https://api.openai.com/v1", "sk-test", "gpt-5.5")
         self.assertEqual(["gpt-5.5", "gpt-4.1"], loaded["openai_models"])
         self.assertEqual(["gpt-5.5", "gpt-4.1"], updated["openai_models"])
+        self.assertEqual("chat_completions", loaded["openai_protocol"])
+
+    def test_update_backend_settings_refuses_invalid_openai_compatible_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            service.backend_settings_file = backend_settings_path
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8456,
+                proxy_api_key="pool-api-key",
+            )
+
+            with mock.patch.object(
+                token_pool_settings,
+                "resolve_openai_compatible_backend_config",
+                side_effect=RuntimeError("Protocol detection failed."),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Protocol detection failed"):
+                    service.update_backend_settings(
+                        backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                        token_dir=str(Path(temp_dir) / "tokens"),
+                        proxy_port=8456,
+                        openai_base_url="https://api.openai.com/v1",
+                        openai_api_key="sk-test",
+                        openai_model="gpt-5.5",
+                    )
+
+            loaded = token_pool_settings.load_backend_settings(backend_settings_path)
+
+        self.assertEqual(token_pool_settings.BACKEND_MODE_CODEX_AUTH, loaded["backend_mode"])
 
 
 class PortalFileShareTests(unittest.TestCase):
@@ -1887,7 +1943,7 @@ class ProxyEnvTests(unittest.TestCase):
                 backend_settings_file=backend_settings_path,
             )
 
-        self.assertEqual("sk-openai", env["CODEX_OPENAI_COMPATIBLE_API_KEY"])
+        self.assertEqual("pool-api-key", env["CODEX_OPENAI_COMPATIBLE_API_KEY"])
 
 
 class TokenPoolBackendStartupTests(unittest.TestCase):
@@ -1936,6 +1992,33 @@ class TokenPoolBackendStartupTests(unittest.TestCase):
         self.assertEqual(8317, args.port)
         self.assertEqual("pool-api-key", args.api_key)
         self.assertEqual("C:\\tokens", args.token_dir)
+
+    def test_build_arg_parser_accepts_custom_provider_proxy_mode(self) -> None:
+        args = mobile_portal.build_arg_parser().parse_args(
+            [
+                "--custom-provider-proxy",
+                "--port",
+                "8456",
+                "--api-key",
+                "local-proxy-key",
+                "--upstream-base-url",
+                "https://token-plan-sgp.example.com/v1",
+                "--upstream-api-key",
+                "sk-upstream-key",
+                "--upstream-protocol",
+                "chat_completions",
+                "--model",
+                "mimo-v2-pro",
+            ]
+        )
+
+        self.assertTrue(args.custom_provider_proxy)
+        self.assertEqual(8456, args.port)
+        self.assertEqual("local-proxy-key", args.api_key)
+        self.assertEqual("https://token-plan-sgp.example.com/v1", args.upstream_base_url)
+        self.assertEqual("sk-upstream-key", args.upstream_api_key)
+        self.assertEqual("chat_completions", args.upstream_protocol)
+        self.assertEqual(["mimo-v2-pro"], args.model)
 
     def test_main_delegates_to_token_pool_proxy_main_when_proxy_mode_enabled(self) -> None:
         with mock.patch.object(mobile_portal.token_pool_proxy, "main", return_value=0) as proxy_main:
@@ -2047,7 +2130,7 @@ class BackendOverrideArgsTests(unittest.TestCase):
 
         rendered = " ".join(args)
         self.assertIn('model_provider="openai_compatible"', rendered)
-        self.assertIn('model_providers.openai_compatible.base_url="https://api.openai.com/v1"', rendered)
+        self.assertIn('model_providers.openai_compatible.base_url="http://127.0.0.1:8317"', rendered)
         self.assertIn('model_providers.openai_compatible.env_key="CODEX_OPENAI_COMPATIBLE_API_KEY"', rendered)
 
 
@@ -2748,7 +2831,7 @@ class LoadMessagesTests(unittest.TestCase):
         )
 
 class MobileBackendLaunchTests(unittest.TestCase):
-    def test_run_resume_job_ensures_token_pool_backend_ready(self) -> None:
+    def test_run_resume_job_ensures_backend_proxy_ready(self) -> None:
         runner = mobile_portal.JobRunner(_FakeStore())
         runner.jobs["job-1"] = {
             "job_id": "job-1",
@@ -2765,7 +2848,7 @@ class MobileBackendLaunchTests(unittest.TestCase):
             "live_chunks_version": 0,
         }
 
-        with mock.patch.object(mobile_portal, "ensure_token_pool_backend_ready", create=True) as ensure_ready, \
+        with mock.patch.object(mobile_portal, "ensure_backend_proxy_ready", create=True) as ensure_ready, \
              mock.patch.object(mobile_portal, "build_resume_args", return_value=["codex.cmd", "exec"]), \
              mock.patch.object(runner, "_run_codex_process", return_value="session-1"), \
              mock.patch("mobile_portal.tempfile.mkstemp", return_value=(1, str(Path(tempfile.gettempdir()) / "portal-out-1.txt"))), \
@@ -2784,7 +2867,7 @@ class MobileBackendLaunchTests(unittest.TestCase):
 
         ensure_ready.assert_called_once()
 
-    def test_run_new_chat_job_ensures_token_pool_backend_ready(self) -> None:
+    def test_run_new_chat_job_ensures_backend_proxy_ready(self) -> None:
         runner = mobile_portal.JobRunner(_FakeStore())
         runner.jobs["job-1"] = {
             "job_id": "job-1",
@@ -2804,7 +2887,7 @@ class MobileBackendLaunchTests(unittest.TestCase):
             "opening_prompt_recorded": False,
         }
 
-        with mock.patch.object(mobile_portal, "ensure_token_pool_backend_ready", create=True) as ensure_ready, \
+        with mock.patch.object(mobile_portal, "ensure_backend_proxy_ready", create=True) as ensure_ready, \
              mock.patch.object(mobile_portal, "build_new_chat_args", return_value=["codex.cmd", "exec"]), \
              mock.patch.object(runner, "_run_codex_process", return_value="session-1"), \
              mock.patch("mobile_portal.tempfile.mkstemp", return_value=(1, str(Path(tempfile.gettempdir()) / "portal-out-2.txt"))), \

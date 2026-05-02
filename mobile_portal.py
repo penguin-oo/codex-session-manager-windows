@@ -2,6 +2,7 @@ import argparse
 import auth_slots
 import base64
 import controlled_browser
+import custom_provider_proxy
 import ipaddress
 import json
 import mimetypes
@@ -1072,7 +1073,7 @@ def build_backend_override_args(
         )
     if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
         return build_openai_compatible_provider_override_args(
-            base_url=str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)),
+            base_url=f"http://127.0.0.1:{int(settings.get('proxy_port', token_pool_settings.DEFAULT_PROXY_PORT))}",
             provider_name=OPENAI_COMPAT_PROVIDER_NAME,
             env_key_name=OPENAI_COMPAT_ENV_KEY_NAME,
         )
@@ -1090,7 +1091,7 @@ def build_codex_subprocess_env(
         env[TOKEN_POOL_ENV_KEY_NAME] = str(backend_settings.get("proxy_api_key", "")).strip()
         env.pop(OPENAI_COMPAT_ENV_KEY_NAME, None)
     elif backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
-        env[OPENAI_COMPAT_ENV_KEY_NAME] = str(backend_settings.get("openai_api_key", "")).strip()
+        env[OPENAI_COMPAT_ENV_KEY_NAME] = str(backend_settings.get("proxy_api_key", "")).strip()
         env.pop(TOKEN_POOL_ENV_KEY_NAME, None)
     else:
         env.pop(TOKEN_POOL_ENV_KEY_NAME, None)
@@ -1177,6 +1178,44 @@ def build_token_pool_proxy_command(
             token_dir,
         ]
     )
+    return command
+
+
+def build_custom_provider_proxy_command(
+    *,
+    executable: str,
+    app_path: str,
+    port: int,
+    api_key: str,
+    upstream_base_url: str,
+    upstream_api_key: str,
+    upstream_protocol: str,
+    model_ids: list[str],
+) -> list[str]:
+    conda_executable = shutil.which("conda")
+    if conda_executable and conda_env_available(conda_executable):
+        command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
+    else:
+        command = [executable, app_path]
+    command.extend(
+        [
+            "--custom-provider-proxy",
+            "--port",
+            str(int(port)),
+            "--api-key",
+            api_key,
+            "--upstream-base-url",
+            upstream_base_url.strip(),
+            "--upstream-api-key",
+            upstream_api_key,
+            "--upstream-protocol",
+            upstream_protocol.strip(),
+        ]
+    )
+    for model_id in model_ids:
+        clean_model = str(model_id).strip()
+        if clean_model:
+            command.extend(["--model", clean_model])
     return command
 
 
@@ -1315,6 +1354,92 @@ def ensure_token_pool_backend_ready(
         backend_settings_file=backend_settings_file,
         proxy_settings_file=proxy_settings_file,
     )
+
+
+def start_openai_compatible_backend(
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+    proxy_settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> dict[str, object]:
+    settings = token_pool_settings.load_backend_settings(backend_settings_file)
+    port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
+    health = token_pool_proxy_is_healthy(port)
+    if health:
+        return health
+    upstream_base_url = str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
+    upstream_api_key = str(settings.get("openai_api_key", "")).strip()
+    upstream_protocol = str(settings.get("openai_protocol", "")).strip()
+    model_ids = [str(item).strip() for item in settings.get("openai_models", []) if str(item).strip()]
+    if not upstream_base_url or not upstream_api_key or not upstream_protocol:
+        raise RuntimeError("Save the OpenAI-Compatible API settings before using this backend.")
+    command = build_custom_provider_proxy_command(
+        executable=sys.executable,
+        app_path=str(Path(__file__).resolve()),
+        port=port,
+        api_key=str(settings.get("proxy_api_key", "")),
+        upstream_base_url=upstream_base_url,
+        upstream_api_key=upstream_api_key,
+        upstream_protocol=upstream_protocol,
+        model_ids=model_ids,
+    )
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.Popen(
+        command,
+        cwd=str(APP_DIR),
+        env=build_codex_subprocess_env(settings_file=proxy_settings_file, backend_settings_file=backend_settings_file),
+        creationflags=creationflags,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    save_token_pool_proxy_state(
+        {
+            "pid": proc.pid,
+            "port": port,
+            "backend_mode": token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+            "upstream_protocol": upstream_protocol,
+            "started_at": time.time(),
+        }
+    )
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        health = token_pool_proxy_is_healthy(port)
+        if health:
+            return health
+        return_code = proc.poll()
+        if return_code is not None:
+            output = ""
+            if proc.stdout is not None:
+                try:
+                    output = (proc.stdout.read() or "").strip()
+                except OSError:
+                    output = ""
+            message = f"OpenAI-compatible backend proxy exited early with code {return_code}."
+            if output:
+                message = f"{message} {output}"
+            raise RuntimeError(message)
+        time.sleep(0.2)
+    raise RuntimeError("OpenAI-compatible backend proxy did not become ready.")
+
+
+def ensure_backend_proxy_ready(
+    backend_settings_file: Path = BACKEND_SETTINGS_FILE,
+    proxy_settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> None:
+    settings = token_pool_settings.load_backend_settings(backend_settings_file)
+    mode = settings.get("backend_mode")
+    if mode == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+        start_token_pool_backend(
+            backend_settings_file=backend_settings_file,
+            proxy_settings_file=proxy_settings_file,
+        )
+        return
+    if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        start_openai_compatible_backend(
+            backend_settings_file=backend_settings_file,
+            proxy_settings_file=proxy_settings_file,
+        )
 
 
 def list_windows_process_rows() -> list[dict[str, object]]:
@@ -2400,7 +2525,7 @@ class JobRunner:
             job = self.jobs.get(job_id)
             if job:
                 job["output_file"] = str(output_file)
-        ensure_token_pool_backend_ready(
+        ensure_backend_proxy_ready(
             backend_settings_file=self.backend_settings_file,
             proxy_settings_file=self.proxy_settings_file,
         )
@@ -2460,7 +2585,7 @@ class JobRunner:
             job = self.jobs.get(job_id)
             if job:
                 job["output_file"] = str(output_file)
-        ensure_token_pool_backend_ready(
+        ensure_backend_proxy_ready(
             backend_settings_file=self.backend_settings_file,
             proxy_settings_file=self.proxy_settings_file,
         )
@@ -2970,6 +3095,7 @@ class PortalService:
             "token_count": token_count,
             "openai_base_url": str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip(),
             "openai_model": str(settings.get("openai_model", "")).strip(),
+            "openai_protocol": str(settings.get("openai_protocol", "")).strip(),
             "openai_models": [str(item).strip() for item in openai_models if str(item).strip()] if isinstance(openai_models, list) else [],
             "openai_model_count": len(openai_models) if isinstance(openai_models, list) else 0,
             "has_openai_api_key": bool(str(settings.get("openai_api_key", "")).strip()),
@@ -2993,19 +3119,23 @@ class PortalService:
         )
         resolved_openai_api_key = openai_api_key.strip() or str(current.get("openai_api_key", ""))
         resolved_openai_models = openai_models if openai_models is not None else current.get("openai_models", [])
+        resolved_openai_model = openai_model.strip() or str(current.get("openai_model", ""))
+        resolved_openai_protocol = str(current.get("openai_protocol", ""))
         if (
             backend_mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE
-            and openai_models is None
             and resolved_openai_base_url
             and resolved_openai_api_key
         ):
-            try:
-                resolved_openai_models = token_pool_settings.fetch_openai_compatible_models(
-                    resolved_openai_base_url,
-                    resolved_openai_api_key,
-                )
-            except Exception:
-                resolved_openai_models = current.get("openai_models", [])
+            resolved = token_pool_settings.resolve_openai_compatible_backend_config(
+                resolved_openai_base_url,
+                resolved_openai_api_key,
+                resolved_openai_model,
+            )
+            resolved_openai_base_url = str(resolved.get("openai_base_url", resolved_openai_base_url))
+            resolved_openai_api_key = str(resolved.get("openai_api_key", resolved_openai_api_key))
+            resolved_openai_model = str(resolved.get("openai_model", resolved_openai_model))
+            resolved_openai_models = resolved.get("openai_models", resolved_openai_models)
+            resolved_openai_protocol = str(resolved.get("openai_protocol", resolved_openai_protocol))
         updated = token_pool_settings.save_backend_settings(
             backend_mode=backend_mode,
             settings_file=self.backend_settings_file,
@@ -3014,8 +3144,9 @@ class PortalService:
             proxy_api_key=str(current.get("proxy_api_key", "")),
             openai_base_url=resolved_openai_base_url,
             openai_api_key=resolved_openai_api_key,
-            openai_model=openai_model.strip() or str(current.get("openai_model", "")),
+            openai_model=resolved_openai_model,
             openai_models=resolved_openai_models,
+            openai_protocol=resolved_openai_protocol,
         )
         self.jobs.backend_settings_file = self.backend_settings_file
         return {
@@ -3024,7 +3155,7 @@ class PortalService:
         }
 
     def start_backend_proxy(self) -> dict[str, object]:
-        start_token_pool_backend(
+        ensure_backend_proxy_ready(
             backend_settings_file=self.backend_settings_file,
             proxy_settings_file=self.proxy_settings_file,
         )
@@ -3035,10 +3166,19 @@ class PortalService:
         return self.backend_status_payload()
 
     def restart_backend_proxy(self) -> dict[str, object]:
-        restart_token_pool_backend(
-            backend_settings_file=self.backend_settings_file,
-            proxy_settings_file=self.proxy_settings_file,
-        )
+        settings = token_pool_settings.load_backend_settings(self.backend_settings_file)
+        stop_token_pool_backend()
+        time.sleep(0.2)
+        if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            start_openai_compatible_backend(
+                backend_settings_file=self.backend_settings_file,
+                proxy_settings_file=self.proxy_settings_file,
+            )
+        else:
+            start_token_pool_backend(
+                backend_settings_file=self.backend_settings_file,
+                proxy_settings_file=self.proxy_settings_file,
+            )
         return self.backend_status_payload()
 
     def has_running_jobs(self) -> bool:
@@ -4351,9 +4491,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8765, help="Listen port. Defaults to 8765")
     parser.add_argument("--token", default="", help="Access token. Random if omitted.")
     parser.add_argument("--token-pool-proxy", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--custom-provider-proxy", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--api-key", default="", help=argparse.SUPPRESS)
     parser.add_argument("--token-dir", default="", help=argparse.SUPPRESS)
     parser.add_argument("--upstream-base-url", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--upstream-api-key", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--upstream-protocol", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--model", action="append", default=[], help=argparse.SUPPRESS)
     return parser
 
 
@@ -4371,6 +4515,22 @@ def main(argv: list[str] | None = None) -> int:
         if str(args.upstream_base_url).strip():
             proxy_args.extend(["--upstream-base-url", str(args.upstream_base_url).strip()])
         return token_pool_proxy.main(proxy_args)
+    if args.custom_provider_proxy:
+        proxy_args = [
+            "--port",
+            str(args.port),
+            "--api-key",
+            str(args.api_key),
+            "--upstream-base-url",
+            str(args.upstream_base_url).strip(),
+            "--upstream-api-key",
+            str(args.upstream_api_key),
+            "--upstream-protocol",
+            str(args.upstream_protocol).strip(),
+        ]
+        for model_id in args.model:
+            proxy_args.extend(["--model", str(model_id)])
+        return custom_provider_proxy.main(proxy_args)
     token = resolve_portal_token(args.token)
     portal = PortalService(host=args.host, port=args.port, token=token)
     server = ThreadingHTTPServer((args.host, args.port), PortalHandler)
