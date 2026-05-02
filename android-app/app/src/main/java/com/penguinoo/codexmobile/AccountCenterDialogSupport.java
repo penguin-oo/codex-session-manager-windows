@@ -2,9 +2,11 @@ package com.penguinoo.codexmobile;
 
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -22,10 +24,16 @@ public final class AccountCenterDialogSupport {
         void onSwitch(AccountSlotSummary slot);
         void onRename(AccountSlotSummary slot);
         void onDelete(AccountSlotSummary slot);
-        void onToggleBackendMode(BackendStatusPayload backend);
+        void onUseCodexAuth(BackendStatusPayload backend);
+        void onUseTokenPool(BackendStatusPayload backend);
+        void onConfigureOpenAi(BackendStatusPayload backend);
         void onStartBackend();
         void onStopBackend();
         void onRestartBackend();
+    }
+
+    public interface OpenAiConfigListener {
+        void onSave(String baseUrl, String apiKey, String model);
     }
 
     private enum ButtonTone {
@@ -162,14 +170,27 @@ public final class AccountCenterDialogSupport {
         LinearLayout actions = buildActionGrid(
                 activity,
                 new ActionSpec(
-                        backend.isTokenPoolMode() ? R.string.action_use_current_login : R.string.action_use_token_pool,
+                        R.string.action_use_current_login,
                         view -> {
                             dismiss(dialogRef);
-                            callbacks.onToggleBackendMode(backend);
+                            callbacks.onUseCodexAuth(backend);
                         },
-                        true,
+                        !backend.isCodexAuthMode(),
                         ButtonTone.ACCENT
                 ),
+                new ActionSpec(
+                        R.string.action_use_token_pool,
+                        view -> {
+                            dismiss(dialogRef);
+                            callbacks.onUseTokenPool(backend);
+                        },
+                        !backend.isTokenPoolMode(),
+                        ButtonTone.SOFT
+                ),
+                new ActionSpec(R.string.action_openai_backend, view -> {
+                    dismiss(dialogRef);
+                    callbacks.onConfigureOpenAi(backend);
+                }, true, ButtonTone.SOFT),
                 new ActionSpec(R.string.action_refresh_accounts, view -> {
                     dismiss(dialogRef);
                     callbacks.onRefresh();
@@ -190,6 +211,83 @@ public final class AccountCenterDialogSupport {
         actions.setPadding(0, dp(activity, 12), 0, 0);
         card.addView(actions);
         return card;
+    }
+
+    public static void promptOpenAiBackendConfig(
+            AppCompatActivity activity,
+            BackendStatusPayload backend,
+            OpenAiConfigListener listener
+    ) {
+        ScrollView scrollView = new ScrollView(activity);
+        LinearLayout container = new LinearLayout(activity);
+        container.setOrientation(LinearLayout.VERTICAL);
+        int horizontalPadding = dp(activity, 20);
+        int verticalPadding = dp(activity, 12);
+        container.setPadding(horizontalPadding, verticalPadding, horizontalPadding, 0);
+        scrollView.addView(container, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        TextView hintView = new TextView(activity);
+        hintView.setText(
+                backend.hasOpenAiApiKey
+                        ? R.string.message_openai_backend_hint_saved_key
+                        : R.string.message_openai_backend_hint
+        );
+        container.addView(hintView);
+
+        EditText baseUrlInput = new EditText(activity);
+        baseUrlInput.setHint(R.string.hint_openai_base_url);
+        String initialBaseUrl = backend.openaiBaseUrl == null || backend.openaiBaseUrl.trim().isEmpty()
+                ? "https://api.openai.com/v1"
+                : backend.openaiBaseUrl.trim();
+        baseUrlInput.setText(initialBaseUrl);
+        baseUrlInput.setSelection(baseUrlInput.getText().length());
+        baseUrlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        container.addView(baseUrlInput);
+
+        EditText apiKeyInput = new EditText(activity);
+        apiKeyInput.setHint(backend.hasOpenAiApiKey
+                ? R.string.hint_openai_api_key_keep_saved
+                : R.string.hint_openai_api_key);
+        apiKeyInput.setInputType(
+                InputType.TYPE_CLASS_TEXT
+                        | InputType.TYPE_TEXT_VARIATION_PASSWORD
+                        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        );
+        container.addView(apiKeyInput);
+
+        EditText modelInput = new EditText(activity);
+        modelInput.setHint(R.string.hint_openai_model);
+        String initialModel = backend.openaiModel == null || backend.openaiModel.trim().isEmpty()
+                ? (backend.openaiModels.isEmpty() ? "gpt-5.5" : backend.openaiModels.get(0))
+                : backend.openaiModel.trim();
+        modelInput.setText(initialModel);
+        modelInput.setSelection(modelInput.getText().length());
+        modelInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        container.addView(modelInput);
+
+        if (!backend.openaiModels.isEmpty()) {
+            TextView knownModelsView = new TextView(activity);
+            knownModelsView.setPadding(0, dp(activity, 12), 0, 0);
+            knownModelsView.setText(activity.getString(
+                    R.string.label_openai_known_models,
+                    joinValues(backend.openaiModels)
+            ));
+            container.addView(knownModelsView);
+        }
+
+        new AlertDialog.Builder(activity)
+                .setTitle(R.string.title_openai_backend)
+                .setView(scrollView)
+                .setPositiveButton(R.string.action_save, (dialog, which) -> listener.onSave(
+                        valueOf(baseUrlInput),
+                        valueOf(apiKeyInput),
+                        valueOf(modelInput)
+                ))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
     }
 
     private static View buildEmptySlotsCard(
@@ -473,5 +571,23 @@ public final class AccountCenterDialogSupport {
 
     private static int dp(AppCompatActivity activity, int value) {
         return Math.round(value * activity.getResources().getDisplayMetrics().density);
+    }
+
+    private static String valueOf(EditText input) {
+        return input.getText() == null ? "" : input.getText().toString().trim();
+    }
+
+    private static String joinValues(java.util.List<String> values) {
+        StringBuilder builder = new StringBuilder();
+        for (String value : values) {
+            if (value == null || value.trim().isEmpty()) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(", ");
+            }
+            builder.append(value.trim());
+        }
+        return builder.toString();
     }
 }

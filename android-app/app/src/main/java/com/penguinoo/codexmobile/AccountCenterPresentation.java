@@ -33,6 +33,14 @@ public final class AccountCenterPresentation {
         summary.append("Mode: ").append(mode);
         summary.append("\nProxy: ").append(proxy);
         summary.append("\nToken files: ").append(Math.max(backend.tokenCount, 0));
+        if (backend.isOpenAiCompatibleMode()) {
+            summary.append("\nBase URL: ").append(firstNonBlank(backend.openaiBaseUrl, "https://api.openai.com/v1"));
+            if (!isBlank(backend.openaiModel)) {
+                summary.append("\nModel: ").append(backend.openaiModel.trim());
+            }
+            summary.append("\nDiscovered models: ").append(Math.max(backend.openaiModelCount, 0));
+            summary.append("\nAPI key: ").append(backend.hasOpenAiApiKey ? "configured" : "missing");
+        }
         if (!isBlank(backend.lastError)) {
             summary.append("\n").append(backend.lastError.trim());
         }

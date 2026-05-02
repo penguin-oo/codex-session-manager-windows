@@ -50,16 +50,19 @@ public final class PortalApiClient {
             PortalEndpoint endpoint,
             String backendMode,
             String tokenDir,
-            int proxyPort
+            int proxyPort,
+            String openaiBaseUrl,
+            String openaiApiKey,
+            String openaiModel
     ) throws IOException {
-        JSONObject body = new JSONObject();
-        try {
-            body.put("backend_mode", backendMode);
-            body.put("token_dir", tokenDir);
-            body.put("proxy_port", proxyPort);
-        } catch (JSONException exception) {
-            throw new IOException("Failed to build backend settings request.", exception);
-        }
+        JSONObject body = buildBackendSettingsBody(
+                backendMode,
+                tokenDir,
+                proxyPort,
+                openaiBaseUrl,
+                openaiApiKey,
+                openaiModel
+        );
         JSONObject json = postJson(endpoint, "/api/backend", body);
         return parseBackendStatus(json);
     }
@@ -382,7 +385,7 @@ public final class PortalApiClient {
                 quota == null ? "" : quota.optString("summary"),
                 quota == null ? "" : quota.optString("state"),
                 json.optBoolean("has_running_jobs", false),
-                backend == null ? new BackendStatusPayload("", "", 0, false, "", 0, "") : parseBackendStatus(backend),
+                backend == null ? new BackendStatusPayload("", "", 0, false, "", 0, "", "", 0, false, java.util.Collections.emptyList(), "") : parseBackendStatus(backend),
                 parseAccountSlots(json.optJSONArray("slots"))
         );
     }
@@ -395,8 +398,35 @@ public final class PortalApiClient {
                 json.optBoolean("proxy_running", false),
                 json.optString("proxy_summary"),
                 json.optInt("token_count", 0),
+                json.optString("openai_base_url"),
+                json.optString("openai_model"),
+                json.optInt("openai_model_count", 0),
+                json.optBoolean("has_openai_api_key", false),
+                parseStringList(json.optJSONArray("openai_models")),
                 json.optString("last_error")
         );
+    }
+
+    static JSONObject buildBackendSettingsBody(
+            String backendMode,
+            String tokenDir,
+            int proxyPort,
+            String openaiBaseUrl,
+            String openaiApiKey,
+            String openaiModel
+    ) throws IOException {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("backend_mode", backendMode);
+            body.put("token_dir", tokenDir);
+            body.put("proxy_port", proxyPort);
+            body.put("openai_base_url", openaiBaseUrl);
+            body.put("openai_api_key", openaiApiKey);
+            body.put("openai_model", openaiModel);
+        } catch (JSONException exception) {
+            throw new IOException("Failed to build backend settings request.", exception);
+        }
+        return body;
     }
 
     static PortalProxySettings parseProxySettings(JSONObject json) {

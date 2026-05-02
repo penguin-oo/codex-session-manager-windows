@@ -928,8 +928,18 @@ public final class ChatActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onToggleBackendMode(BackendStatusPayload backend) {
-                toggleBackendMode(backend);
+            public void onUseCodexAuth(BackendStatusPayload backend) {
+                setBackendMode("codex_auth", backend);
+            }
+
+            @Override
+            public void onUseTokenPool(BackendStatusPayload backend) {
+                setBackendMode("built_in_token_pool", backend);
+            }
+
+            @Override
+            public void onConfigureOpenAi(BackendStatusPayload backend) {
+                showOpenAiBackendDialog(backend);
             }
 
             @Override
@@ -1110,15 +1120,63 @@ public final class ChatActivity extends AppCompatActivity {
                 .show();
     }
 
-    private void toggleBackendMode(BackendStatusPayload backend) {
-        String nextMode = backend.isTokenPoolMode() ? "codex_auth" : "built_in_token_pool";
+    private void setBackendMode(String nextMode, BackendStatusPayload backend) {
         int proxyPort = backend.proxyPort > 0 ? backend.proxyPort : 8317;
         showBanner(getString(R.string.banner_loading_backend));
         executor.execute(() -> {
             try {
-                apiClient.saveBackendStatus(endpoint, nextMode, backend.tokenDir, proxyPort);
+                apiClient.saveBackendStatus(endpoint, nextMode, backend.tokenDir, proxyPort, "", "", "");
                 runOnUiThread(() -> {
                     showBanner(getString(R.string.banner_backend_mode_saved, nextMode));
+                    showAccountsDialog();
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> showBanner(exception.getMessage()));
+            }
+        });
+    }
+
+    private void showOpenAiBackendDialog(BackendStatusPayload backend) {
+        AccountCenterDialogSupport.promptOpenAiBackendConfig(this, backend, (baseUrl, apiKey, model) ->
+                saveOpenAiBackendSettings(backend, baseUrl, apiKey, model)
+        );
+    }
+
+    private void saveOpenAiBackendSettings(
+            BackendStatusPayload backend,
+            String baseUrl,
+            String apiKey,
+            String model
+    ) {
+        String normalizedBaseUrl = baseUrl == null ? "" : baseUrl.trim();
+        String normalizedModel = model == null ? "" : model.trim();
+        if (normalizedBaseUrl.isEmpty()) {
+            showBanner(getString(R.string.hint_openai_base_url));
+            return;
+        }
+        if (!backend.hasOpenAiApiKey && (apiKey == null || apiKey.trim().isEmpty())) {
+            showBanner(getString(R.string.hint_openai_api_key));
+            return;
+        }
+        if (normalizedModel.isEmpty()) {
+            showBanner(getString(R.string.hint_openai_model));
+            return;
+        }
+        int proxyPort = backend.proxyPort > 0 ? backend.proxyPort : 8317;
+        showBanner(getString(R.string.banner_loading_backend));
+        executor.execute(() -> {
+            try {
+                apiClient.saveBackendStatus(
+                        endpoint,
+                        "openai_compatible",
+                        backend.tokenDir,
+                        proxyPort,
+                        normalizedBaseUrl,
+                        apiKey == null ? "" : apiKey.trim(),
+                        normalizedModel
+                );
+                runOnUiThread(() -> {
+                    showBanner(getString(R.string.banner_openai_backend_saved));
                     showAccountsDialog();
                 });
             } catch (Exception exception) {

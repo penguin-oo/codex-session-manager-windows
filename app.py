@@ -223,6 +223,30 @@ def build_openai_compatible_provider_override_args(
     ]
 
 
+def save_openai_compatible_backend_settings(
+    *,
+    settings_file: Path = token_pool_settings.DEFAULT_SETTINGS_FILE,
+    token_dir: Path = token_pool_settings.DEFAULT_TOKEN_POOL_DIR,
+    proxy_port: int = token_pool_settings.DEFAULT_PROXY_PORT,
+    proxy_api_key: str = "",
+    base_url: str = token_pool_settings.DEFAULT_OPENAI_BASE_URL,
+    api_key: str = "",
+    model: str = "",
+    discovered_models: object = None,
+) -> dict[str, object]:
+    return token_pool_settings.save_backend_settings(
+        backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+        settings_file=settings_file,
+        token_dir=token_dir,
+        proxy_port=proxy_port,
+        proxy_api_key=proxy_api_key,
+        openai_base_url=base_url,
+        openai_api_key=api_key,
+        openai_model=model,
+        openai_models=[] if discovered_models is None else discovered_models,
+    )
+
+
 def build_token_pool_proxy_command(
     *,
     executable: str,
@@ -1725,17 +1749,18 @@ class SessionManagerApp:
                     fetch_error = str(exc)
             if discovered_models and (not selected_model or selected_model not in discovered_models):
                 selected_model = discovered_models[0]
-            updated = token_pool_settings.save_backend_settings(
-                backend_mode=backend_mode_var.get(),
+            updated = save_openai_compatible_backend_settings(
+                settings_file=token_pool_settings.DEFAULT_SETTINGS_FILE,
                 token_dir=token_dir,
                 proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
                 proxy_api_key=str(settings.get("proxy_api_key", "")),
-                openai_base_url=base_url,
-                openai_api_key=api_key,
-                openai_model=selected_model,
-                openai_models=discovered_models,
+                base_url=base_url,
+                api_key=api_key,
+                model=selected_model,
+                discovered_models=discovered_models,
             )
             self.backend_settings = updated
+            backend_mode_var.set(token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE)
             self.available_models = self._load_available_models()
             self._render_models()
             refresh_token_pool_section()

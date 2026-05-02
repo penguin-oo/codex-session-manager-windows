@@ -17,7 +17,7 @@ public final class AccountCenterPresentationTest {
                 "Weekly quota: 76% used",
                 "ok",
                 false,
-                new BackendStatusPayload("codex_auth", "", 0, false, "", 0, ""),
+                new BackendStatusPayload("codex_auth", "", 0, false, "", 0, "", "", 0, false, java.util.Collections.emptyList(), ""),
                 java.util.Collections.emptyList()
         );
 
@@ -80,5 +80,40 @@ public final class AccountCenterPresentationTest {
 
         assertEquals("b@example.com\nMode: chatgpt\nActive now", summary);
         assertTrue(AccountCenterPresentation.canSwitch(slot));
+    }
+
+    @Test
+    public void backendSummary_highlightsOpenAiConfiguration() {
+        BackendStatusPayload backend = new BackendStatusPayload(
+                "openai_compatible",
+                "",
+                0,
+                false,
+                "stopped",
+                0,
+                "https://api.openai.com/v1",
+                "gpt-5.5",
+                2,
+                true,
+                java.util.Arrays.asList("gpt-5.5", "gpt-4.1"),
+                ""
+        );
+
+        String summary = AccountCenterPresentation.backendSummary(
+                backend,
+                "running",
+                "stopped"
+        );
+
+        assertEquals(
+                "Mode: openai_compatible\n" +
+                        "Proxy: stopped\n" +
+                        "Token files: 0\n" +
+                        "Base URL: https://api.openai.com/v1\n" +
+                        "Model: gpt-5.5\n" +
+                        "Discovered models: 2\n" +
+                        "API key: configured",
+                summary
+        );
     }
 }

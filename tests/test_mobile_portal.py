@@ -1483,6 +1483,7 @@ class PortalAccountSlotsTests(unittest.TestCase):
         self.assertEqual("openai_compatible", payload["backend_mode"])
         self.assertEqual("https://api.openai.com/v1", payload["openai_base_url"])
         self.assertEqual("gpt-5.5", payload["openai_model"])
+        self.assertEqual(["gpt-5.5", "gpt-5.4"], payload["openai_models"])
         self.assertEqual(2, payload["openai_model_count"])
         self.assertTrue(payload["has_openai_api_key"])
 
@@ -1510,6 +1511,32 @@ class PortalAccountSlotsTests(unittest.TestCase):
         self.assertEqual("sk-test", loaded["openai_api_key"])
         self.assertEqual("gpt-5.5", loaded["openai_model"])
         self.assertEqual(["gpt-5.5", "gpt-5.4"], loaded["openai_models"])
+
+    def test_update_backend_settings_fetches_openai_models_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            service.backend_settings_file = backend_settings_path
+
+            with mock.patch.object(
+                token_pool_settings,
+                "fetch_openai_compatible_models",
+                return_value=["gpt-5.5", "gpt-4.1"],
+            ) as fetch_openai_models:
+                updated = service.update_backend_settings(
+                    backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                    token_dir=str(Path(temp_dir) / "tokens"),
+                    proxy_port=8456,
+                    openai_base_url="https://api.openai.com/v1",
+                    openai_api_key="sk-test",
+                    openai_model="gpt-5.5",
+                )
+
+            loaded = token_pool_settings.load_backend_settings(backend_settings_path)
+
+        fetch_openai_models.assert_called_once_with("https://api.openai.com/v1", "sk-test")
+        self.assertEqual(["gpt-5.5", "gpt-4.1"], loaded["openai_models"])
+        self.assertEqual(["gpt-5.5", "gpt-4.1"], updated["openai_models"])
 
 
 class PortalFileShareTests(unittest.TestCase):
@@ -1717,6 +1744,38 @@ class PortalBrowserControlTests(unittest.TestCase):
 
         portal.login_and_bind_account.assert_called_once_with("slot-9")
         send_json.assert_called_once_with({"active_slot": "slot-9"})
+
+    def test_do_post_backend_dispatches_openai_compatible_fields(self) -> None:
+        portal = SimpleNamespace(
+            token="token",
+            update_backend_settings=mock.Mock(return_value={"backend_mode": "openai_compatible"}),
+        )
+        handler = self._make_handler(path="/api/backend?token=token", portal=portal)
+
+        with mock.patch.object(
+            handler,
+            "_read_json_body",
+            return_value={
+                "backend_mode": "openai_compatible",
+                "token_dir": r"C:\tokens",
+                "proxy_port": 8317,
+                "openai_base_url": "https://api.openai.com/v1",
+                "openai_api_key": "sk-test",
+                "openai_model": "gpt-5.5",
+            },
+        ), mock.patch.object(handler, "_send_json") as send_json:
+            handler.do_POST()
+
+        portal.update_backend_settings.assert_called_once_with(
+            backend_mode="openai_compatible",
+            token_dir=r"C:\tokens",
+            proxy_port=8317,
+            openai_base_url="https://api.openai.com/v1",
+            openai_api_key="sk-test",
+            openai_model="gpt-5.5",
+            openai_models=None,
+        )
+        send_json.assert_called_once_with({"backend_mode": "openai_compatible"})
 
 
 class ResumeArgsTests(unittest.TestCase):

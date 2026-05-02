@@ -2970,6 +2970,7 @@ class PortalService:
             "token_count": token_count,
             "openai_base_url": str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip(),
             "openai_model": str(settings.get("openai_model", "")).strip(),
+            "openai_models": [str(item).strip() for item in openai_models if str(item).strip()] if isinstance(openai_models, list) else [],
             "openai_model_count": len(openai_models) if isinstance(openai_models, list) else 0,
             "has_openai_api_key": bool(str(settings.get("openai_api_key", "")).strip()),
             "last_error": "",
@@ -2987,16 +2988,34 @@ class PortalService:
     ) -> dict[str, object]:
         current = token_pool_settings.load_backend_settings(self.backend_settings_file)
         token_dir_path = Path(token_dir.strip() or str(current.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
+        resolved_openai_base_url = openai_base_url.strip() or str(
+            current.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)
+        )
+        resolved_openai_api_key = openai_api_key.strip() or str(current.get("openai_api_key", ""))
+        resolved_openai_models = openai_models if openai_models is not None else current.get("openai_models", [])
+        if (
+            backend_mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE
+            and openai_models is None
+            and resolved_openai_base_url
+            and resolved_openai_api_key
+        ):
+            try:
+                resolved_openai_models = token_pool_settings.fetch_openai_compatible_models(
+                    resolved_openai_base_url,
+                    resolved_openai_api_key,
+                )
+            except Exception:
+                resolved_openai_models = current.get("openai_models", [])
         updated = token_pool_settings.save_backend_settings(
             backend_mode=backend_mode,
             settings_file=self.backend_settings_file,
             token_dir=token_dir_path,
             proxy_port=proxy_port,
             proxy_api_key=str(current.get("proxy_api_key", "")),
-            openai_base_url=openai_base_url.strip() or str(current.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)),
-            openai_api_key=openai_api_key.strip() or str(current.get("openai_api_key", "")),
+            openai_base_url=resolved_openai_base_url,
+            openai_api_key=resolved_openai_api_key,
             openai_model=openai_model.strip() or str(current.get("openai_model", "")),
-            openai_models=openai_models if openai_models is not None else current.get("openai_models", []),
+            openai_models=resolved_openai_models,
         )
         self.jobs.backend_settings_file = self.backend_settings_file
         return {
@@ -4154,6 +4173,10 @@ class PortalHandler(BaseHTTPRequestHandler):
                     backend_mode=str(payload.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)),
                     token_dir=str(payload.get("token_dir", "")),
                     proxy_port=int(payload.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+                    openai_base_url=str(payload.get("openai_base_url", "")),
+                    openai_api_key=str(payload.get("openai_api_key", "")),
+                    openai_model=str(payload.get("openai_model", "")),
+                    openai_models=payload.get("openai_models") if isinstance(payload.get("openai_models"), list) else None,
                 )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)

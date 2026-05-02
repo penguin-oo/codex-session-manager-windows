@@ -213,6 +213,38 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual("gpt-5.5", loaded["openai_model"])
         self.assertEqual(["gpt-5.5", "gpt-5.4"], loaded["openai_models"])
 
+    def test_save_openai_compatible_backend_settings_forces_openai_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "token_pool_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            token_dir.mkdir()
+            app.token_pool_settings.save_backend_settings(
+                app.token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                settings_file=settings_file,
+                token_dir=token_dir,
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+            )
+
+            updated = app.save_openai_compatible_backend_settings(
+                settings_file=settings_file,
+                token_dir=token_dir,
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                base_url="https://api.openai.com/v1",
+                api_key="sk-test",
+                model="gpt-5.5",
+                discovered_models=["gpt-5.5", "gpt-5.4"],
+            )
+            reloaded = app.token_pool_settings.load_backend_settings(settings_file)
+
+        self.assertEqual(app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE, updated["backend_mode"])
+        self.assertEqual(app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE, reloaded["backend_mode"])
+        self.assertEqual("https://api.openai.com/v1", reloaded["openai_base_url"])
+        self.assertEqual("sk-test", reloaded["openai_api_key"])
+        self.assertEqual("gpt-5.5", reloaded["openai_model"])
+        self.assertEqual(["gpt-5.5", "gpt-5.4"], reloaded["openai_models"])
+
     def test_load_available_models_prefers_openai_compatible_cache_when_backend_enabled(self) -> None:
         manager = object.__new__(app.SessionManagerApp)
         manager.backend_settings = {
