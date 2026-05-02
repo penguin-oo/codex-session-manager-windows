@@ -311,6 +311,72 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertEqual(app.token_pool_settings.BACKEND_MODE_CODEX_AUTH, reloaded["backend_mode"])
 
+    def test_apply_backend_mode_settings_preserves_openai_protocol_for_other_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "token_pool_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            token_dir.mkdir()
+
+            updated = app.apply_backend_mode_settings(
+                backend_mode=app.token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                settings_file=settings_file,
+                token_dir=token_dir,
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://token-plan-sgp.xiaomimimo.com/v1",
+                openai_api_key="tp-test",
+                openai_model="mimo-v2-omni",
+                openai_models=["mimo-v2-omni", "mimo-v2-pro"],
+                openai_protocol="chat_completions",
+            )
+            reloaded = app.token_pool_settings.load_backend_settings(settings_file)
+
+        self.assertEqual(app.token_pool_settings.BACKEND_MODE_CODEX_AUTH, updated["backend_mode"])
+        self.assertEqual("chat_completions", reloaded["openai_protocol"])
+        self.assertEqual("tp-test", reloaded["openai_api_key"])
+
+    def test_apply_backend_mode_settings_uses_openai_save_flow_when_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "token_pool_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            token_dir.mkdir()
+
+            with mock.patch.object(
+                app,
+                "save_openai_compatible_backend_settings",
+                return_value={
+                    "backend_mode": app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                    "openai_base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
+                    "openai_api_key": "tp-test",
+                    "openai_model": "mimo-v2-omni",
+                    "openai_models": ["mimo-v2-omni", "mimo-v2-pro"],
+                    "openai_protocol": "chat_completions",
+                },
+            ) as save_openai:
+                updated = app.apply_backend_mode_settings(
+                    backend_mode=app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                    settings_file=settings_file,
+                    token_dir=token_dir,
+                    proxy_port=8317,
+                    proxy_api_key="pool-api-key",
+                    openai_base_url="https://token-plan-sgp.xiaomimimo.com/v1",
+                    openai_api_key="tp-test",
+                    openai_model="mimo-v2-omni",
+                    openai_models=["mimo-v2-omni"],
+                    openai_protocol="",
+                )
+
+        self.assertEqual(app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE, updated["backend_mode"])
+        save_openai.assert_called_once_with(
+            settings_file=settings_file,
+            token_dir=token_dir,
+            proxy_port=8317,
+            proxy_api_key="pool-api-key",
+            base_url="https://token-plan-sgp.xiaomimimo.com/v1",
+            api_key="tp-test",
+            model="mimo-v2-omni",
+        )
+
     def test_load_available_models_prefers_openai_compatible_cache_when_backend_enabled(self) -> None:
         manager = object.__new__(app.SessionManagerApp)
         manager.backend_settings = {

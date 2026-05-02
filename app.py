@@ -253,6 +253,44 @@ def save_openai_compatible_backend_settings(
     )
 
 
+def apply_backend_mode_settings(
+    *,
+    backend_mode: str,
+    settings_file: Path = token_pool_settings.DEFAULT_SETTINGS_FILE,
+    token_dir: Path = token_pool_settings.DEFAULT_TOKEN_POOL_DIR,
+    proxy_port: int = token_pool_settings.DEFAULT_PROXY_PORT,
+    proxy_api_key: str = "",
+    openai_base_url: str = token_pool_settings.DEFAULT_OPENAI_BASE_URL,
+    openai_api_key: str = "",
+    openai_model: str = "",
+    openai_models: list[str] | tuple[str, ...] = (),
+    openai_protocol: str = "",
+) -> dict[str, object]:
+    clean_mode = str(backend_mode).strip() or token_pool_settings.BACKEND_MODE_CODEX_AUTH
+    if clean_mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        return save_openai_compatible_backend_settings(
+            settings_file=settings_file,
+            token_dir=token_dir,
+            proxy_port=proxy_port,
+            proxy_api_key=proxy_api_key,
+            base_url=openai_base_url,
+            api_key=openai_api_key,
+            model=openai_model,
+        )
+    return token_pool_settings.save_backend_settings(
+        backend_mode=clean_mode,
+        settings_file=settings_file,
+        token_dir=token_dir,
+        proxy_port=proxy_port,
+        proxy_api_key=proxy_api_key,
+        openai_base_url=openai_base_url,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        openai_models=list(openai_models),
+        openai_protocol=openai_protocol,
+    )
+
+
 def build_token_pool_proxy_command(
     *,
     executable: str,
@@ -1822,17 +1860,25 @@ class SessionManagerApp:
         def apply_backend_mode() -> None:
             settings = self._token_pool_settings()
             token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
-            updated = token_pool_settings.save_backend_settings(
-                backend_mode=backend_mode_var.get(),
-                token_dir=token_dir,
-                proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
-                proxy_api_key=str(settings.get("proxy_api_key", "")),
-                openai_base_url=openai_base_url_var.get(),
-                openai_api_key=openai_api_key_var.get(),
-                openai_model=openai_model_var.get(),
-                openai_models=settings.get("openai_models", []),
-            )
+            try:
+                updated = apply_backend_mode_settings(
+                    backend_mode=backend_mode_var.get(),
+                    settings_file=token_pool_settings.DEFAULT_SETTINGS_FILE,
+                    token_dir=token_dir,
+                    proxy_port=int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+                    proxy_api_key=str(settings.get("proxy_api_key", "")),
+                    openai_base_url=openai_base_url_var.get(),
+                    openai_api_key=openai_api_key_var.get(),
+                    openai_model=openai_model_var.get(),
+                    openai_models=settings.get("openai_models", []),
+                    openai_protocol=str(settings.get("openai_protocol", "")),
+                )
+            except Exception as exc:
+                messagebox.showerror("Backend Mode", str(exc), parent=dialog)
+                return
             self.backend_settings = updated
+            self.available_models = self._load_available_models()
+            self._render_models()
             refresh_token_pool_section()
             self.status_var.set(f"Auth backend set to {updated.get('backend_mode')}")
 
