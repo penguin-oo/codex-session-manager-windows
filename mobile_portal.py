@@ -29,6 +29,7 @@ from urllib import request as url_request
 
 import token_pool_proxy
 import token_pool_settings
+import session_context_repair
 
 try:
     import tomllib
@@ -2630,6 +2631,14 @@ class JobRunner:
             backend_settings_file=self.backend_settings_file,
             proxy_settings_file=self.proxy_settings_file,
         )
+        find_session_file = getattr(self.data_store, "find_session_file", None)
+        session_file = find_session_file(session_id) if callable(find_session_file) else ""
+        if session_file:
+            session_context_repair.compact_oversized_session_file(
+                session_id,
+                Path(session_file),
+                HISTORY_FILE,
+            )
         args = build_resume_args(
             output_file,
             session_id,

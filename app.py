@@ -9,6 +9,7 @@ import tomllib
 import tkinter as tk
 import auth_slots
 import custom_provider_proxy
+import session_context_repair
 import token_pool_proxy
 import token_pool_settings
 from dataclasses import dataclass, replace
@@ -1502,6 +1503,12 @@ class SessionManagerApp:
         return configured_model or DEFAULT_PRIMARY_MODEL
 
     def _build_codex_resume_args(self, item: SessionItem) -> list[str]:
+        if item.session_file:
+            session_context_repair.compact_oversized_session_file(
+                item.session_id,
+                Path(item.session_file),
+                HISTORY_FILE,
+            )
         args: list[str] = ["codex.cmd", "resume", item.session_id]
         args.extend(self._build_codex_override_args())
         if self._is_openai_compatible_backend_enabled():
