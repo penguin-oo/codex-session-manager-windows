@@ -1365,8 +1365,21 @@ class PortalAccountSlotsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             store = mobile_portal.CodexDataStore()
+            default_backend = token_pool_settings._build_backend_payload(
+                backend_mode=token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+                token_dir=str(Path(temp_dir) / "tokens"),
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="",
+                openai_model="",
+                openai_models=[],
+                openai_protocol="",
+            )
+            default_backend_path = Path(temp_dir) / "token_pool_settings.json"
+            default_backend_path.write_text(json.dumps(default_backend, ensure_ascii=False), encoding="utf-8")
 
-            with mock.patch.object(mobile_portal, "MODELS_CACHE_FILE", models_path):
+            with mock.patch.object(mobile_portal, "MODELS_CACHE_FILE", models_path), mock.patch.object(mobile_portal, "BACKEND_SETTINGS_FILE", default_backend_path):
                 models = store.load_available_models()
 
         self.assertEqual(
@@ -1374,7 +1387,7 @@ class PortalAccountSlotsTests(unittest.TestCase):
             models,
         )
 
-    def test_load_available_models_prefers_openai_compatible_cache_when_backend_enabled(self) -> None:
+    def test_load_available_models_uses_exact_openai_compatible_models_when_backend_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
             token_pool_settings.save_backend_settings(
@@ -1385,8 +1398,8 @@ class PortalAccountSlotsTests(unittest.TestCase):
                 proxy_api_key="pool-api-key",
                 openai_base_url="https://api.openai.com/v1",
                 openai_api_key="sk-test",
-                openai_model="gpt-5.5",
-                openai_models=["gpt-5.5", "gpt-4.1"],
+                openai_model="mimo-v2.5-pro",
+                openai_models=["mimo-v2.5-pro", "mimo-v2-pro"],
             )
             store = mobile_portal.CodexDataStore()
 
@@ -1394,7 +1407,7 @@ class PortalAccountSlotsTests(unittest.TestCase):
                  mock.patch.object(mobile_portal, "MODELS_CACHE_FILE", Path(temp_dir) / "missing-models-cache.json"):
                 models = store.load_available_models()
 
-        self.assertEqual(["gpt-5.5", "gpt-4.1", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5"], models)
+        self.assertEqual(["mimo-v2.5-pro", "mimo-v2-pro"], models)
 
     def test_account_slots_payload_includes_backend_status(self) -> None:
         service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
@@ -1434,13 +1447,46 @@ class PortalAccountSlotsTests(unittest.TestCase):
             )
             service.backend_settings_file = backend_settings_path
 
-            with mock.patch.object(mobile_portal, "token_pool_proxy_is_healthy", return_value=True):
+            with mock.patch.object(
+                mobile_portal,
+                "token_pool_proxy_is_healthy",
+                return_value={"status": "ok", "backend_mode": "built_in_token_pool", "port": 8317},
+            ):
                 payload = service.backend_status_payload()
 
         self.assertEqual("built_in_token_pool", payload["backend_mode"])
         self.assertEqual(8317, payload["proxy_port"])
         self.assertTrue(payload["proxy_running"])
         self.assertEqual(2, payload["token_count"])
+
+    def test_backend_status_payload_ignores_proxy_from_other_backend_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-test",
+                openai_model="mimo-v2.5-pro",
+                openai_models=["mimo-v2.5-pro"],
+                openai_protocol="chat_completions",
+            )
+            service.backend_settings_file = backend_settings_path
+
+            with mock.patch.object(
+                mobile_portal,
+                "token_pool_proxy_is_healthy",
+                return_value={"status": "ok", "backend_mode": "openai_compatible", "port": 8317},
+            ):
+                payload = service.backend_status_payload()
+
+        self.assertEqual("codex_auth", payload["backend_mode"])
+        self.assertFalse(payload["proxy_running"])
+        self.assertEqual("stopped", payload["proxy_summary"])
 
     def test_update_backend_settings_persists_and_returns_backend_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1460,6 +1506,34 @@ class PortalAccountSlotsTests(unittest.TestCase):
         self.assertEqual(token_pool_settings.BACKEND_MODE_TOKEN_POOL, updated["backend_mode"])
         self.assertEqual(8456, loaded["proxy_port"])
         self.assertEqual(str(token_dir), loaded["token_dir"])
+
+    def test_update_backend_settings_stops_proxy_when_switching_to_codex_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_dir = Path(temp_dir) / "tokens"
+            service.backend_settings_file = backend_settings_path
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                settings_file=backend_settings_path,
+                token_dir=token_dir,
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-test",
+                openai_model="mimo-v2.5-pro",
+                openai_models=["mimo-v2.5-pro"],
+                openai_protocol="chat_completions",
+            )
+
+            with mock.patch.object(mobile_portal, "stop_token_pool_backend") as stop_backend:
+                service.update_backend_settings(
+                    backend_mode=token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                    token_dir=str(token_dir),
+                    proxy_port=8317,
+                )
+
+        stop_backend.assert_called_once()
 
     def test_backend_status_payload_reports_openai_compatible_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1867,6 +1941,63 @@ class ResumeArgsTests(unittest.TestCase):
 
         self.assertEqual(["resume", "-i", "photo.png", "session-1"], args[-4:])
 
+    def test_build_resume_args_openai_compatible_replaces_stale_codex_model_with_saved_endpoint_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-test",
+                openai_model="mimo-v2.5-pro",
+                openai_models=["mimo-v2.5-pro", "mimo-v2-pro"],
+                openai_protocol="chat_completions",
+            )
+
+            args = mobile_portal.build_resume_args(
+                output_file=Path("out.txt"),
+                session_id="session-1",
+                prompt="hello",
+                model="gpt-5.5",
+                sandbox="default",
+                approval="default",
+                reasoning_effort="default",
+                backend_settings_file=backend_settings_path,
+            )
+
+        self.assertEqual("mimo-v2.5-pro", args[args.index("-m") + 1])
+
+    def test_build_new_chat_args_openai_compatible_keeps_selected_endpoint_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+                openai_base_url="https://api.openai.com/v1",
+                openai_api_key="sk-test",
+                openai_model="mimo-v2.5-pro",
+                openai_models=["mimo-v2.5-pro", "mimo-v2-pro"],
+                openai_protocol="chat_completions",
+            )
+
+            args = mobile_portal.build_new_chat_args(
+                output_file=Path("out.txt"),
+                prompt="hello",
+                model="mimo-v2-pro",
+                sandbox="default",
+                approval="default",
+                reasoning_effort="default",
+                backend_settings_file=backend_settings_path,
+            )
+
+        self.assertEqual("mimo-v2-pro", args[args.index("-m") + 1])
+
     def test_build_new_chat_args_uses_stdin_marker_for_prompt_text(self) -> None:
         args = mobile_portal.build_new_chat_args(
             output_file=Path("out.txt"),
@@ -1947,6 +2078,62 @@ class ProxyEnvTests(unittest.TestCase):
 
 
 class TokenPoolBackendStartupTests(unittest.TestCase):
+    def test_backend_health_matches_requires_expected_backend_mode(self) -> None:
+        self.assertTrue(
+            mobile_portal.backend_health_matches(
+                {"status": "ok", "backend_mode": token_pool_settings.BACKEND_MODE_TOKEN_POOL},
+                token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+            )
+        )
+        self.assertFalse(
+            mobile_portal.backend_health_matches(
+                {"status": "ok", "backend_mode": token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE},
+                token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+            )
+        )
+        self.assertFalse(
+            mobile_portal.backend_health_matches(
+                {"status": "ok"},
+                token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+            )
+        )
+
+    def test_run_taskkill_tree_silently_discards_taskkill_console_output(self) -> None:
+        completed = subprocess.CompletedProcess(["taskkill"], 0)
+        with mock.patch.object(mobile_portal.subprocess, "run", return_value=completed) as run:
+            result = mobile_portal.run_taskkill_tree_silently(123)
+
+        self.assertTrue(result)
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "123", "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+
+    def test_restart_backend_proxy_codex_auth_only_stops_existing_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = mobile_portal.PortalService("127.0.0.1", 8765, "token")
+            backend_settings_path = Path(temp_dir) / "token_pool_settings.json"
+            token_pool_settings.save_backend_settings(
+                token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                settings_file=backend_settings_path,
+                token_dir=Path(temp_dir) / "tokens",
+                proxy_port=8317,
+                proxy_api_key="pool-api-key",
+            )
+            service.backend_settings_file = backend_settings_path
+
+            with mock.patch.object(mobile_portal, "stop_token_pool_backend") as stop_backend, \
+                 mock.patch.object(mobile_portal, "start_token_pool_backend") as start_token_backend, \
+                 mock.patch.object(mobile_portal, "start_openai_compatible_backend") as start_openai_backend:
+                service.restart_backend_proxy()
+
+        stop_backend.assert_called_once()
+        start_token_backend.assert_not_called()
+        start_openai_backend.assert_not_called()
+
     def test_build_token_pool_proxy_command_falls_back_to_current_python_when_conda_env_missing(self) -> None:
         with mock.patch.object(mobile_portal.shutil, "which", return_value="C:\Miniconda\Scripts\conda.exe"), \
              mock.patch.object(mobile_portal, "conda_env_available", return_value=False):

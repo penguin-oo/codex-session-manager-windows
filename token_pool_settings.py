@@ -12,6 +12,7 @@ USERPROFILE = Path(os.environ.get('USERPROFILE', ''))
 CODEX_HOME = USERPROFILE / '.codex'
 DEFAULT_TOKEN_POOL_DIR = USERPROFILE / '.cli-proxy-api'
 DEFAULT_SETTINGS_FILE = CODEX_HOME / 'token_pool_settings.json'
+DEFAULT_MODELS_CACHE_FILE = CODEX_HOME / 'models_cache.json'
 DEFAULT_PROXY_PORT = 8317
 BACKEND_MODE_CODEX_AUTH = 'codex_auth'
 BACKEND_MODE_TOKEN_POOL = 'built_in_token_pool'
@@ -29,6 +30,7 @@ VALID_BACKEND_MODES = {
     BACKEND_MODE_TOKEN_POOL,
     BACKEND_MODE_OPENAI_COMPATIBLE,
 }
+MODEL_METADATA_SOURCE_SLUG = 'gpt-5.5'
 
 
 def _normalize_openai_models(raw_models: object) -> list[str]:
@@ -43,6 +45,69 @@ def _normalize_openai_models(raw_models: object) -> list[str]:
         seen.add(clean)
         unique.append(clean)
     return unique
+
+
+def ensure_openai_compatible_model_metadata(
+    model_ids: Iterable[str],
+    *,
+    models_cache_file: Path = DEFAULT_MODELS_CACHE_FILE,
+    source_slug: str = MODEL_METADATA_SOURCE_SLUG,
+) -> bool:
+    """Add synthetic Codex model metadata for OpenAI-compatible model ids."""
+    clean_model_ids = _normalize_openai_models([str(model_id).strip() for model_id in model_ids if str(model_id).strip()])
+    if not clean_model_ids or not models_cache_file.exists():
+        return False
+    try:
+        payload = json.loads(models_cache_file.read_text(encoding='utf-8'))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    models = payload.get('models')
+    if not isinstance(models, list):
+        return False
+
+    existing_slugs = {
+        str(model.get('slug', '')).strip()
+        for model in models
+        if isinstance(model, dict) and str(model.get('slug', '')).strip()
+    }
+    source = next(
+        (
+            model
+            for model in models
+            if isinstance(model, dict) and str(model.get('slug', '')).strip() == source_slug
+        ),
+        None,
+    )
+    if source is None:
+        source = next((model for model in models if isinstance(model, dict) and str(model.get('slug', '')).strip()), None)
+    if source is None:
+        return False
+
+    changed = False
+    for model_id in clean_model_ids:
+        if model_id in existing_slugs:
+            continue
+        cloned = json.loads(json.dumps(source, ensure_ascii=False))
+        cloned['slug'] = model_id
+        cloned['display_name'] = model_id
+        cloned['description'] = 'OpenAI-compatible model routed through the local Codex provider.'
+        cloned['visibility'] = 'list'
+        cloned['supported_in_api'] = True
+        cloned['priority'] = int(cloned.get('priority', 1000) or 1000) + 1000
+        models.append(cloned)
+        existing_slugs.add(model_id)
+        changed = True
+    if not changed:
+        return False
+
+    try:
+        models_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        models_cache_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    except OSError:
+        return False
+    return True
 
 
 def _build_backend_payload(

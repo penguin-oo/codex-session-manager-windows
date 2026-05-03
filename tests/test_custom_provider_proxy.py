@@ -5,6 +5,22 @@ import custom_provider_proxy
 
 
 class CustomProviderProxyTranslationTests(unittest.TestCase):
+    def test_build_health_payload_reports_openai_compatible_backend_mode(self) -> None:
+        proxy = custom_provider_proxy.CustomProviderProxyApp(
+            local_api_key="local-proxy-key",
+            proxy_port=8317,
+            upstream_base_url="https://api.openai.com/v1",
+            upstream_api_key="sk-test",
+            upstream_protocol="chat_completions",
+            model_ids=["mimo-v2.5-pro"],
+        )
+
+        payload = proxy.build_health_payload()
+
+        self.assertEqual("ok", payload["status"])
+        self.assertEqual("openai_compatible", payload["backend_mode"])
+        self.assertEqual(8317, payload["port"])
+
     def test_translate_responses_request_to_chat_completions_includes_instructions_and_text(self) -> None:
         payload = {
             "model": "mimo-v2-pro",

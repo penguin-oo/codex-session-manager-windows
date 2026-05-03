@@ -314,6 +314,7 @@ class TokenPoolProxyApp:
     def build_health_payload(self) -> dict[str, object]:
         return {
             'status': 'ok',
+            'backend_mode': 'built_in_token_pool',
             'token_count': len(self.pool.states()),
             'port': self.proxy_port,
         }

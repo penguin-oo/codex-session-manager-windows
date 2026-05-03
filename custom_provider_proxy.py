@@ -151,6 +151,40 @@ def _tool_definition_to_chat_tool(item: dict[str, object]) -> dict[str, object] 
     return {"type": "function", "function": function_payload}
 
 
+def normalize_chat_completion_usage(usage: object) -> dict[str, object]:
+    if not isinstance(usage, dict):
+        return {
+            "input_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 0,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 0,
+        }
+
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+
+    prompt_details = usage.get("prompt_tokens_details", {})
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    completion_details = usage.get("completion_tokens_details", {})
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+
+    return {
+        "input_tokens": prompt_tokens,
+        "input_tokens_details": {
+            "cached_tokens": int(prompt_details.get("cached_tokens", 0) or 0),
+        },
+        "output_tokens": completion_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": int(completion_details.get("reasoning_tokens", 0) or 0),
+        },
+        "total_tokens": total_tokens,
+    }
+
+
 def translate_responses_request_to_chat_completions(payload: dict[str, object]) -> dict[str, object]:
     translated: dict[str, object] = {
         "model": str(payload.get("model", "")).strip(),
@@ -274,7 +308,7 @@ def translate_chat_completion_to_responses_output(completion: dict[str, object])
         "model": str(completion.get("model", "")).strip(),
         "output": output_items,
         "status": "completed",
-        "usage": dict(completion.get("usage", {})) if isinstance(completion.get("usage"), dict) else {},
+        "usage": normalize_chat_completion_usage(completion.get("usage")),
     }
     return response_payload
 
@@ -407,6 +441,7 @@ class CustomProviderProxyApp:
     def build_health_payload(self) -> dict[str, object]:
         return {
             "status": "ok",
+            "backend_mode": token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
             "port": self.proxy_port,
             "protocol": self.upstream_protocol,
             "model_count": len(self.model_ids),

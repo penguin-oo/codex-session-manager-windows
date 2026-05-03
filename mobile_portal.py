@@ -333,6 +333,24 @@ def tokens_match(candidate: str, expected: str) -> bool:
         return False
 
 
+def resolve_launch_model_for_backend(model: str, backend_settings: dict[str, object]) -> str:
+    clean_model = str(model).strip()
+    mode = backend_settings.get("backend_mode")
+    if mode != token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        return clean_model
+
+    allowed_models = unique_model_ids(backend_settings.get("openai_models", []))
+    if clean_model and clean_model != "default" and (not allowed_models or clean_model in allowed_models):
+        return clean_model
+
+    configured_model = str(backend_settings.get("openai_model", "")).strip()
+    if configured_model and (not allowed_models or configured_model in allowed_models):
+        return configured_model
+    if allowed_models:
+        return allowed_models[0]
+    return configured_model
+
+
 def build_resume_args(
     output_file: Path,
     session_id: str,
@@ -345,10 +363,8 @@ def build_resume_args(
     backend_settings_file: Path = BACKEND_SETTINGS_FILE,
 ) -> list[str]:
     args = [CODEX_BIN, "exec", "--json", "-o", str(output_file), "--skip-git-repo-check"]
-    resolved_model = model
     backend_settings = token_pool_settings.load_backend_settings(backend_settings_file)
-    if (not resolved_model or resolved_model == "default") and backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
-        resolved_model = str(backend_settings.get("openai_model", "")).strip()
+    resolved_model = resolve_launch_model_for_backend(model, backend_settings)
     if resolved_model and resolved_model != "default":
         args.extend(["-m", resolved_model])
     if sandbox and sandbox != "default":
@@ -378,10 +394,8 @@ def build_new_chat_args(
     backend_settings_file: Path = BACKEND_SETTINGS_FILE,
 ) -> list[str]:
     args = [CODEX_BIN, "exec", "--json", "-o", str(output_file)]
-    resolved_model = model
     backend_settings = token_pool_settings.load_backend_settings(backend_settings_file)
-    if (not resolved_model or resolved_model == "default") and backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
-        resolved_model = str(backend_settings.get("openai_model", "")).strip()
+    resolved_model = resolve_launch_model_for_backend(model, backend_settings)
     if resolved_model and resolved_model != "default":
         args.extend(["-m", resolved_model])
     if sandbox and sandbox != "default":
@@ -1154,6 +1168,28 @@ def conda_env_available(conda_executable: str, env_name: str = "codex-accel") ->
     return any(Path(str(item)).name.strip().lower() == target for item in envs)
 
 
+def is_windowsapps_python_shim(path: str) -> bool:
+    clean_path = str(path).strip().replace("/", "\\").lower()
+    if not clean_path or "windowsapps" not in clean_path:
+        return False
+    name = Path(clean_path).name
+    return name.startswith("python") and name.endswith(".exe")
+
+
+def build_source_python_command(executable: str, app_path: str) -> list[str]:
+    clean_executable = str(executable).strip()
+    clean_app_path = str(app_path).strip()
+    if not is_windowsapps_python_shim(clean_executable):
+        return [clean_executable, clean_app_path]
+    python_executable = shutil.which("python")
+    if python_executable and not is_windowsapps_python_shim(python_executable):
+        return [python_executable, clean_app_path]
+    py_launcher = shutil.which("py")
+    if py_launcher:
+        return [py_launcher, "-3", clean_app_path]
+    return [clean_executable, clean_app_path]
+
+
 def build_token_pool_proxy_command(
     *,
     executable: str,
@@ -1166,7 +1202,7 @@ def build_token_pool_proxy_command(
     if conda_executable and conda_env_available(conda_executable):
         command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
     else:
-        command = [executable, app_path]
+        command = build_source_python_command(executable, app_path)
     command.extend(
         [
             "--token-pool-proxy",
@@ -1196,7 +1232,7 @@ def build_custom_provider_proxy_command(
     if conda_executable and conda_env_available(conda_executable):
         command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
     else:
-        command = [executable, app_path]
+        command = build_source_python_command(executable, app_path)
     command.extend(
         [
             "--custom-provider-proxy",
@@ -1241,9 +1277,44 @@ def clear_token_pool_proxy_state(state_file: Path = TOKEN_POOL_PROXY_STATE_FILE)
         pass
 
 
+def backend_health_matches(health: object, expected_backend_mode: str) -> bool:
+    if not isinstance(health, dict):
+        return False
+    clean_expected = str(expected_backend_mode).strip()
+    if not clean_expected:
+        return True
+    return str(health.get("backend_mode", "")).strip() == clean_expected
+
+
+def expected_backend_mode_for_settings(settings: dict[str, object]) -> str:
+    mode = settings.get("backend_mode")
+    if mode == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+        return token_pool_settings.BACKEND_MODE_TOKEN_POOL
+    if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        return token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE
+    return ""
+
+
+def run_taskkill_tree_silently(pid: int, timeout_seconds: int = 5) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def token_pool_proxy_is_healthy(
     port: int,
     timeout_seconds: float = 0.5,
+    expected_backend_mode: str = "",
 ) -> dict[str, object] | None:
     req = url_request.Request(
         f"http://127.0.0.1:{int(port)}/health",
@@ -1255,7 +1326,11 @@ def token_pool_proxy_is_healthy(
             payload = json.loads(resp.read().decode("utf-8"))
     except (OSError, ValueError, url_error.URLError):
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    if expected_backend_mode and not backend_health_matches(payload, expected_backend_mode):
+        return None
+    return payload
 
 
 def start_token_pool_backend(
@@ -1269,9 +1344,14 @@ def start_token_pool_backend(
     if not token_files:
         raise RuntimeError(f"No token files found in {token_dir}")
     port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
-    health = token_pool_proxy_is_healthy(port)
+    health = token_pool_proxy_is_healthy(port, expected_backend_mode=token_pool_settings.BACKEND_MODE_TOKEN_POOL)
     if health:
         return health
+    if token_pool_proxy_is_healthy(port):
+        stop_token_pool_backend()
+        time.sleep(0.2)
+        if token_pool_proxy_is_healthy(port):
+            raise RuntimeError(f"Port {port} is already used by a different backend proxy.")
     command = build_token_pool_proxy_command(
         executable=sys.executable,
         app_path=str(Path(__file__).resolve()),
@@ -1301,7 +1381,7 @@ def start_token_pool_backend(
     )
     deadline = time.time() + 6.0
     while time.time() < deadline:
-        health = token_pool_proxy_is_healthy(port)
+        health = token_pool_proxy_is_healthy(port, expected_backend_mode=token_pool_settings.BACKEND_MODE_TOKEN_POOL)
         if health:
             return health
         return_code = proc.poll()
@@ -1324,10 +1404,7 @@ def stop_token_pool_backend(state_file: Path = TOKEN_POOL_PROXY_STATE_FILE) -> N
     state = load_token_pool_proxy_state(state_file)
     pid = int(state.get("pid", 0) or 0)
     if pid > 0:
-        try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
-        except OSError:
-            pass
+        run_taskkill_tree_silently(pid)
     clear_token_pool_proxy_state(state_file)
 
 
@@ -1362,9 +1439,14 @@ def start_openai_compatible_backend(
 ) -> dict[str, object]:
     settings = token_pool_settings.load_backend_settings(backend_settings_file)
     port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
-    health = token_pool_proxy_is_healthy(port)
+    health = token_pool_proxy_is_healthy(port, expected_backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE)
     if health:
         return health
+    if token_pool_proxy_is_healthy(port):
+        stop_token_pool_backend()
+        time.sleep(0.2)
+        if token_pool_proxy_is_healthy(port):
+            raise RuntimeError(f"Port {port} is already used by a different backend proxy.")
     upstream_base_url = str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
     upstream_api_key = str(settings.get("openai_api_key", "")).strip()
     upstream_protocol = str(settings.get("openai_protocol", "")).strip()
@@ -1404,7 +1486,7 @@ def start_openai_compatible_backend(
     )
     deadline = time.time() + 6.0
     while time.time() < deadline:
-        health = token_pool_proxy_is_healthy(port)
+        health = token_pool_proxy_is_healthy(port, expected_backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE)
         if health:
             return health
         return_code = proc.poll()
@@ -1436,6 +1518,9 @@ def ensure_backend_proxy_ready(
         )
         return
     if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        token_pool_settings.ensure_openai_compatible_model_metadata(
+            unique_model_ids(settings.get("openai_models", [])) or [str(settings.get("openai_model", "")).strip()]
+        )
         start_openai_compatible_backend(
             backend_settings_file=backend_settings_file,
             proxy_settings_file=proxy_settings_file,
@@ -1474,6 +1559,20 @@ def merge_available_models(models: list[str]) -> list[str]:
         seen.add(clean_model)
         merged.append(clean_model)
     return merged
+
+
+def unique_model_ids(models: object) -> list[str]:
+    if not isinstance(models, (list, tuple)):
+        return []
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in models:
+        clean_model = str(item).strip()
+        if not clean_model or clean_model in seen:
+            continue
+        seen.add(clean_model)
+        unique.append(clean_model)
+    return unique
 
 
 def _normalize_process_match_text(value: object) -> str:
@@ -2009,9 +2108,11 @@ class CodexDataStore:
         backend_settings_signature = path_signature(BACKEND_SETTINGS_FILE)
         backend_settings = token_pool_settings.load_backend_settings(BACKEND_SETTINGS_FILE)
         if backend_settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
-            openai_models = backend_settings.get("openai_models", [])
-            if isinstance(openai_models, list) and openai_models:
-                unique = merge_available_models([str(item).strip() for item in openai_models if str(item).strip()])
+            unique = unique_model_ids(backend_settings.get("openai_models", []))
+            saved_openai_model = str(backend_settings.get("openai_model", "")).strip()
+            if saved_openai_model and saved_openai_model not in unique:
+                unique.insert(0, saved_openai_model)
+            if unique:
                 with self.cache_lock:
                     self._models_signature = (backend_settings_signature[0], backend_settings_signature[1]) if backend_settings_signature else None
                     self._models_cache = list(unique)
@@ -2898,14 +2999,7 @@ class JobRunner:
         if pid <= 0:
             return False
         if os.name == "nt":
-            result = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            return result.returncode == 0
+            return run_taskkill_tree_silently(pid)
         try:
             os.kill(pid, signal.SIGTERM)
             return True
@@ -3084,7 +3178,9 @@ class PortalService:
         token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
         token_count = len(token_pool_settings.list_token_files(token_dir))
         proxy_port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
-        health = token_pool_proxy_is_healthy(proxy_port)
+        expected_backend_mode = expected_backend_mode_for_settings(settings)
+        raw_health = token_pool_proxy_is_healthy(proxy_port) if expected_backend_mode else None
+        health = raw_health if backend_health_matches(raw_health, expected_backend_mode) else None
         openai_models = settings.get("openai_models", [])
         return {
             "backend_mode": str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)),
@@ -3113,6 +3209,7 @@ class PortalService:
         openai_models: list[str] | None = None,
     ) -> dict[str, object]:
         current = token_pool_settings.load_backend_settings(self.backend_settings_file)
+        previous_backend_mode = str(current.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH))
         token_dir_path = Path(token_dir.strip() or str(current.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
         resolved_openai_base_url = openai_base_url.strip() or str(
             current.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)
@@ -3149,6 +3246,18 @@ class PortalService:
             openai_protocol=resolved_openai_protocol,
         )
         self.jobs.backend_settings_file = self.backend_settings_file
+        updated_backend_mode = str(updated.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH))
+        if (
+            updated_backend_mode == token_pool_settings.BACKEND_MODE_CODEX_AUTH
+            or (
+                previous_backend_mode in {
+                    token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+                    token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                }
+                and previous_backend_mode != updated_backend_mode
+            )
+        ):
+            stop_token_pool_backend()
         return {
             "backend_mode": str(updated.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH)),
             **self.backend_status_payload(),
@@ -3174,7 +3283,7 @@ class PortalService:
                 backend_settings_file=self.backend_settings_file,
                 proxy_settings_file=self.proxy_settings_file,
             )
-        else:
+        elif settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
             start_token_pool_backend(
                 backend_settings_file=self.backend_settings_file,
                 proxy_settings_file=self.proxy_settings_file,

@@ -55,6 +55,62 @@ class TokenPoolSettingsTests(unittest.TestCase):
         self.assertTrue(self.token_dir.exists())
         self.assertTrue(self.token_dir.is_dir())
 
+    def test_ensure_openai_compatible_model_metadata_clones_existing_codex_metadata(self) -> None:
+        models_cache = self.codex_home / 'models_cache.json'
+        models_cache.write_text(
+            json.dumps(
+                {
+                    'models': [
+                        {
+                            'slug': 'gpt-5.5',
+                            'display_name': 'GPT-5.5',
+                            'description': 'source',
+                            'visibility': 'list',
+                            'supported_in_api': True,
+                            'priority': 0,
+                            'base_instructions': 'base',
+                        }
+                    ]
+                }
+            ),
+            encoding='utf-8',
+        )
+
+        changed = token_pool_settings.ensure_openai_compatible_model_metadata(
+            ['mimo-v2.5-pro', 'mimo-v2.5-pro'],
+            models_cache_file=models_cache,
+        )
+
+        self.assertTrue(changed)
+        payload = json.loads(models_cache.read_text(encoding='utf-8'))
+        slugs = [model['slug'] for model in payload['models']]
+        self.assertEqual(['gpt-5.5', 'mimo-v2.5-pro'], slugs)
+        self.assertEqual('mimo-v2.5-pro', payload['models'][1]['display_name'])
+        self.assertEqual('base', payload['models'][1]['base_instructions'])
+
+    def test_ensure_openai_compatible_model_metadata_keeps_existing_entries(self) -> None:
+        models_cache = self.codex_home / 'models_cache.json'
+        models_cache.write_text(
+            json.dumps(
+                {
+                    'models': [
+                        {'slug': 'gpt-5.5', 'display_name': 'GPT-5.5'},
+                        {'slug': 'mimo-v2.5-pro', 'display_name': 'Mimo'},
+                    ]
+                }
+            ),
+            encoding='utf-8',
+        )
+
+        changed = token_pool_settings.ensure_openai_compatible_model_metadata(
+            ['mimo-v2.5-pro'],
+            models_cache_file=models_cache,
+        )
+
+        self.assertFalse(changed)
+        payload = json.loads(models_cache.read_text(encoding='utf-8'))
+        self.assertEqual(2, len(payload['models']))
+
     def test_import_token_files_copies_multiple_json_files(self) -> None:
         source_dir = self.root / 'source'
         source_dir.mkdir()
@@ -373,6 +429,7 @@ class TokenPoolAppTests(unittest.TestCase):
         payload = self.app.build_health_payload()
 
         self.assertEqual('ok', payload['status'])
+        self.assertEqual('built_in_token_pool', payload['backend_mode'])
         self.assertEqual(1, payload['token_count'])
         self.assertEqual(8317, payload['port'])
 

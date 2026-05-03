@@ -163,6 +163,28 @@ def build_openai_compatible_environment_ps_prefix(env_key_name: str, api_key_val
     return build_token_pool_environment_ps_prefix(env_key_name=env_key_name, api_key_value=api_key_value)
 
 
+def is_windowsapps_python_shim(path: str) -> bool:
+    clean_path = str(path).strip().replace("/", "\\").lower()
+    if not clean_path or "windowsapps" not in clean_path:
+        return False
+    name = Path(clean_path).name
+    return name.startswith("python") and name.endswith(".exe")
+
+
+def build_source_python_command(executable: str, app_path: str) -> list[str]:
+    clean_executable = str(executable).strip()
+    clean_app_path = str(app_path).strip()
+    if not is_windowsapps_python_shim(clean_executable):
+        return [clean_executable, clean_app_path]
+    python_executable = shutil.which("python")
+    if python_executable and not is_windowsapps_python_shim(python_executable):
+        return [python_executable, clean_app_path]
+    py_launcher = shutil.which("py")
+    if py_launcher:
+        return [py_launcher, "-3", clean_app_path]
+    return [clean_executable, clean_app_path]
+
+
 def build_token_pool_provider_override_args(
     model: str,
     proxy_port: int,
@@ -305,7 +327,7 @@ def build_token_pool_proxy_command(
         if conda_executable:
             command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
         else:
-            command = [executable, app_path]
+            command = build_source_python_command(executable, app_path)
     else:
         command = [executable]
     command.extend(
@@ -339,7 +361,7 @@ def build_custom_provider_proxy_command(
         if conda_executable:
             command = [conda_executable, "run", "--no-capture-output", "-n", "codex-accel", "python", app_path]
         else:
-            command = [executable, app_path]
+            command = build_source_python_command(executable, app_path)
     else:
         command = [executable]
     command.extend(
@@ -535,6 +557,54 @@ def merge_available_models(models: list[str]) -> list[str]:
         seen.add(clean_model)
         merged.append(clean_model)
     return merged
+
+
+def unique_model_ids(models: object) -> list[str]:
+    if not isinstance(models, (list, tuple)):
+        return []
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in models:
+        clean_model = str(item).strip()
+        if not clean_model or clean_model in seen:
+            continue
+        seen.add(clean_model)
+        unique.append(clean_model)
+    return unique
+
+
+def backend_health_matches(health: object, expected_backend_mode: str) -> bool:
+    if not isinstance(health, dict):
+        return False
+    clean_expected = str(expected_backend_mode).strip()
+    if not clean_expected:
+        return True
+    return str(health.get("backend_mode", "")).strip() == clean_expected
+
+
+def expected_backend_mode_for_settings(settings: dict[str, object]) -> str:
+    mode = settings.get("backend_mode")
+    if mode == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+        return token_pool_settings.BACKEND_MODE_TOKEN_POOL
+    if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+        return token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE
+    return ""
+
+
+def run_taskkill_tree_silently(pid: int, timeout_seconds: int = 5) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def account_dialog_dimensions(screen_width: int, screen_height: int) -> tuple[int, int]:
@@ -1119,9 +1189,12 @@ class SessionManagerApp:
         settings_loader = getattr(self, "_reload_backend_settings", None)
         settings = settings_loader() if callable(settings_loader) else getattr(self, "backend_settings", {})
         if isinstance(settings, dict) and settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
-            openai_models = settings.get("openai_models", [])
-            if isinstance(openai_models, list) and openai_models:
-                return merge_available_models([str(item).strip() for item in openai_models if str(item).strip()])
+            openai_models = unique_model_ids(settings.get("openai_models", []))
+            saved_openai_model = str(settings.get("openai_model", "")).strip()
+            if saved_openai_model and saved_openai_model not in openai_models:
+                openai_models.insert(0, saved_openai_model)
+            if openai_models:
+                return openai_models
         models: list[str] = []
         if MODELS_CACHE_FILE.exists():
             try:
@@ -1135,9 +1208,9 @@ class SessionManagerApp:
                         visibility = str(item.get("visibility", ""))
                         if visibility and visibility != "list":
                             continue
-                            slug = str(item.get("slug", "")).strip()
-                            if slug:
-                                models.append(slug)
+                        slug = str(item.get("slug", "")).strip()
+                        if slug:
+                            models.append(slug)
             except Exception:
                 models = []
         return merge_available_models(models)
@@ -1385,7 +1458,11 @@ class SessionManagerApp:
             return []
         args: list[str] = []
         model = self.model_var.get().strip()
-        if model and model != "default":
+        if (
+            model
+            and model != "default"
+            and not self._is_openai_compatible_backend_enabled()
+        ):
             args.extend(["-m", model])
 
         approval = self.approval_var.get().strip()
@@ -1400,10 +1477,38 @@ class SessionManagerApp:
             args.append("--search")
         return args
 
+    def _is_openai_compatible_backend_enabled(self) -> bool:
+        settings = self._token_pool_settings()
+        return settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE
+
+    def _selected_launch_model(self) -> str:
+        if self.use_global_defaults_var.get():
+            return ""
+        selected = self.model_var.get().strip()
+        return selected if selected and selected != "default" else ""
+
+    def _resolve_openai_compatible_launch_model(self, *candidates: str) -> str:
+        settings = self._token_pool_settings()
+        allowed_models = unique_model_ids(settings.get("openai_models", []))
+        for candidate in candidates:
+            clean_candidate = str(candidate).strip()
+            if clean_candidate and clean_candidate != "default" and (not allowed_models or clean_candidate in allowed_models):
+                return clean_candidate
+        configured_model = str(settings.get("openai_model", "")).strip()
+        if configured_model and (not allowed_models or configured_model in allowed_models):
+            return configured_model
+        if allowed_models:
+            return allowed_models[0]
+        return configured_model or DEFAULT_PRIMARY_MODEL
+
     def _build_codex_resume_args(self, item: SessionItem) -> list[str]:
         args: list[str] = ["codex.cmd", "resume", item.session_id]
         args.extend(self._build_codex_override_args())
-        backend_model = item.model.strip() or self._configured_backend_model() or DEFAULT_PRIMARY_MODEL
+        if self._is_openai_compatible_backend_enabled():
+            backend_model = self._resolve_openai_compatible_launch_model(self._selected_launch_model(), item.model)
+            args.extend(["-m", backend_model])
+        else:
+            backend_model = item.model.strip() or self._configured_backend_model() or DEFAULT_PRIMARY_MODEL
         args.extend(self._build_backend_override_args(backend_model))
         return args
 
@@ -1411,7 +1516,11 @@ class SessionManagerApp:
         args: list[str] = ["codex.cmd"]
         args.extend(self._build_codex_override_args())
         selected_model = self.model_var.get().strip()
-        backend_model = selected_model if selected_model and selected_model != "default" else self._configured_backend_model() or DEFAULT_PRIMARY_MODEL
+        if self._is_openai_compatible_backend_enabled():
+            backend_model = self._resolve_openai_compatible_launch_model(self._selected_launch_model())
+            args.extend(["-m", backend_model])
+        else:
+            backend_model = selected_model if selected_model and selected_model != "default" else self._configured_backend_model() or DEFAULT_PRIMARY_MODEL
         args.extend(
             self._build_backend_override_args(backend_model)
         )
@@ -1468,7 +1577,7 @@ class SessionManagerApp:
             api_key_value=str(settings.get("proxy_api_key", "")),
         )
 
-    def _token_pool_health(self, port: int | None = None) -> dict[str, object] | None:
+    def _token_pool_health(self, port: int | None = None, expected_backend_mode: str = "") -> dict[str, object] | None:
         settings = self._token_pool_settings()
         health_port = int(port or settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
         req = url_request.Request(
@@ -1481,7 +1590,11 @@ class SessionManagerApp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except (OSError, ValueError, url_error.URLError):
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        if expected_backend_mode and not backend_health_matches(payload, expected_backend_mode):
+            return None
+        return payload
 
     def _build_token_pool_proxy_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -1524,14 +1637,21 @@ class SessionManagerApp:
         if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
             self._start_openai_compatible_proxy()
             return
+        if settings.get("backend_mode") != token_pool_settings.BACKEND_MODE_TOKEN_POOL:
+            return
         token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
         token_pool_settings.ensure_token_pool_dir(token_dir)
         token_files = token_pool_settings.list_token_files(token_dir)
         if not token_files:
             raise RuntimeError(f"No token files found in {token_dir}")
         port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
-        if self._token_pool_health(port):
+        if self._token_pool_health(port, token_pool_settings.BACKEND_MODE_TOKEN_POOL):
             return
+        if self._token_pool_health(port):
+            self._stop_token_pool_proxy()
+            time.sleep(0.2)
+            if self._token_pool_health(port):
+                raise RuntimeError(f"Port {port} is already used by a different backend proxy.")
         command = build_token_pool_proxy_command(
             executable=sys.executable,
             app_path=str(Path(__file__).resolve()),
@@ -1557,7 +1677,7 @@ class SessionManagerApp:
         )
         deadline = time.time() + 6.0
         while time.time() < deadline:
-            if self._token_pool_health(port):
+            if self._token_pool_health(port, token_pool_settings.BACKEND_MODE_TOKEN_POOL):
                 return
             time.sleep(0.2)
         raise RuntimeError("Built-in token pool proxy did not become ready.")
@@ -1565,9 +1685,14 @@ class SessionManagerApp:
     def _start_openai_compatible_proxy(self) -> None:
         settings = self._token_pool_settings()
         port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
-        health = self._token_pool_health(port)
+        health = self._token_pool_health(port, token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE)
         if health:
             return
+        if self._token_pool_health(port):
+            self._stop_token_pool_proxy()
+            time.sleep(0.2)
+            if self._token_pool_health(port):
+                raise RuntimeError(f"Port {port} is already used by a different backend proxy.")
         upstream_base_url = str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
         upstream_api_key = str(settings.get("openai_api_key", "")).strip()
         upstream_protocol = str(settings.get("openai_protocol", "")).strip()
@@ -1603,7 +1728,7 @@ class SessionManagerApp:
         )
         deadline = time.time() + 6.0
         while time.time() < deadline:
-            if self._token_pool_health(port):
+            if self._token_pool_health(port, token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE):
                 return
             time.sleep(0.2)
         raise RuntimeError("OpenAI-compatible backend proxy did not become ready.")
@@ -1612,15 +1737,15 @@ class SessionManagerApp:
         state = load_token_pool_proxy_state()
         pid = int(state.get("pid", 0) or 0)
         if pid > 0:
-            try:
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
-            except OSError:
-                pass
+            run_taskkill_tree_silently(pid)
         clear_token_pool_proxy_state()
 
     def _restart_token_pool_proxy(self) -> None:
         self._stop_token_pool_proxy()
         time.sleep(0.2)
+        settings = self._token_pool_settings()
+        if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_CODEX_AUTH:
+            return
         self._start_token_pool_proxy()
 
     def _token_pool_status_summary(self) -> str:
@@ -1628,8 +1753,10 @@ class SessionManagerApp:
         token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
         token_count = len(token_pool_settings.list_token_files(token_dir))
         port = int(settings.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT))
-        health = self._token_pool_health(port)
         mode = str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH))
+        expected_mode = expected_backend_mode_for_settings(settings)
+        raw_health = self._token_pool_health(port) if expected_mode else None
+        health = raw_health if backend_health_matches(raw_health, expected_mode) else None
         if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
             base_url = str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
             model = str(settings.get("openai_model", "")).strip() or "default"
@@ -1673,6 +1800,9 @@ class SessionManagerApp:
         if settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_TOKEN_POOL:
             self._start_token_pool_proxy()
         elif settings.get("backend_mode") == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            token_pool_settings.ensure_openai_compatible_model_metadata(
+                unique_model_ids(settings.get("openai_models", [])) or [str(settings.get("openai_model", "")).strip()]
+            )
             self._start_openai_compatible_proxy()
 
     def _toggle_proxy_controls(self) -> None:
@@ -1859,6 +1989,7 @@ class SessionManagerApp:
 
         def apply_backend_mode() -> None:
             settings = self._token_pool_settings()
+            previous_backend_mode = str(settings.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH))
             token_dir = Path(str(settings.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
             try:
                 updated = apply_backend_mode_settings(
@@ -1877,6 +2008,18 @@ class SessionManagerApp:
                 messagebox.showerror("Backend Mode", str(exc), parent=dialog)
                 return
             self.backend_settings = updated
+            updated_backend_mode = str(updated.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH))
+            if (
+                updated_backend_mode == token_pool_settings.BACKEND_MODE_CODEX_AUTH
+                or (
+                    previous_backend_mode in {
+                        token_pool_settings.BACKEND_MODE_TOKEN_POOL,
+                        token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                    }
+                    and previous_backend_mode != updated_backend_mode
+                )
+            ):
+                self._stop_token_pool_proxy()
             self.available_models = self._load_available_models()
             self._render_models()
             refresh_token_pool_section()
@@ -2348,6 +2491,9 @@ def main() -> int:
     if "--token-pool-proxy" in sys.argv[1:]:
         marker_index = sys.argv.index("--token-pool-proxy")
         return token_pool_proxy.main(sys.argv[marker_index + 1 :])
+    if "--custom-provider-proxy" in sys.argv[1:]:
+        marker_index = sys.argv.index("--custom-provider-proxy")
+        return custom_provider_proxy.main(sys.argv[marker_index + 1 :])
 
     root = tk.Tk()
     style = ttk.Style(root)

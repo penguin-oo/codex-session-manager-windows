@@ -1,5 +1,6 @@
-import tempfile
+import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -145,6 +146,7 @@ class AppHelperTests(unittest.TestCase):
         manager = object.__new__(app.SessionManagerApp)
         manager.model_var = mock.Mock()
         manager.model_var.get.return_value = "default"
+        manager._token_pool_settings = mock.Mock(return_value={"backend_mode": app.token_pool_settings.BACKEND_MODE_TOKEN_POOL})
         manager._build_codex_override_args = mock.Mock(return_value=[])
         manager._build_backend_override_args = mock.Mock(return_value=[])
 
@@ -377,18 +379,117 @@ class AppHelperTests(unittest.TestCase):
             model="mimo-v2-omni",
         )
 
-    def test_load_available_models_prefers_openai_compatible_cache_when_backend_enabled(self) -> None:
+    def test_load_available_models_uses_exact_openai_compatible_models_when_backend_enabled(self) -> None:
         manager = object.__new__(app.SessionManagerApp)
         manager.backend_settings = {
             "backend_mode": "openai_compatible",
-            "openai_models": ["gpt-5.5", "gpt-4.1"],
+            "openai_models": ["mimo-v2.5-pro", "mimo-v2-pro"],
         }
         manager._reload_backend_settings = mock.Mock(return_value=manager.backend_settings)
 
         with mock.patch.object(app, "MODELS_CACHE_FILE", Path("missing-models-cache.json")):
             models = app.SessionManagerApp._load_available_models(manager)
 
-        self.assertEqual(["gpt-5.5", "gpt-4.1", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5"], models)
+        self.assertEqual(["mimo-v2.5-pro", "mimo-v2-pro"], models)
+
+    def test_load_available_models_includes_visible_cache_models_for_codex_auth(self) -> None:
+        manager = object.__new__(app.SessionManagerApp)
+        manager.backend_settings = {"backend_mode": app.token_pool_settings.BACKEND_MODE_CODEX_AUTH}
+        manager._reload_backend_settings = mock.Mock(return_value=manager.backend_settings)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            models_path = Path(temp_dir) / "models_cache.json"
+            models_path.write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {"slug": "gpt-5.4-mini", "visibility": "list"},
+                            {"slug": "hidden-model", "visibility": "hidden"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(app, "MODELS_CACHE_FILE", models_path):
+                models = app.SessionManagerApp._load_available_models(manager)
+
+        self.assertIn("gpt-5.4-mini", models)
+        self.assertNotIn("hidden-model", models)
+
+    def test_build_codex_new_args_openai_compatible_uses_selected_endpoint_model(self) -> None:
+        manager = object.__new__(app.SessionManagerApp)
+        manager.use_global_defaults_var = mock.Mock()
+        manager.use_global_defaults_var.get.return_value = False
+        manager.model_var = mock.Mock()
+        manager.model_var.get.return_value = "mimo-v2-pro"
+        manager.approval_var = mock.Mock()
+        manager.approval_var.get.return_value = "default"
+        manager.sandbox_var = mock.Mock()
+        manager.sandbox_var.get.return_value = "default"
+        manager.search_var = mock.Mock()
+        manager.search_var.get.return_value = False
+        manager.available_models = ["mimo-v2.5-pro", "mimo-v2-pro"]
+        manager._token_pool_settings = mock.Mock(
+            return_value={
+                "backend_mode": app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                "proxy_port": 8317,
+                "openai_model": "mimo-v2.5-pro",
+            }
+        )
+
+        args = app.SessionManagerApp._build_codex_new_args(manager)
+
+        self.assertEqual("mimo-v2-pro", args[args.index("-m") + 1])
+
+    def test_token_pool_status_summary_ignores_proxy_from_other_backend_mode_for_codex_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = object.__new__(app.SessionManagerApp)
+            manager._token_pool_settings = mock.Mock(
+                return_value={
+                    "backend_mode": app.token_pool_settings.BACKEND_MODE_CODEX_AUTH,
+                    "proxy_port": 8317,
+                    "token_dir": str(Path(temp_dir) / "tokens"),
+                }
+            )
+            manager._token_pool_health = mock.Mock(
+                return_value={
+                    "status": "ok",
+                    "backend_mode": app.token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+                    "port": 8317,
+                }
+            )
+
+            summary = app.SessionManagerApp._token_pool_status_summary(manager)
+
+        self.assertIn("Mode: codex_auth", summary)
+        self.assertIn("Proxy: stopped", summary)
+
+    def test_restart_token_pool_proxy_codex_auth_only_stops_existing_proxy(self) -> None:
+        manager = object.__new__(app.SessionManagerApp)
+        manager._token_pool_settings = mock.Mock(
+            return_value={"backend_mode": app.token_pool_settings.BACKEND_MODE_CODEX_AUTH}
+        )
+        manager._stop_token_pool_proxy = mock.Mock()
+        manager._start_token_pool_proxy = mock.Mock()
+
+        app.SessionManagerApp._restart_token_pool_proxy(manager)
+
+        manager._stop_token_pool_proxy.assert_called_once_with()
+        manager._start_token_pool_proxy.assert_not_called()
+
+    def test_run_taskkill_tree_silently_discards_taskkill_console_output(self) -> None:
+        completed = subprocess.CompletedProcess(["taskkill"], 0)
+        with mock.patch.object(app.subprocess, "run", return_value=completed) as run:
+            result = app.run_taskkill_tree_silently(123)
+
+        self.assertTrue(result)
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "123", "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
 
     def test_build_backend_override_args_uses_local_adapter_url_for_openai_mode(self) -> None:
         manager = object.__new__(app.SessionManagerApp)
