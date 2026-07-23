@@ -644,6 +644,87 @@ def save_openai_preset(
     return payload
 
 
+def _write_settings_payload_atomically(
+    settings_file: Path,
+    payload: dict[str, object],
+) -> None:
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = settings_file.with_name(
+        f'{settings_file.name}.{os.getpid()}-{secrets.token_hex(6)}.tmp'
+    )
+    try:
+        temp_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding='utf-8',
+        )
+        os.replace(temp_file, settings_file)
+    finally:
+        if temp_file.exists():
+            temp_file.unlink()
+
+
+def save_and_activate_openai_preset(
+    *,
+    settings_file: Path = DEFAULT_SETTINGS_FILE,
+    preset_id: str,
+    name: str,
+    openai_base_url: str,
+    openai_api_key: str,
+    openai_model: str,
+    openai_models: object,
+    openai_protocol: str,
+    openai_manual_extra_models: object = None,
+    proxy_preference: str = 'direct',
+    upstream_proxy_url: str = '',
+    skip_validation: bool = False,
+    installation_id: str = '',
+    claude_env: object = None,
+    disable_image_generation: bool = False,
+) -> dict[str, object]:
+    payload = load_backend_settings(settings_file)
+    clean_id = _normalize_openai_preset_id(
+        preset_id,
+        openai_preset_id_from_name(name),
+    )
+    clean_pref = (
+        proxy_preference.strip()
+        if proxy_preference.strip() in ('direct', 'proxy', 'auto')
+        else 'direct'
+    )
+    preset = _normalize_openai_preset(
+        {
+            'id': clean_id,
+            'name': name or clean_id,
+            'openai_base_url': openai_base_url,
+            'openai_api_key': openai_api_key,
+            'openai_model': openai_model,
+            'openai_models': openai_models,
+            'openai_protocol': openai_protocol,
+            'openai_manual_extra_models': (
+                []
+                if openai_manual_extra_models is None
+                else openai_manual_extra_models
+            ),
+            'proxy_preference': clean_pref,
+            'upstream_proxy_url': upstream_proxy_url,
+            'skip_validation': skip_validation,
+            'installation_id': installation_id,
+            'claude_env': {} if claude_env is None else claude_env,
+            'disable_image_generation': disable_image_generation,
+        },
+        fallback_id=clean_id,
+        fallback_name=name or clean_id,
+    )
+    payload['backend_mode'] = BACKEND_MODE_OPENAI_COMPATIBLE
+    _replace_openai_preset(payload, preset)
+    payload['active_openai_preset_id'] = clean_id
+    _copy_openai_preset_to_top_level(payload, preset)
+    payload['openai_config_detached_from_preset'] = False
+    _write_settings_payload_atomically(settings_file, payload)
+    set_active_proxy_preference(clean_pref)
+    return payload
+
+
 def apply_openai_preset(
     preset_id: str,
     *,
