@@ -1,4 +1,5 @@
 import base64
+import functools
 import json
 import os
 import re
@@ -37,6 +38,7 @@ HISTORY_FILE = CODEX_HOME / "history.jsonl"
 NOTES_FILE = CODEX_HOME / "session_notes.json"
 SESSIONS_DIR = CODEX_HOME / "sessions"
 CONFIG_FILE = CODEX_HOME / "config.toml"
+PORTAL_SETTINGS_FILE = CODEX_HOME / "mobile_portal_settings.json"
 MODELS_CACHE_FILE = CODEX_HOME / "models_cache.json"
 SKILLS_DIR = CODEX_HOME / "skills"
 PORTAL_TOKEN_FILE = CODEX_HOME / "mobile_portal_token.txt"
@@ -80,6 +82,7 @@ DEFAULT_LAUNCH_APPROVAL = "never"
 DEFAULT_LAUNCH_SANDBOX = "danger-full-access"
 DEFAULT_LAUNCH_REASONING_EFFORT = "max"
 DEFAULT_LAUNCH_ADMIN = False
+CODEX_VERSION_PATTERN = re.compile(r"^codex-cli\s+\d+\.\d+\.\d+(?:[-+][^\s]+)?$")
 FALLBACK_MODEL_OPTIONS = (
     DEFAULT_PRIMARY_MODEL,
     "gpt-5.6-luna",
@@ -605,6 +608,63 @@ def build_source_python_command(executable: str, app_path: str) -> list[str]:
     if py_launcher:
         return [py_launcher, "-3", clean_app_path]
     return [clean_executable, clean_app_path]
+
+
+def configured_codex_executable(
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> Path | None:
+    try:
+        payload = json.loads(settings_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_path = payload.get("codex_executable")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    expanded = os.path.expandvars(raw_path.strip())
+    executable = Path(expanded).expanduser()
+    return executable if executable.is_absolute() else None
+
+
+@functools.lru_cache(maxsize=16)
+def _cached_codex_executable_health_check(
+    executable: str,
+    size: int,
+    modified_ns: int,
+) -> bool:
+    del size, modified_ns
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+    if result.returncode != 0:
+        return False
+    version = (result.stdout or result.stderr or "").strip()
+    return CODEX_VERSION_PATTERN.fullmatch(version) is not None
+
+
+def codex_executable_is_healthy(executable: Path) -> bool:
+    try:
+        stat = executable.stat()
+    except OSError:
+        return False
+    if not executable.is_file():
+        return False
+    return _cached_codex_executable_health_check(
+        str(executable),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
 
 
 def build_token_pool_provider_override_args(
@@ -2512,6 +2572,9 @@ class SessionManagerApp:
             return codex_args
         if codex_args[0].lower() != "codex.cmd":
             return codex_args
+        configured = configured_codex_executable()
+        if configured is not None and codex_executable_is_healthy(configured):
+            return [str(configured), *codex_args[1:]]
         resolved = shutil.which("codex.cmd")
         if not resolved:
             return codex_args

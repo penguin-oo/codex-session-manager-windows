@@ -1,3 +1,5 @@
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -120,6 +122,172 @@ class DesktopWindowLaunchTests(unittest.TestCase):
         self.assertIn("$env:CODEX_SQLITE_HOME", command)
         self.assertIn("finally {", command)
         manager._token_pool_settings.assert_not_called()
+
+    def test_configured_codex_executable_reads_local_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_file.write_text(
+                '{"codex_executable":"%USERPROFILE%\\\\.codex\\\\bin\\\\codex-clickable.exe"}',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {"USERPROFILE": "C:\\Users\\Test"}):
+                executable = app.configured_codex_executable(settings_file)
+
+        self.assertEqual(
+            Path("C:\\Users\\Test\\.codex\\bin\\codex-clickable.exe"),
+            executable,
+        )
+
+    def test_configured_codex_executable_ignores_malformed_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_file.write_text("{not-json", encoding="utf-8")
+
+            executable = app.configured_codex_executable(settings_file)
+
+        self.assertIsNone(executable)
+
+    def test_configured_codex_executable_ignores_missing_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_file.write_text('{"proxy_enabled":false}', encoding="utf-8")
+
+            executable = app.configured_codex_executable(settings_file)
+
+        self.assertIsNone(executable)
+
+    def test_configured_codex_executable_rejects_relative_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_file.write_text(
+                '{"codex_executable":"bin\\\\codex-clickable.exe"}',
+                encoding="utf-8",
+            )
+
+            executable = app.configured_codex_executable(settings_file)
+
+        self.assertIsNone(executable)
+
+    def test_codex_executable_health_check_rejects_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "missing.exe"
+
+            with mock.patch.object(app.subprocess, "run") as run:
+                healthy = app.codex_executable_is_healthy(executable)
+
+        self.assertFalse(healthy)
+        run.assert_not_called()
+
+    def test_codex_executable_health_check_requires_codex_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "codex-clickable.exe"
+            executable.write_bytes(b"test")
+            result = subprocess.CompletedProcess(
+                args=[str(executable), "--version"],
+                returncode=0,
+                stdout="codex-cli 0.144.3\n",
+                stderr="",
+            )
+
+            with mock.patch.object(app.subprocess, "run", return_value=result):
+                healthy = app.codex_executable_is_healthy(executable)
+
+        self.assertTrue(healthy)
+
+    def test_codex_executable_health_check_rejects_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "codex-clickable.exe"
+            executable.write_bytes(b"test")
+
+            with mock.patch.object(
+                app.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(str(executable), 3),
+            ):
+                healthy = app.codex_executable_is_healthy(executable)
+
+        self.assertFalse(healthy)
+
+    def test_codex_executable_health_check_rejects_unexpected_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "codex-clickable.exe"
+            executable.write_bytes(b"test")
+            result = subprocess.CompletedProcess(
+                args=[str(executable), "--version"],
+                returncode=0,
+                stdout="not-codex\n",
+                stderr="",
+            )
+
+            with mock.patch.object(app.subprocess, "run", return_value=result):
+                healthy = app.codex_executable_is_healthy(executable)
+
+        self.assertFalse(healthy)
+
+    def test_codex_executable_health_check_rejects_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "codex-clickable.exe"
+            executable.write_bytes(b"test")
+            result = subprocess.CompletedProcess(
+                args=[str(executable), "--version"],
+                returncode=1,
+                stdout="codex-cli 0.144.3\n",
+                stderr="failed",
+            )
+
+            with mock.patch.object(app.subprocess, "run", return_value=result):
+                healthy = app.codex_executable_is_healthy(executable)
+
+        self.assertFalse(healthy)
+
+    def test_healthy_configured_codex_executable_is_selected(self) -> None:
+        manager = make_manager()
+        custom = Path("C:\\local\\codex-clickable.exe")
+        with (
+            mock.patch.object(
+                app,
+                "configured_codex_executable",
+                return_value=custom,
+            ),
+            mock.patch.object(
+                app,
+                "codex_executable_is_healthy",
+                return_value=True,
+            ),
+        ):
+            resolved = manager._resolve_terminal_codex_args(
+                ["codex.cmd", "resume", "session-id"]
+            )
+
+        self.assertEqual(
+            [str(custom), "resume", "session-id"],
+            resolved,
+        )
+
+    def test_unhealthy_configured_codex_executable_falls_back_to_official(self) -> None:
+        manager = make_manager()
+        custom = Path("C:\\local\\broken.exe")
+        with (
+            mock.patch.object(
+                app,
+                "configured_codex_executable",
+                return_value=custom,
+            ),
+            mock.patch.object(
+                app,
+                "codex_executable_is_healthy",
+                return_value=False,
+            ),
+            mock.patch.object(
+                app.shutil,
+                "which",
+                return_value="C:\\official\\codex.cmd",
+            ),
+        ):
+            resolved = manager._resolve_terminal_codex_args(["codex.cmd"])
+
+        self.assertEqual(["C:\\official\\codex.cmd"], resolved)
 
     def test_runtime_isolated_for_non_auth_backends_only(self) -> None:
         manager = make_manager()
