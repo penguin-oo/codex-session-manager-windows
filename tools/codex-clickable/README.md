@@ -16,7 +16,8 @@ directory, and `:line[:column]` locations are preserved in the editor URI.
 
 Only editor URIs generated internally from parsed local paths are trusted. A model-provided
 `vscode://`, `cursor://`, or similar URI is not promoted to a clickable terminal link. Existing
-`http` and `https` handling remains unchanged.
+`http` and `https` handling remains unchanged. UNC network shares and Windows device namespace
+paths remain visible text but are not promoted to editor links.
 
 ## Build
 

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,33 @@ import token_pool_settings
 
 
 class ProxyRoutingTests(unittest.TestCase):
+    def test_save_proxy_settings_preserves_unknown_local_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "proxy_enabled": False,
+                        "proxy_port": 7897,
+                        "codex_executable": "C:\\Tools\\codex-clickable.exe",
+                        "future_local_setting": {"enabled": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            mobile_portal.save_proxy_settings(
+                proxy_enabled=True,
+                proxy_port=7898,
+                settings_file=settings_file,
+            )
+
+            saved = json.loads(settings_file.read_text(encoding="utf-8"))
+            self.assertEqual("C:\\Tools\\codex-clickable.exe", saved["codex_executable"])
+            self.assertEqual({"enabled": True}, saved["future_local_setting"])
+            self.assertTrue(saved["proxy_enabled"])
+            self.assertEqual(7898, saved["proxy_port"])
+
     def test_apply_standard_preset_persists_form_edits_before_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings_file = Path(temp_dir) / "settings.json"

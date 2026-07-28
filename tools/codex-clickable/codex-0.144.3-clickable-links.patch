@@ -6,7 +6,7 @@ index dc8262f..8e2ed98 100644
 +    markdown_render::set_uri_file_opener(config.file_opener);
 +
 diff --git a/tui/src/markdown_render.rs b/tui/src/markdown_render.rs
-index 52b603b..7e4b809 100644
+index 52b603b..cc18db9 100644
 --- a/tui/src/markdown_render.rs
 +++ b/tui/src/markdown_render.rs
 @@ -54,0 +55 @@ use crate::wrapping::word_wrap_line;
@@ -88,7 +88,7 @@ index 52b603b..7e4b809 100644
 @@ -1794 +1846 @@ where
 -                    self.push_span(span);
 +                    self.push_annotated(target);
-@@ -2018,0 +2071,78 @@ fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Option<String
+@@ -2018,0 +2071,81 @@ fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Option<String
 +fn editor_uri_for_local_link(
 +    dest_url: &str,
 +    cwd: Option<&Path>,
@@ -97,6 +97,9 @@ index 52b603b..7e4b809 100644
 +    let scheme = file_opener.get_scheme()?;
 +    let (path_text, location_suffix) = parse_local_link_target(dest_url)?;
 +    let mut target_path = absolute_editor_path(&path_text, cwd)?;
++    if target_path.starts_with("//") {
++        return None;
++    }
 +    if !target_path.starts_with('/') {
 +        target_path.insert(0, '/');
 +    }
@@ -167,7 +170,7 @@ index 52b603b..7e4b809 100644
 +    &location_suffix[..end]
 +}
 +
-@@ -2407 +2537,7 @@ mod tests {
+@@ -2407 +2540,7 @@ mod tests {
 -        let writer = W::new("", std::iter::empty(), Some(80), /*cwd*/ None);
 +        let writer = W::new(
 +            "",
@@ -177,14 +180,14 @@ index 52b603b..7e4b809 100644
 +            UriBasedFileOpener::None,
 +        );
 diff --git a/tui/src/markdown_render_tests.rs b/tui/src/markdown_render_tests.rs
-index e0e498e..58287d9 100644
+index e0e498e..113d324 100644
 --- a/tui/src/markdown_render_tests.rs
 +++ b/tui/src/markdown_render_tests.rs
 @@ -8,0 +9 @@ use std::path::Path;
 +use codex_config::types::UriBasedFileOpener;
 @@ -10,0 +12 @@ use crate::markdown_render::HASH_LOCATION_SUFFIX_RE;
 +use crate::markdown_render::render_markdown_lines_with_width_cwd_and_file_opener;
-@@ -784,0 +787,88 @@ fn file_link_hides_destination() {
+@@ -784,0 +787,109 @@ fn file_link_hides_destination() {
 +#[test]
 +fn file_link_emits_encoded_vscode_uri_without_changing_visible_text() {
 +    let lines = render_markdown_lines_with_width_cwd_and_file_opener(
@@ -271,6 +274,27 @@ index e0e498e..58287d9 100644
 +    );
 +
 +    assert!(lines.iter().all(|line| line.hyperlinks.is_empty()));
++}
++
++#[test]
++fn network_and_device_file_links_are_not_promoted_to_trusted_links() {
++    for input in [
++        "[network](file://server/share/main.rs)",
++        "[unc](//server/share/main.rs)",
++        "[device](//?/C:/workspace/main.rs)",
++    ] {
++        let lines = render_markdown_lines_with_width_cwd_and_file_opener(
++            input,
++            /*width*/ Some(80),
++            /*cwd*/ Some(Path::new("D:/workspace")),
++            UriBasedFileOpener::VsCode,
++        );
++
++        assert!(
++            lines.iter().all(|line| line.hyperlinks.is_empty()),
++            "unexpected trusted hyperlink for {input}"
++        );
++    }
 +}
 +
 diff --git a/tui/src/terminal_hyperlinks.rs b/tui/src/terminal_hyperlinks.rs

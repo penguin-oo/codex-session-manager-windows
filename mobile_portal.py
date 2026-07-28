@@ -1288,13 +1288,23 @@ def save_proxy_settings(
     if port < 1 or port > 65535:
         raise ValueError("Proxy port must be between 1 and 65535.")
     existing = load_proxy_settings(settings_file)
-    payload = {
-        "proxy_enabled": bool(proxy_enabled),
-        "proxy_port": port,
-        "public_urls": normalize_public_urls(existing.get("public_urls", []) if public_urls is None else public_urls),
-        "remote_restart": existing.get("remote_restart", {}) if isinstance(existing.get("remote_restart", {}), dict) else {},
-        "default_portal_urls": normalize_public_urls(existing.get("default_portal_urls", [])),
-    }
+    payload: dict[str, object] = {}
+    if settings_file.exists():
+        try:
+            raw_payload = json.loads(settings_file.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            raw_payload = {}
+        if isinstance(raw_payload, dict):
+            payload.update(raw_payload)
+    payload.update(
+        {
+            "proxy_enabled": bool(proxy_enabled),
+            "proxy_port": port,
+            "public_urls": normalize_public_urls(existing.get("public_urls", []) if public_urls is None else public_urls),
+            "remote_restart": existing.get("remote_restart", {}) if isinstance(existing.get("remote_restart", {}), dict) else {},
+            "default_portal_urls": normalize_public_urls(existing.get("default_portal_urls", [])),
+        }
+    )
     settings_file.parent.mkdir(parents=True, exist_ok=True)
     settings_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
