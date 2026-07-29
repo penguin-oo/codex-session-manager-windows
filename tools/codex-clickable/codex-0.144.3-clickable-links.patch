@@ -1,12 +1,45 @@
+diff --git a/config/src/types.rs b/config/src/types.rs
+index 5303fccd43b632d71224d3caad97e35931115d64..a8ebf85ebca11396d44a41e7a19987cd049f2d7c 100644
+--- a/config/src/types.rs
++++ b/config/src/types.rs
+@@ -166,0 +167,3 @@ pub enum UriBasedFileOpener {
++    #[serde(rename = "explorer")]
++    Explorer,
++
+@@ -178,0 +182 @@ impl UriBasedFileOpener {
++            UriBasedFileOpener::Explorer => Some("codex-location"),
+diff --git a/config/src/types_tests.rs b/config/src/types_tests.rs
+index 2c3f69d9867ef65c2aa9058000b897f5c071f549..4fb612189a0d23acac78d7d525c7cfa5eb2c7211 100644
+--- a/config/src/types_tests.rs
++++ b/config/src/types_tests.rs
+@@ -3,0 +4,10 @@ use pretty_assertions::assert_eq;
++#[test]
++#[allow(non_snake_case)]
++fn UriBasedFileOpener_deserializes_explorer_with_codex_location_scheme() {
++    let opener: UriBasedFileOpener =
++        serde_json::from_str("\"explorer\"").expect("explorer should deserialize");
++
++    assert_eq!(opener, UriBasedFileOpener::Explorer);
++    assert_eq!(opener.get_scheme(), Some("codex-location"));
++}
++
+diff --git a/core/config.schema.json b/core/config.schema.json
+index fb4d8740ba772fa6d5d0b00ebcf38c376f923a02..059182c8932645a29c198e71ee6d83d191871cd6 100644
+--- a/core/config.schema.json
++++ b/core/config.schema.json
+@@ -4496 +4496,2 @@
+-            "cursor"
++            "cursor",
++            "explorer"
 diff --git a/tui/src/lib.rs b/tui/src/lib.rs
-index dc8262f..8e2ed98 100644
+index dc8262f7db30c91895ef1804f23b364075f870e4..8e2ed987c0a54cdc3441545b0786ecdecd87defa 100644
 --- a/tui/src/lib.rs
 +++ b/tui/src/lib.rs
 @@ -1670,0 +1671,2 @@ async fn run_ratatui_app(
 +    markdown_render::set_uri_file_opener(config.file_opener);
 +
 diff --git a/tui/src/markdown_render.rs b/tui/src/markdown_render.rs
-index 52b603b..cc18db9 100644
+index 52b603bce0b5fd5f958d0774dfbabd7ac89e74ce..9f042604dcee4afa449a1f8b1a69548c89e0b438 100644
 --- a/tui/src/markdown_render.rs
 +++ b/tui/src/markdown_render.rs
 @@ -54,0 +55 @@ use crate::wrapping::word_wrap_line;
@@ -88,7 +121,7 @@ index 52b603b..cc18db9 100644
 @@ -1794 +1846 @@ where
 -                    self.push_span(span);
 +                    self.push_annotated(target);
-@@ -2018,0 +2071,81 @@ fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Option<String
+@@ -2018,0 +2071,93 @@ fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Option<String
 +fn editor_uri_for_local_link(
 +    dest_url: &str,
 +    cwd: Option<&Path>,
@@ -99,6 +132,18 @@ index 52b603b..cc18db9 100644
 +    let mut target_path = absolute_editor_path(&path_text, cwd)?;
 +    if target_path.starts_with("//") {
 +        return None;
++    }
++    if matches!(file_opener, UriBasedFileOpener::Explorer) {
++        if !matches!(
++            target_path.as_bytes(),
++            [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
++        ) {
++            return None;
++        }
++        target_path.insert(0, '/');
++        let mut url = Url::parse(&format!("{scheme}:///")).ok()?;
++        url.set_path(&target_path);
++        return Some(url.to_string());
 +    }
 +    if !target_path.starts_with('/') {
 +        target_path.insert(0, '/');
@@ -170,7 +215,7 @@ index 52b603b..cc18db9 100644
 +    &location_suffix[..end]
 +}
 +
-@@ -2407 +2540,7 @@ mod tests {
+@@ -2407 +2552,7 @@ mod tests {
 -        let writer = W::new("", std::iter::empty(), Some(80), /*cwd*/ None);
 +        let writer = W::new(
 +            "",
@@ -180,14 +225,14 @@ index 52b603b..cc18db9 100644
 +            UriBasedFileOpener::None,
 +        );
 diff --git a/tui/src/markdown_render_tests.rs b/tui/src/markdown_render_tests.rs
-index e0e498e..113d324 100644
+index e0e498e69afba21925b53da4540ba084067aec29..b7ef39260b9408a1a0b7b0eb32bafa0d6950e65c 100644
 --- a/tui/src/markdown_render_tests.rs
 +++ b/tui/src/markdown_render_tests.rs
 @@ -8,0 +9 @@ use std::path::Path;
 +use codex_config::types::UriBasedFileOpener;
 @@ -10,0 +12 @@ use crate::markdown_render::HASH_LOCATION_SUFFIX_RE;
 +use crate::markdown_render::render_markdown_lines_with_width_cwd_and_file_opener;
-@@ -784,0 +787,109 @@ fn file_link_hides_destination() {
+@@ -784,0 +787,222 @@ fn file_link_hides_destination() {
 +#[test]
 +fn file_link_emits_encoded_vscode_uri_without_changing_visible_text() {
 +    let lines = render_markdown_lines_with_width_cwd_and_file_opener(
@@ -208,6 +253,119 @@ index e0e498e..113d324 100644
 +    assert_eq!(
 +        lines[0].hyperlinks[0].destination,
 +        "vscode://file/D:/workspace/Example%20Folder/%E6%B5%8B%E8%AF%95.rs:12:3"
++    );
++}
++
++#[test]
++fn explorer_location_file_strips_line_and_column() {
++    let lines = render_markdown_lines_with_width_cwd_and_file_opener(
++        "[source](D:/workspace/src/main.rs:42:7)",
++        /*width*/ Some(80),
++        /*cwd*/ Some(Path::new("D:/workspace")),
++        UriBasedFileOpener::Explorer,
++    );
++
++    assert_eq!(lines[0].hyperlinks.len(), 1);
++    assert_eq!(
++        lines[0].hyperlinks[0].destination,
++        "codex-location:///D:/workspace/src/main.rs"
++    );
++}
++
++#[test]
++fn explorer_location_directory_preserves_trailing_slash() {
++    let lines = render_markdown_lines_with_width_cwd_and_file_opener(
++        "[folder](D:/workspace/src/)",
++        /*width*/ Some(80),
++        /*cwd*/ Some(Path::new("D:/workspace")),
++        UriBasedFileOpener::Explorer,
++    );
++
++    assert_eq!(lines[0].hyperlinks.len(), 1);
++    assert_eq!(
++        lines[0].hyperlinks[0].destination,
++        "codex-location:///D:/workspace/src/"
++    );
++}
++
++#[test]
++fn explorer_location_relative_path_resolves_against_conversation_cwd() {
++    let lines = render_markdown_lines_with_width_cwd_and_file_opener(
++        "[source](./src/main.rs:9)",
++        /*width*/ Some(80),
++        /*cwd*/ Some(Path::new("D:/workspace")),
++        UriBasedFileOpener::Explorer,
++    );
++
++    assert_eq!(lines[0].hyperlinks.len(), 1);
++    assert_eq!(
++        lines[0].hyperlinks[0].destination,
++        "codex-location:///D:/workspace/src/main.rs"
++    );
++}
++
++#[test]
++fn explorer_location_percent_encodes_spaces_and_non_ascii() {
++    let lines = render_markdown_lines_with_width_cwd_and_file_opener(
++        "[source](D:/workspace/Example%20Folder/%E6%B5%8B%E8%AF%95.rs)",
++        /*width*/ Some(80),
++        /*cwd*/ Some(Path::new("D:/workspace")),
++        UriBasedFileOpener::Explorer,
++    );
++
++    assert_eq!(lines[0].hyperlinks.len(), 1);
++    assert_eq!(
++        lines[0].hyperlinks[0].destination,
++        "codex-location:///D:/workspace/Example%20Folder/%E6%B5%8B%E8%AF%95.rs"
++    );
++}
++
++#[test]
++fn explorer_location_rejects_unc_and_device_paths() {
++    for input in [
++        "[network](file://server/share/main.rs)",
++        "[unc](//server/share/main.rs)",
++        "[device](//?/C:/workspace/main.rs)",
++    ] {
++        let lines = render_markdown_lines_with_width_cwd_and_file_opener(
++            input,
++            /*width*/ Some(80),
++            /*cwd*/ Some(Path::new("D:/workspace")),
++            UriBasedFileOpener::Explorer,
++        );
++
++        assert!(
++            lines.iter().all(|line| line.hyperlinks.is_empty()),
++            "unexpected trusted hyperlink for {input}"
++        );
++    }
++}
++
++#[test]
++fn explorer_location_model_provided_scheme_is_not_promoted() {
++    let lines = render_markdown_lines_with_width_cwd_and_file_opener(
++        "[source](codex-location:///D:/workspace/src/main.rs)",
++        /*width*/ Some(80),
++        /*cwd*/ Some(Path::new("D:/workspace")),
++        UriBasedFileOpener::Explorer,
++    );
++
++    assert!(lines.iter().all(|line| line.hyperlinks.is_empty()));
++}
++
++#[test]
++fn explorer_location_existing_vscode_opener_preserves_line_and_column() {
++    let lines = render_markdown_lines_with_width_cwd_and_file_opener(
++        "[source](D:/workspace/src/main.rs:42:7)",
++        /*width*/ Some(80),
++        /*cwd*/ Some(Path::new("D:/workspace")),
++        UriBasedFileOpener::VsCode,
++    );
++
++    assert_eq!(lines[0].hyperlinks.len(), 1);
++    assert_eq!(
++        lines[0].hyperlinks[0].destination,
++        "vscode://file/D:/workspace/src/main.rs:42:7"
 +    );
 +}
 +
@@ -298,7 +456,7 @@ index e0e498e..113d324 100644
 +}
 +
 diff --git a/tui/src/terminal_hyperlinks.rs b/tui/src/terminal_hyperlinks.rs
-index 21d6b5d..611b64f 100644
+index 21d6b5d2e489a949763c0e435643f6f459f87c29..8504d9109423afb6fc67d2be209ac87c9b93ac56 100644
 --- a/tui/src/terminal_hyperlinks.rs
 +++ b/tui/src/terminal_hyperlinks.rs
 @@ -50,0 +51,8 @@ impl HyperlinkLine {
@@ -313,16 +471,23 @@ index 21d6b5d..611b64f 100644
 @@ -55 +63 @@ impl HyperlinkLine {
 -            && let Some(destination) = destination.and_then(web_destination)
 +            && let Some(destination) = destination
-@@ -321,0 +330,25 @@ pub(crate) fn web_destination(destination: &str) -> Option<String> {
+@@ -321,0 +330,32 @@ pub(crate) fn web_destination(destination: &str) -> Option<String> {
 +fn editor_destination(destination: &str) -> Option<String> {
 +    if destination.chars().any(char::is_control) {
 +        return None;
 +    }
 +    let parsed = Url::parse(destination).ok()?;
-+    if !matches!(
++    let editor_file_uri = matches!(
 +        parsed.scheme(),
 +        "vscode" | "vscode-insiders" | "windsurf" | "cursor"
-+    ) || parsed.host_str() != Some("file")
++    ) && parsed.host_str() == Some("file");
++    let explorer_location_uri = parsed.scheme() == "codex-location"
++        && parsed.host_str().is_none()
++        && matches!(
++            parsed.path().as_bytes(),
++            [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
++        );
++    if !(editor_file_uri || explorer_location_uri)
 +        || !parsed.username().is_empty()
 +        || parsed.password().is_some()
 +        || parsed.port().is_some()
@@ -339,7 +504,7 @@ index 21d6b5d..611b64f 100644
 +    web_destination(destination).or_else(|| editor_destination(destination))
 +}
 +
-@@ -328,0 +362,7 @@ pub(crate) fn osc8_hyperlink(destination: &str, text: &str) -> String {
+@@ -328,0 +369,7 @@ pub(crate) fn osc8_hyperlink(destination: &str, text: &str) -> String {
 +fn annotated_osc8_hyperlink(destination: &str, text: &str) -> String {
 +    let Some(safe_destination) = annotated_destination(destination) else {
 +        return text.to_string();
@@ -347,18 +512,18 @@ index 21d6b5d..611b64f 100644
 +    format!("\x1b]8;;{safe_destination}\x07{text}\x1b]8;;\x07")
 +}
 +
-@@ -391 +431 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
+@@ -391 +438 @@ pub(crate) fn decorate_spans(line: &HyperlinkLine) -> Vec<Span<'static>> {
 -                    .and_then(|index| web_destination(&line.hyperlinks[index].destination));
 +                    .and_then(|index| annotated_destination(&line.hyperlinks[index].destination));
-@@ -477 +517 @@ pub(crate) fn mark_buffer_hyperlinks(
+@@ -477 +524 @@ pub(crate) fn mark_buffer_hyperlinks(
 -                    let symbol = osc8_hyperlink(&link.destination, cell.symbol());
 +                    let symbol = annotated_osc8_hyperlink(&link.destination, cell.symbol());
-@@ -524,0 +565,4 @@ mod tests {
+@@ -524,0 +572,4 @@ mod tests {
 +        assert_eq!(
 +            osc8_hyperlink("vscode://file/C:/workspace/main.rs:12:3", "main.rs"),
 +            "main.rs"
 +        );
-@@ -534,0 +579,27 @@ mod tests {
+@@ -534,0 +586,43 @@ mod tests {
 +    #[test]
 +    fn trusted_editor_span_receives_osc8() {
 +        let destination = "vscode://file/C:/workspace/main.rs:12:3";
@@ -373,6 +538,22 @@ index 21d6b5d..611b64f 100644
 +            .collect::<String>();
 +        assert!(rendered.contains(&format!("\x1b]8;;{destination}\x07")));
 +        assert_eq!(strip_osc8(&rendered), "main.rs:12:3");
++    }
++
++    #[test]
++    fn trusted_explorer_span_receives_osc8() {
++        let destination = "codex-location:///C:/workspace/main.rs";
++        let mut line = HyperlinkLine::new(Line::default());
++        line.push_editor_span(Span::from("main.rs"), Some(destination));
++
++        assert_eq!(line.hyperlinks.len(), 1);
++        assert_eq!(line.hyperlinks[0].destination, destination);
++        let rendered = decorate_spans(&line)
++            .into_iter()
++            .map(|span| span.content.into_owned())
++            .collect::<String>();
++        assert!(rendered.contains(&format!("\x1b]8;;{destination}\x07")));
++        assert_eq!(strip_osc8(&rendered), "main.rs");
 +    }
 +
 +    #[test]

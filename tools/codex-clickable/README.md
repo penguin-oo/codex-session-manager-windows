@@ -1,61 +1,72 @@
 # Clickable Codex CLI file links
 
-This optional patch adds OSC 8 editor links to local file and directory links rendered by the
-Codex TUI. It is intentionally separate from the official Codex installation.
+This optional patch adds OSC 8 links for local files and directories rendered
+by the Codex TUI. It remains separate from the official Codex installation.
 
 ## Compatibility
 
 - Upstream source tag: `rust-v0.144.3`
 - Patch file: `codex-0.144.3-clickable-links.patch`
-- Supported `file_opener` values: `vscode`, `vscode-insiders`, `windsurf`, `cursor`, and `none`
+- Supported `file_opener` values: `vscode`, `vscode-insiders`, `windsurf`,
+  `cursor`, `explorer`, and `none`
 
-The visible path text is unchanged. Relative paths are resolved against the conversation working
-directory, and `:line[:column]` locations are preserved in the editor URI.
+Editor modes preserve `:line[:column]` locations. The Windows-only `explorer`
+mode instead removes line and column suffixes, reveals a file in its parent
+folder, and opens a directory directly.
 
 ## Security boundary
 
-Only editor URIs generated internally from parsed local paths are trusted. A model-provided
-`vscode://`, `cursor://`, or similar URI is not promoted to a clickable terminal link. Existing
-`http` and `https` handling remains unchanged. UNC network shares and Windows device namespace
-paths remain visible text but are not promoted to editor links.
+Only links generated internally from parsed local paths are trusted. Explorer
+mode accepts local fixed-drive paths through a private `codex-location` URI
+handler. It rejects URI hosts, queries, fragments, UNC paths, device paths,
+alternate data streams, control characters, shell expansion, and unowned
+protocol registrations. Existing `http` and `https` handling is unchanged.
+
+The protocol is registered only for the current Windows user. It launches
+Windows File Explorer directly without `cmd.exe` or `Invoke-Expression`.
 
 ## Build
 
-Apply the patch from the upstream `codex-rs` directory:
+Apply the patch from an upstream `codex-rs` directory:
 
 ```powershell
 git apply --unidiff-zero C:\absolute\path\to\codex-0.144.3-clickable-links.patch
+cargo +1.95.0-x86_64-pc-windows-msvc test -p codex-config UriBasedFileOpener --lib
 cargo +1.95.0-x86_64-pc-windows-msvc test -p codex-tui markdown_render --lib
 cargo +1.95.0-x86_64-pc-windows-msvc test -p codex-tui terminal_hyperlinks --lib
 cargo +1.95.0-x86_64-pc-windows-msvc build -p codex-cli --bin codex --release
 ```
 
-On Windows, run the commands from an x64 Visual Studio developer shell. Keep `CARGO_TARGET_DIR`
-on the same drive as the source tree because the `v8` build script otherwise requires cross-drive
-symbolic-link privileges.
+Use an x64 Visual Studio developer shell. Keep `CARGO_TARGET_DIR` on the same
+drive as the source tree when the `v8` build script cannot create cross-drive
+symbolic links.
 
-## Local activation
+## Explorer activation
 
-Keep the custom executable outside the repository, for example:
+Install the handler from this directory:
 
-```text
-%USERPROFILE%\.codex\bin\codex-clickable.exe
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-codex-location-handler.ps1
 ```
 
-Set the root-level Codex option:
+Then set the root-level Codex option:
 
 ```toml
-file_opener = "vscode"
+file_opener = "explorer"
 ```
 
-Then add the executable override to the local, ignored
-`%USERPROFILE%\.codex\mobile_portal_settings.json`:
+Keep the custom executable outside the repository and point the session
+manager's local ignored settings at it. The manager health-checks the override
+and falls back to the official `codex.cmd` when it is unavailable or invalid.
+Existing Codex processes keep their current executable.
 
-```json
-{
-  "codex_executable": "%USERPROFILE%\\.codex\\bin\\codex-clickable.exe"
-}
+Inspect or remove the current-user protocol registration with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-codex-location-handler.ps1 -Mode Inspect
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-codex-location-handler.ps1 -Mode Uninstall
 ```
 
-The session manager checks `<custom executable> --version` before each cached selection. A missing,
-timed-out, or invalid custom executable falls back to the official `codex.cmd`.
+Explorer links require no Android change, mobile service, network port, or
+remote API. To roll back, set `file_opener` to the previous value, restore the
+previous custom executable override, and uninstall the protocol handler.
