@@ -77,14 +77,16 @@ Activation will:
 - Install the handler under the local Codex bin directory.
 - Register the current-user URI protocol.
 - Set `file_opener = "explorer"` in the local Codex config.
-- Atomically replace only the separate `codex-clickable.exe` after the rebuilt
-  binary passes health checks.
+- Install the rebuilt CLI under a new separate filename and update the local
+  `codex_executable` override only after the new binary passes health checks.
+  Existing Codex processes and the previous separate binary remain untouched.
 
 The official Codex installation will not be modified. The desktop manager's
 existing health check and fallback remain in place.
 
 Rollback will restore the config backup, unregister or restore the previous
-current-user protocol key, and restore the previous separate custom binary.
+current-user protocol key, and point `codex_executable` back to the previous
+separate custom binary.
 
 ## Testing
 
