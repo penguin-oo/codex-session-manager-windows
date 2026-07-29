@@ -13,6 +13,31 @@ function Exit-InvalidRequest {
     exit 1
 }
 
+function ConvertTo-WindowsQuotedArgument {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Value
+    )
+
+    $trailingBackslashCount = 0
+    for ($index = $Value.Length - 1; $index -ge 0; $index--) {
+        if ($Value[$index] -ne [char]0x5C) {
+            break
+        }
+        $trailingBackslashCount++
+    }
+
+    $escapedSuffix = ""
+    if ($trailingBackslashCount -gt 0) {
+        $escapedSuffix = [string]::new(
+            [char]0x5C,
+            $trailingBackslashCount
+        )
+    }
+
+    return [string]::Concat('"', $Value, $escapedSuffix, '"')
+}
+
 if ([string]::IsNullOrWhiteSpace($Uri) -or
     -not $Uri.StartsWith("codex-location:", [StringComparison]::Ordinal)) {
     Exit-InvalidRequest
@@ -47,16 +72,10 @@ try {
     }
 
     $uriSuffix = $parsedUri.OriginalString.Substring("codex-location:".Length)
-    if ($uriSuffix.StartsWith("///", [StringComparison]::Ordinal)) {
-        $escapedPath = $uriSuffix.Substring(2)
-    }
-    elseif ($uriSuffix.StartsWith("/", [StringComparison]::Ordinal) -and
-        -not $uriSuffix.StartsWith("//", [StringComparison]::Ordinal)) {
-        $escapedPath = $uriSuffix
-    }
-    else {
+    if (-not $uriSuffix.StartsWith("///", [StringComparison]::Ordinal)) {
         Exit-InvalidRequest
     }
+    $escapedPath = $uriSuffix.Substring(2)
 
     $decodedPath = [Uri]::UnescapeDataString($escapedPath)
     if ($decodedPath -cnotmatch "^/[A-Za-z]:/" -or
@@ -66,22 +85,12 @@ try {
     }
 
     $forbiddenCharacters = [char[]] @(
-        [char]0x21, # !
         [char]0x22, # double quote
-        [char]0x23, # #
-        [char]0x24, # $
-        [char]0x25, # %
-        [char]0x26, # &
-        [char]0x27, # single quote
-        [char]0x3B, # ;
+        [char]0x2A, # *
         [char]0x3C, # <
         [char]0x3E, # >
-        [char]0x40, # @
-        [char]0x5E, # ^
-        [char]0x60, # backtick
-        [char]0x7B, # {
+        [char]0x3F, # ?
         [char]0x7C, # |
-        [char]0x7D, # }
         [char]0xFFFD
     )
     if ($decodedPath.IndexOfAny($forbiddenCharacters) -ge 0) {
@@ -128,11 +137,14 @@ try {
         Exit-InvalidRequest
     }
 
+    $quotedTargetPath = ConvertTo-WindowsQuotedArgument -Value $targetPath
     if ($action -eq "select-file") {
-        [string[]] $explorerArguments = @(('/select,"{0}"' -f $targetPath))
+        [string[]] $explorerArguments = @(
+            [string]::Concat("/select,", $quotedTargetPath)
+        )
     }
     else {
-        [string[]] $explorerArguments = @(('"{0}"' -f $targetPath))
+        [string[]] $explorerArguments = @($quotedTargetPath)
     }
 
     if ($DryRun) {

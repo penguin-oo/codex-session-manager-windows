@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 import subprocess
@@ -9,6 +10,34 @@ from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HANDLER = REPO_ROOT / "tools" / "codex-clickable" / "codex-location-handler.ps1"
+
+
+def parse_explorer_argument(argument: str) -> list[str]:
+    command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+    command_line_to_argv.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    local_free = ctypes.windll.kernel32.LocalFree
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+
+    argument_count = ctypes.c_int()
+    argument_vector = command_line_to_argv(
+        f"explorer.exe {argument}",
+        ctypes.byref(argument_count),
+    )
+    if not argument_vector:
+        raise ctypes.WinError()
+
+    try:
+        return [
+            argument_vector[index]
+            for index in range(1, argument_count.value)
+        ]
+    finally:
+        local_free(ctypes.cast(argument_vector, ctypes.c_void_p))
 
 
 def location_uri(path: Path | str) -> str:
@@ -56,8 +85,13 @@ class CodexLocationHandlerTests(unittest.TestCase):
             check=False,
         )
 
-    def run_handler(self, uri: str) -> dict[str, object]:
-        completed = self.invoke_handler(uri)
+    def run_handler(
+        self,
+        uri: str,
+        *,
+        extra_environment: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        completed = self.invoke_handler(uri, extra_environment=extra_environment)
         self.assertEqual(
             0,
             completed.returncode,
@@ -122,6 +156,30 @@ class CodexLocationHandlerTests(unittest.TestCase):
         self.assert_path_equal(directory, payload["path"])
         self.assertEqual([f'"{directory}"'], payload["arguments"])
 
+    def test_trailing_separator_directory_argument_round_trips(self) -> None:
+        directory = self.root / "trailing-separator"
+        directory.mkdir()
+        directory_with_separator = f"{directory}\\"
+
+        payload = self.run_handler(location_uri(directory_with_separator))
+
+        self.assertEqual(directory_with_separator, payload["path"])
+        self.assertEqual(
+            [directory_with_separator],
+            parse_explorer_argument(payload["arguments"][0]),
+        )
+
+    def test_drive_root_argument_round_trips(self) -> None:
+        drive_root = self.root.anchor
+
+        payload = self.run_handler(location_uri(drive_root))
+
+        self.assertEqual(drive_root, payload["path"])
+        self.assertEqual(
+            [drive_root],
+            parse_explorer_argument(payload["arguments"][0]),
+        )
+
     def test_missing_file_opens_existing_parent(self) -> None:
         missing_file = self.root / "missing.txt"
 
@@ -148,13 +206,29 @@ class CodexLocationHandlerTests(unittest.TestCase):
         self.assertEqual("select-file", file_payload["action"])
         self.assert_path_equal(unicode_file, file_payload["path"])
 
-    def test_encoded_quotes_and_control_characters_are_rejected(self) -> None:
-        quoted_uri = location_uri(f'{self.root}\\bad"name.txt')
-        control_uri = location_uri(f"{self.root}\\bad\nname.txt")
-        self.assertIn("%22", quoted_uri)
-        self.assertIn("%0A", control_uri)
+    def test_legal_windows_path_characters_are_accepted(self) -> None:
+        file_path = self.root / "legal ! # $ % & ' ; @ ^ ` { }.txt"
+        file_path.write_text("content", encoding="utf-8")
 
-        for uri in (quoted_uri, control_uri):
+        payload = self.run_handler(location_uri(file_path))
+
+        self.assertEqual("select-file", payload["action"])
+        self.assert_path_equal(file_path, payload["path"])
+
+    def test_invalid_windows_characters_and_controls_are_rejected(self) -> None:
+        unsafe_paths = [
+            f"{self.root}\\bad{character}name.txt"
+            for character in '<>"|?*'
+        ]
+        unsafe_paths.extend(
+            (
+                f"{self.root}\\bad\nname.txt",
+                f"{self.root}\\bad\uFFFDname.txt",
+            )
+        )
+
+        for path in unsafe_paths:
+            uri = location_uri(path)
             with self.subTest(uri=uri):
                 self.assert_rejected(uri)
 
@@ -175,11 +249,23 @@ class CodexLocationHandlerTests(unittest.TestCase):
             with self.subTest(uri=uri):
                 self.assert_rejected(uri)
 
+    def test_single_slash_uri_is_rejected(self) -> None:
+        directory = self.root / "single-slash"
+        directory.mkdir()
+        uri = location_uri(directory).replace(
+            "codex-location:///",
+            "codex-location:/",
+            1,
+        )
+
+        self.assert_rejected(uri)
+
     def test_unc_device_namespace_and_ads_paths_are_rejected(self) -> None:
         unsafe_uris = (
             "codex-location:////server/share/file.txt",
             "codex-location:///%5C%5C%3F%5CC%3A%5CWindows%5Cfile.txt",
             "codex-location:///%5C%5C.%5CPhysicalDrive0",
+            f"{location_uri(self.root)}%5Cchild.txt",
             f"{location_uri(self.root / 'safe.txt')}:stream",
         )
 
@@ -187,44 +273,49 @@ class CodexLocationHandlerTests(unittest.TestCase):
             with self.subTest(uri=uri):
                 self.assert_rejected(uri)
 
-    def test_malformed_and_double_encoded_input_is_rejected(self) -> None:
-        base_uri = location_uri(self.root)
-        unsafe_uris = (
-            f"{base_uri}/bad%ZZname.txt",
-            f"{base_uri}/bad%2522name.txt",
-            f"{base_uri}/bad%253Astream.txt",
+    def test_malformed_percent_escape_is_rejected(self) -> None:
+        self.assert_rejected(f"{location_uri(self.root)}/bad%ZZname.txt")
+
+    def test_double_encoded_text_remains_literal(self) -> None:
+        literal_paths = (
+            self.root / "bad%22name.txt",
+            self.root / "bad%3Astream.txt",
         )
+        for path in literal_paths:
+            path.write_text("content", encoding="utf-8")
 
-        for uri in unsafe_uris:
-            with self.subTest(uri=uri):
-                self.assert_rejected(uri)
+        for path in literal_paths:
+            with self.subTest(path=path):
+                payload = self.run_handler(location_uri(path))
+                self.assertEqual("select-file", payload["action"])
+                self.assert_path_equal(path, payload["path"])
 
-    def test_environment_variable_text_is_not_expanded(self) -> None:
+    def test_environment_variable_text_remains_literal(self) -> None:
         literal_directory = self.root / "%CODEX_LOCATION_SENTINEL%"
         literal_directory.mkdir()
         expanded_directory = self.root / "expanded"
         expanded_directory.mkdir()
 
-        completed = self.invoke_handler(
+        payload = self.run_handler(
             location_uri(literal_directory),
             extra_environment={"CODEX_LOCATION_SENTINEL": str(expanded_directory)},
         )
 
-        self.assertNotEqual(0, completed.returncode)
-        self.assertEqual("", completed.stdout.strip())
+        self.assertEqual("open-directory", payload["action"])
+        self.assert_path_equal(literal_directory, payload["path"])
 
-    def test_command_text_is_rejected_without_side_effects(self) -> None:
+    def test_command_text_is_treated_as_path_without_side_effects(self) -> None:
         marker = self.root / "handler-side-effect.txt"
         injected_path = (
             f"{self.root}\\missing.txt; "
             "New-Item -ItemType File -Path handler-side-effect.txt"
         )
 
-        completed = self.invoke_handler(location_uri(injected_path))
+        payload = self.run_handler(location_uri(injected_path))
 
-        self.assertNotEqual(0, completed.returncode)
+        self.assertEqual("open-parent", payload["action"])
+        self.assert_path_equal(self.root, payload["path"])
         self.assertFalse(marker.exists())
-        self.assertEqual("", completed.stdout.strip())
 
 
 if __name__ == "__main__":
