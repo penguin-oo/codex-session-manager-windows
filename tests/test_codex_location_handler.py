@@ -877,11 +877,17 @@ class CodexLocationInstallerTests(unittest.TestCase):
         self,
         source: Path,
         handler: Path,
+        *,
+        commit_mode: str = "fail",
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["CODEX_TEST_INSTALLER"] = str(INSTALLER)
         environment["CODEX_TEST_SOURCE"] = str(source)
         environment["CODEX_TEST_HANDLER"] = str(handler)
+        environment["CODEX_TEST_COMMIT_MODE"] = commit_mode
+        environment["CODEX_TEST_SIDE_EFFECT"] = str(
+            handler.parent / "registration-created.txt"
+        )
         command = r"""
 $tokens = $null
 $errors = $null
@@ -902,11 +908,35 @@ if ($null -eq $functionAst) {
 
 $caughtInjectedFailure = $false
 $failureMessage = $null
+$transactionSucceeded = $false
+if ($env:CODEX_TEST_COMMIT_MODE -eq "cleanup-failure") {
+    $commitAction = {
+        [IO.File]::WriteAllText(
+            $env:CODEX_TEST_SIDE_EFFECT,
+            "registration created"
+        )
+        $backup = Get-ChildItem `
+            -LiteralPath ([IO.Path]::GetDirectoryName($env:CODEX_TEST_HANDLER)) `
+            -Filter ".codex-location-handler.*.bak" |
+            Select-Object -First 1
+        if ($null -eq $backup) {
+            throw "Transaction backup is missing."
+        }
+        [IO.File]::SetAttributes(
+            $backup.FullName,
+            [IO.FileAttributes]::ReadOnly
+        )
+    }
+}
+else {
+    $commitAction = { throw "Injected registration failure." }
+}
 try {
     Invoke-CodexHandlerFileTransaction `
         -SourceHandlerPath $env:CODEX_TEST_SOURCE `
         -HandlerPath $env:CODEX_TEST_HANDLER `
-        -CommitAction { throw "Injected registration failure." }
+        -CommitAction $commitAction
+    $transactionSucceeded = $true
 }
 catch {
     $failureMessage = $_.Exception.Message
@@ -924,8 +954,10 @@ $handlerDirectory = [IO.Path]::GetDirectoryName($env:CODEX_TEST_HANDLER)
         ForEach-Object { $_.Name }
 )
 $result = [ordered] @{
+    transactionSucceeded = $transactionSucceeded
     caughtInjectedFailure = $caughtInjectedFailure
     failureMessage = $failureMessage
+    sideEffectExists = [IO.File]::Exists($env:CODEX_TEST_SIDE_EFFECT)
     handlerExists = [IO.File]::Exists($env:CODEX_TEST_HANDLER)
     handlerContent = if ([IO.File]::Exists($env:CODEX_TEST_HANDLER)) {
         [IO.File]::ReadAllText($env:CODEX_TEST_HANDLER)
@@ -934,6 +966,17 @@ $result = [ordered] @{
     }
     temporaryFiles = $temporaryFiles
 }
+foreach ($file in @(
+    Get-ChildItem -LiteralPath $handlerDirectory -Force |
+        Where-Object { $_.Name -like ".codex-location-handler.*" }
+)) {
+    $file.Attributes = [IO.FileAttributes]::Normal
+    Remove-Item -LiteralPath $file.FullName -Force
+}
+$result["cleanupComplete"] = @(
+    Get-ChildItem -LiteralPath $handlerDirectory -Force |
+        Where-Object { $_.Name -like ".codex-location-handler.*" }
+).Count -eq 0
 [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress))
 """
         registry_before = registry_state_and_hash()
@@ -991,6 +1034,38 @@ $result = [ordered] @{
                 )
                 self.assertEqual(existing_content, payload["handlerContent"])
                 self.assertEqual([], payload["temporaryFiles"])
+
+    def test_post_commit_cleanup_failure_does_not_roll_back(self) -> None:
+        case_root = self.root / "post-commit"
+        source = case_root / "source.ps1"
+        handler = case_root / "bin" / "codex-location-handler.ps1"
+        source.parent.mkdir(parents=True)
+        handler.parent.mkdir(parents=True)
+        source.write_text("new handler", encoding="utf-8")
+        handler.write_text("old handler", encoding="utf-8")
+
+        completed = self.invoke_file_transaction_probe(
+            source,
+            handler,
+            commit_mode="cleanup-failure",
+        )
+
+        self.assertEqual(
+            0,
+            completed.returncode,
+            msg=f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}",
+        )
+        payload = self.parse_payload(completed)
+        self.assertIs(
+            payload["transactionSucceeded"],
+            True,
+            msg=payload["failureMessage"],
+        )
+        self.assertIs(payload["sideEffectExists"], True)
+        self.assertEqual("new handler", payload["handlerContent"])
+        self.assertEqual(1, len(payload["temporaryFiles"]))
+        self.assertTrue(payload["temporaryFiles"][0].endswith(".bak"))
+        self.assertIs(payload["cleanupComplete"], True)
 
     def test_installer_does_not_use_shell_evaluation_or_machine_registry(
         self,

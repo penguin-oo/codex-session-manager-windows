@@ -412,7 +412,8 @@ function Invoke-CodexHandlerFileTransaction {
     )
     $handlerExisted = [IO.File]::Exists($HandlerPath)
     $handlerCommitted = $false
-    $transactionCompleted = $false
+    $transactionCommitted = $false
+    $rollbackCompleted = $false
 
     try {
         [IO.File]::Copy($SourceHandlerPath, $temporaryPath, $false)
@@ -432,15 +433,11 @@ function Invoke-CodexHandlerFileTransaction {
         if ($null -ne $CommitAction) {
             & $CommitAction
         }
-
-        if ([IO.File]::Exists($backupPath)) {
-            [IO.File]::Delete($backupPath)
-        }
-        $transactionCompleted = $true
+        $transactionCommitted = $true
     }
     catch {
         $failure = $_
-        if ($handlerCommitted) {
+        if (-not $transactionCommitted -and $handlerCommitted) {
             if ($handlerExisted) {
                 if (-not [IO.File]::Exists($backupPath)) {
                     throw "Handler update failed and its backup is unavailable."
@@ -452,7 +449,6 @@ function Invoke-CodexHandlerFileTransaction {
                         $rollbackDiscardPath,
                         $true
                     )
-                    [IO.File]::Delete($rollbackDiscardPath)
                 }
                 else {
                     [IO.File]::Move($backupPath, $HandlerPath)
@@ -462,17 +458,27 @@ function Invoke-CodexHandlerFileTransaction {
                 [IO.File]::Delete($HandlerPath)
             }
         }
+        $rollbackCompleted = $true
         throw $failure
     }
     finally {
-        if ([IO.File]::Exists($temporaryPath)) {
-            [IO.File]::Delete($temporaryPath)
+        try {
+            if ([IO.File]::Exists($temporaryPath)) {
+                [IO.File]::Delete($temporaryPath)
+            }
         }
-        if ($transactionCompleted -and [IO.File]::Exists($backupPath)) {
-            [IO.File]::Delete($backupPath)
+        catch {
         }
-        if ([IO.File]::Exists($rollbackDiscardPath)) {
-            [IO.File]::Delete($rollbackDiscardPath)
+        if ($transactionCommitted -or $rollbackCompleted) {
+            foreach ($cleanupPath in @($backupPath, $rollbackDiscardPath)) {
+                try {
+                    if ([IO.File]::Exists($cleanupPath)) {
+                        [IO.File]::Delete($cleanupPath)
+                    }
+                }
+                catch {
+                }
+            }
         }
     }
 }
