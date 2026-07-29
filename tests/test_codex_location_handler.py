@@ -1,15 +1,85 @@
 import ctypes
+import hashlib
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+import winreg
 from pathlib import Path
 from urllib.parse import quote
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HANDLER = REPO_ROOT / "tools" / "codex-clickable" / "codex-location-handler.ps1"
+INSTALLER = (
+    REPO_ROOT
+    / "tools"
+    / "codex-clickable"
+    / "install-codex-location-handler.ps1"
+)
+REGISTRY_KEY = r"HKCU\Software\Classes\codex-location"
+REGISTRY_SUBKEY = r"Software\Classes\codex-location"
+
+
+def normalize_registry_data(data: object) -> object:
+    if isinstance(data, bytes):
+        return {"bytes": data.hex()}
+    if isinstance(data, (list, tuple)):
+        return [normalize_registry_data(item) for item in data]
+    if data is None or isinstance(data, (int, str)):
+        return data
+    return repr(data)
+
+
+def read_registry_tree(key: int) -> dict[str, object]:
+    _, value_count, _ = winreg.QueryInfoKey(key)
+    values = []
+    for index in range(value_count):
+        name, data, value_type = winreg.EnumValue(key, index)
+        values.append(
+            {
+                "name": name,
+                "type": value_type,
+                "data": normalize_registry_data(data),
+            }
+        )
+
+    subkeys: dict[str, object] = {}
+    subkey_count, _, _ = winreg.QueryInfoKey(key)
+    for index in range(subkey_count):
+        name = winreg.EnumKey(key, index)
+        with winreg.OpenKey(key, name, 0, winreg.KEY_READ) as child:
+            subkeys[name] = read_registry_tree(child)
+
+    return {
+        "values": sorted(values, key=lambda value: value["name"]),
+        "subkeys": subkeys,
+    }
+
+
+def registry_state_and_hash() -> tuple[bool, str]:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            REGISTRY_SUBKEY,
+            0,
+            winreg.KEY_READ,
+        ) as key:
+            state: dict[str, object] = {
+                "exists": True,
+                "tree": read_registry_tree(key),
+            }
+    except FileNotFoundError:
+        state = {"exists": False}
+
+    serialized = json.dumps(
+        state,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return bool(state["exists"]), hashlib.sha256(serialized).hexdigest()
 
 
 def parse_explorer_argument(argument: str) -> list[str]:
@@ -316,6 +386,184 @@ class CodexLocationHandlerTests(unittest.TestCase):
         self.assertEqual("open-parent", payload["action"])
         self.assert_path_equal(self.root, payload["path"])
         self.assertFalse(marker.exists())
+
+
+class CodexLocationInstallerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="codex-location-installer-")
+        self.root = Path(self.temp_dir.name)
+        self.install_root = self.root / "bin"
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def expected_command(self, handler: Path) -> str:
+        return (
+            "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden "
+            f'-ExecutionPolicy Bypass -File "{handler}" -Uri "%1"'
+        )
+
+    def invoke_installer(
+        self,
+        *arguments: str,
+    ) -> subprocess.CompletedProcess[str]:
+        self.assertTrue(INSTALLER.is_file(), msg=f"installer missing: {INSTALLER}")
+        registry_before = registry_state_and_hash()
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(INSTALLER),
+                *arguments,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        registry_after = registry_state_and_hash()
+        self.assertEqual(registry_before, registry_after)
+        return completed
+
+    def run_installer(self, *arguments: str) -> dict[str, object]:
+        completed = self.invoke_installer(*arguments)
+        self.assertEqual(
+            0,
+            completed.returncode,
+            msg=f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}",
+        )
+        lines = completed.stdout.strip().splitlines()
+        self.assertEqual(1, len(lines), msg=completed.stdout)
+        return json.loads(lines[0])
+
+    def test_install_dry_run_targets_temporary_install_root(self) -> None:
+        payload = self.run_installer(
+            "-DryRun",
+            "-InstallRoot",
+            str(self.install_root),
+        )
+
+        self.assertEqual("Install", payload["mode"])
+        self.assertIs(payload["dryRun"], True)
+        self.assertEqual(
+            self.install_root / "codex-location-handler.ps1",
+            Path(payload["handler"]),
+        )
+        self.assertEqual(HANDLER, Path(payload["sourceHandler"]))
+        self.assertFalse(self.install_root.exists())
+
+    def test_install_dry_run_uses_default_current_user_target(self) -> None:
+        payload = self.run_installer("-DryRun")
+
+        expected_handler = (
+            Path(os.environ["USERPROFILE"])
+            / ".codex"
+            / "bin"
+            / "codex-location-handler.ps1"
+        )
+        self.assertEqual(expected_handler, Path(payload["handler"]))
+
+    def test_install_dry_run_has_exact_command_and_registry_values(self) -> None:
+        payload = self.run_installer(
+            "-DryRun",
+            "-InstallRoot",
+            str(self.install_root),
+        )
+        expected_handler = self.install_root / "codex-location-handler.ps1"
+
+        self.assertEqual(REGISTRY_KEY, payload["registryKey"])
+        self.assertEqual(
+            self.expected_command(expected_handler),
+            payload["command"],
+        )
+        self.assertEqual("URL:codex-location Protocol", payload["description"])
+        self.assertEqual("", payload["urlProtocol"])
+        self.assertNotIn("HKLM", completed_text := json.dumps(payload))
+        self.assertNotIn("HKEY_LOCAL_MACHINE", completed_text)
+
+    def test_inspect_dry_run_reports_absent_key_without_other_configuration(
+        self,
+    ) -> None:
+        payload = self.run_installer(
+            "-Mode",
+            "Inspect",
+            "-DryRun",
+            "-DryRunRegistryKeyAbsent",
+        )
+
+        self.assertEqual(
+            {
+                "mode": "Inspect",
+                "registryKey": REGISTRY_KEY,
+                "exists": False,
+                "owned": False,
+            },
+            payload,
+        )
+
+    def test_uninstall_dry_run_refuses_unowned_registration(self) -> None:
+        completed = self.invoke_installer(
+            "-Mode",
+            "Uninstall",
+            "-DryRun",
+            "-InstallRoot",
+            str(self.install_root),
+            "-DryRunCurrentCommand",
+            r'powershell.exe -File "C:\other\handler.ps1" -Uri "%1"',
+        )
+
+        self.assertNotEqual(0, completed.returncode)
+        lines = completed.stdout.strip().splitlines()
+        self.assertEqual(1, len(lines), msg=completed.stdout)
+        payload = json.loads(lines[0])
+        self.assertEqual("Uninstall", payload["mode"])
+        self.assertIs(payload["exists"], True)
+        self.assertIs(payload["owned"], False)
+        self.assertIs(payload["removeRegistryKey"], False)
+        self.assertFalse(self.install_root.exists())
+
+    def test_uninstall_dry_run_accepts_exact_owned_registration(self) -> None:
+        handler = self.install_root / "codex-location-handler.ps1"
+        payload = self.run_installer(
+            "-Mode",
+            "Uninstall",
+            "-DryRun",
+            "-InstallRoot",
+            str(self.install_root),
+            "-DryRunCurrentCommand",
+            self.expected_command(handler),
+        )
+
+        self.assertIs(payload["exists"], True)
+        self.assertIs(payload["owned"], True)
+        self.assertIs(payload["removeRegistryKey"], True)
+        self.assertFalse(self.install_root.exists())
+
+    def test_registry_state_override_requires_dry_run(self) -> None:
+        completed = self.invoke_installer(
+            "-Mode",
+            "Inspect",
+            "-DryRunRegistryKeyAbsent",
+        )
+
+        self.assertNotEqual(0, completed.returncode)
+        self.assertEqual("", completed.stdout.strip())
+
+    def test_installer_does_not_use_shell_evaluation_or_machine_registry(
+        self,
+    ) -> None:
+        self.assertTrue(INSTALLER.is_file(), msg=f"installer missing: {INSTALLER}")
+        source = INSTALLER.read_text(encoding="utf-8").lower()
+
+        self.assertNotIn("invoke-expression", source)
+        self.assertNotIn("cmd.exe", source)
+        self.assertNotIn("hkey_local_machine", source)
+        self.assertNotIn("hklm", source)
 
 
 if __name__ == "__main__":
