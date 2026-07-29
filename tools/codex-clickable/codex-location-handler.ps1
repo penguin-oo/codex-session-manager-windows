@@ -73,8 +73,6 @@ try {
         [char]0x25, # %
         [char]0x26, # &
         [char]0x27, # single quote
-        [char]0x28, # (
-        [char]0x29, # )
         [char]0x3B, # ;
         [char]0x3C, # <
         [char]0x3E, # >

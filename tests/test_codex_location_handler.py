@@ -112,6 +112,16 @@ class CodexLocationHandlerTests(unittest.TestCase):
         self.assert_path_equal(directory, payload["path"])
         self.assertEqual([f'"{directory}"'], payload["arguments"])
 
+    def test_existing_directory_with_parentheses_is_opened(self) -> None:
+        directory = self.root / "Program Files (x86)"
+        directory.mkdir()
+
+        payload = self.run_handler(location_uri(directory))
+
+        self.assertEqual("open-directory", payload["action"])
+        self.assert_path_equal(directory, payload["path"])
+        self.assertEqual([f'"{directory}"'], payload["arguments"])
+
     def test_missing_file_opens_existing_parent(self) -> None:
         missing_file = self.root / "missing.txt"
 
