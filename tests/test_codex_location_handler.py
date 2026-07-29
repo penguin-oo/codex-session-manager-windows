@@ -1,3 +1,4 @@
+import copy
 import ctypes
 import hashlib
 import json
@@ -20,6 +21,83 @@ INSTALLER = (
 )
 REGISTRY_KEY = r"HKCU\Software\Classes\codex-location"
 REGISTRY_SUBKEY = r"Software\Classes\codex-location"
+REGISTRY_DESCRIPTION = "URL:codex-location Protocol"
+OWNER_NAME = "Codex Location Owner"
+OWNER_VALUE = "codex-session-manager-windows/v1"
+
+
+def windows_powershell_executable() -> Path:
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::Out.Write($PSHOME)",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        raise RuntimeError(f"could not resolve Windows PowerShell: {completed.stderr}")
+    return Path(completed.stdout) / "powershell.exe"
+
+
+WINDOWS_POWERSHELL = windows_powershell_executable()
+
+
+def registry_value(name: str, data: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "type": winreg.REG_SZ,
+        "data": data,
+    }
+
+
+def registry_node(
+    *,
+    values: list[dict[str, object]] | None = None,
+    subkeys: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "values": values or [],
+        "subkeys": subkeys or [],
+    }
+
+
+def named_registry_node(
+    name: str,
+    node: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "name": name,
+        **node,
+    }
+
+
+def owned_registry_state(command: str) -> dict[str, object]:
+    command_node = registry_node(values=[registry_value("", command)])
+    open_node = registry_node(
+        subkeys=[named_registry_node("command", command_node)]
+    )
+    shell_node = registry_node(
+        subkeys=[named_registry_node("open", open_node)]
+    )
+    root = registry_node(
+        values=[
+            registry_value("", REGISTRY_DESCRIPTION),
+            registry_value("URL Protocol", ""),
+            registry_value(OWNER_NAME, OWNER_VALUE),
+        ],
+        subkeys=[named_registry_node("shell", shell_node)],
+    )
+    return {
+        "exists": True,
+        "tree": root,
+    }
 
 
 def normalize_registry_data(data: object) -> object:
@@ -399,8 +477,18 @@ class CodexLocationInstallerTests(unittest.TestCase):
 
     def expected_command(self, handler: Path) -> str:
         return (
-            "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden "
+            f'"{WINDOWS_POWERSHELL}" '
+            "-NoProfile -NonInteractive -WindowStyle Hidden "
             f'-ExecutionPolicy Bypass -File "{handler}" -Uri "%1"'
+        )
+
+    def registry_state_arguments(
+        self,
+        state: dict[str, object],
+    ) -> tuple[str, str]:
+        return (
+            "-DryRunRegistryStateJson",
+            json.dumps(state, ensure_ascii=True, separators=(",", ":")),
         )
 
     def invoke_installer(
@@ -430,6 +518,15 @@ class CodexLocationInstallerTests(unittest.TestCase):
         self.assertEqual(registry_before, registry_after)
         return completed
 
+    def parse_payload(
+        self,
+        completed: subprocess.CompletedProcess[str],
+    ) -> dict[str, object]:
+        lines = completed.stdout.strip().splitlines()
+        self.assertEqual(1, len(lines), msg=completed.stdout)
+        self.assertTrue(lines[0].startswith("{"), msg=completed.stdout)
+        return json.loads(lines[0])
+
     def run_installer(self, *arguments: str) -> dict[str, object]:
         completed = self.invoke_installer(*arguments)
         self.assertEqual(
@@ -437,15 +534,14 @@ class CodexLocationInstallerTests(unittest.TestCase):
             completed.returncode,
             msg=f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}",
         )
-        lines = completed.stdout.strip().splitlines()
-        self.assertEqual(1, len(lines), msg=completed.stdout)
-        return json.loads(lines[0])
+        return self.parse_payload(completed)
 
     def test_install_dry_run_targets_temporary_install_root(self) -> None:
         payload = self.run_installer(
             "-DryRun",
             "-InstallRoot",
             str(self.install_root),
+            *self.registry_state_arguments({"exists": False}),
         )
 
         self.assertEqual("Install", payload["mode"])
@@ -455,10 +551,14 @@ class CodexLocationInstallerTests(unittest.TestCase):
             Path(payload["handler"]),
         )
         self.assertEqual(HANDLER, Path(payload["sourceHandler"]))
+        self.assertEqual("create", payload["registrationAction"])
         self.assertFalse(self.install_root.exists())
 
     def test_install_dry_run_uses_default_current_user_target(self) -> None:
-        payload = self.run_installer("-DryRun")
+        payload = self.run_installer(
+            "-DryRun",
+            *self.registry_state_arguments({"exists": False}),
+        )
 
         expected_handler = (
             Path(os.environ["USERPROFILE"])
@@ -473,6 +573,7 @@ class CodexLocationInstallerTests(unittest.TestCase):
             "-DryRun",
             "-InstallRoot",
             str(self.install_root),
+            *self.registry_state_arguments({"exists": False}),
         )
         expected_handler = self.install_root / "codex-location-handler.ps1"
 
@@ -481,8 +582,10 @@ class CodexLocationInstallerTests(unittest.TestCase):
             self.expected_command(expected_handler),
             payload["command"],
         )
-        self.assertEqual("URL:codex-location Protocol", payload["description"])
+        self.assertEqual(REGISTRY_DESCRIPTION, payload["description"])
         self.assertEqual("", payload["urlProtocol"])
+        self.assertEqual(OWNER_NAME, payload["ownerName"])
+        self.assertEqual(OWNER_VALUE, payload["ownerValue"])
         self.assertNotIn("HKLM", completed_text := json.dumps(payload))
         self.assertNotIn("HKEY_LOCAL_MACHINE", completed_text)
 
@@ -493,7 +596,7 @@ class CodexLocationInstallerTests(unittest.TestCase):
             "-Mode",
             "Inspect",
             "-DryRun",
-            "-DryRunRegistryKeyAbsent",
+            *self.registry_state_arguments({"exists": False}),
         )
 
         self.assertEqual(
@@ -506,21 +609,139 @@ class CodexLocationInstallerTests(unittest.TestCase):
             payload,
         )
 
+    def test_complete_registration_is_owned_and_can_be_updated(self) -> None:
+        handler = self.install_root / "codex-location-handler.ps1"
+        state = owned_registry_state(self.expected_command(handler))
+
+        inspect_payload = self.run_installer(
+            "-Mode",
+            "Inspect",
+            "-DryRun",
+            "-InstallRoot",
+            str(self.install_root),
+            *self.registry_state_arguments(state),
+        )
+        install_payload = self.run_installer(
+            "-DryRun",
+            "-InstallRoot",
+            str(self.install_root),
+            *self.registry_state_arguments(state),
+        )
+
+        self.assertIs(inspect_payload["exists"], True)
+        self.assertIs(inspect_payload["owned"], True)
+        self.assertEqual("preserve", install_payload["registrationAction"])
+        self.assertIs(install_payload["owned"], True)
+        self.assertFalse(self.install_root.exists())
+
+    def test_registration_drift_is_never_owned(self) -> None:
+        handler = self.install_root / "codex-location-handler.ps1"
+        expected_state = owned_registry_state(self.expected_command(handler))
+        drifted_states: list[tuple[str, dict[str, object]]] = []
+
+        missing_owner = copy.deepcopy(expected_state)
+        missing_owner["tree"]["values"] = [
+            value
+            for value in missing_owner["tree"]["values"]
+            if value["name"] != OWNER_NAME
+        ]
+        drifted_states.append(("missing-owner", missing_owner))
+
+        wrong_description = copy.deepcopy(expected_state)
+        wrong_description["tree"]["values"][0]["data"] = "External protocol"
+        drifted_states.append(("wrong-description", wrong_description))
+
+        wrong_url_protocol = copy.deepcopy(expected_state)
+        wrong_url_protocol["tree"]["values"][1]["data"] = "present"
+        drifted_states.append(("wrong-url-protocol", wrong_url_protocol))
+
+        wrong_owner = copy.deepcopy(expected_state)
+        wrong_owner["tree"]["values"][2]["data"] = "another-owner"
+        drifted_states.append(("wrong-owner", wrong_owner))
+
+        extra_value = copy.deepcopy(expected_state)
+        extra_value["tree"]["values"].append(registry_value("Extra", "value"))
+        drifted_states.append(("extra-root-value", extra_value))
+
+        extra_subkey = copy.deepcopy(expected_state)
+        extra_subkey["tree"]["subkeys"].append(
+            named_registry_node("extra", registry_node())
+        )
+        drifted_states.append(("extra-root-subkey", extra_subkey))
+
+        shell_value = copy.deepcopy(expected_state)
+        shell_value["tree"]["subkeys"][0]["values"].append(
+            registry_value("", "unexpected")
+        )
+        drifted_states.append(("shell-value", shell_value))
+
+        wrong_command = copy.deepcopy(expected_state)
+        wrong_command["tree"]["subkeys"][0]["subkeys"][0]["subkeys"][0][
+            "values"
+        ][0]["data"] = "different command"
+        drifted_states.append(("wrong-command", wrong_command))
+
+        command_subkey = copy.deepcopy(expected_state)
+        command_subkey["tree"]["subkeys"][0]["subkeys"][0]["subkeys"][0][
+            "subkeys"
+        ].append(named_registry_node("extra", registry_node()))
+        drifted_states.append(("command-subkey", command_subkey))
+
+        for name, state in drifted_states:
+            with self.subTest(name=name):
+                payload = self.run_installer(
+                    "-Mode",
+                    "Inspect",
+                    "-DryRun",
+                    "-InstallRoot",
+                    str(self.install_root),
+                    *self.registry_state_arguments(state),
+                )
+                self.assertIs(payload["exists"], True)
+                self.assertIs(payload["owned"], False)
+
+    def test_install_dry_run_rejects_drifted_registration(self) -> None:
+        handler = self.install_root / "codex-location-handler.ps1"
+        state = owned_registry_state(self.expected_command(handler))
+        state["tree"]["values"] = [
+            value
+            for value in state["tree"]["values"]
+            if value["name"] != OWNER_NAME
+        ]
+
+        completed = self.invoke_installer(
+            "-DryRun",
+            "-InstallRoot",
+            str(self.install_root),
+            *self.registry_state_arguments(state),
+        )
+
+        self.assertNotEqual(0, completed.returncode)
+        payload = self.parse_payload(completed)
+        self.assertEqual("reject", payload["registrationAction"])
+        self.assertIs(payload["owned"], False)
+        self.assertFalse(self.install_root.exists())
+
     def test_uninstall_dry_run_refuses_unowned_registration(self) -> None:
+        handler = self.install_root / "codex-location-handler.ps1"
+        state = owned_registry_state(self.expected_command(handler))
+        state["tree"]["values"] = [
+            value
+            for value in state["tree"]["values"]
+            if value["name"] != OWNER_NAME
+        ]
+
         completed = self.invoke_installer(
             "-Mode",
             "Uninstall",
             "-DryRun",
             "-InstallRoot",
             str(self.install_root),
-            "-DryRunCurrentCommand",
-            r'powershell.exe -File "C:\other\handler.ps1" -Uri "%1"',
+            *self.registry_state_arguments(state),
         )
 
         self.assertNotEqual(0, completed.returncode)
-        lines = completed.stdout.strip().splitlines()
-        self.assertEqual(1, len(lines), msg=completed.stdout)
-        payload = json.loads(lines[0])
+        payload = self.parse_payload(completed)
         self.assertEqual("Uninstall", payload["mode"])
         self.assertIs(payload["exists"], True)
         self.assertIs(payload["owned"], False)
@@ -529,14 +750,14 @@ class CodexLocationInstallerTests(unittest.TestCase):
 
     def test_uninstall_dry_run_accepts_exact_owned_registration(self) -> None:
         handler = self.install_root / "codex-location-handler.ps1"
+        state = owned_registry_state(self.expected_command(handler))
         payload = self.run_installer(
             "-Mode",
             "Uninstall",
             "-DryRun",
             "-InstallRoot",
             str(self.install_root),
-            "-DryRunCurrentCommand",
-            self.expected_command(handler),
+            *self.registry_state_arguments(state),
         )
 
         self.assertIs(payload["exists"], True)
@@ -548,11 +769,228 @@ class CodexLocationInstallerTests(unittest.TestCase):
         completed = self.invoke_installer(
             "-Mode",
             "Inspect",
-            "-DryRunRegistryKeyAbsent",
+            "-DryRunRegistryStateJson",
+            json.dumps({"exists": False}),
         )
 
         self.assertNotEqual(0, completed.returncode)
         self.assertEqual("", completed.stdout.strip())
+
+    def test_custom_install_root_requires_dry_run(self) -> None:
+        completed = self.invoke_installer(
+            "-InstallRoot",
+            str(self.install_root),
+            "-SourceHandler",
+            str(self.root / "missing-handler.ps1"),
+        )
+
+        self.assertNotEqual(0, completed.returncode)
+        self.assertIn(
+            "custom InstallRoot requires -DryRun",
+            completed.stderr,
+        )
+        self.assertFalse(self.install_root.exists())
+
+    def test_unsafe_install_roots_are_rejected(self) -> None:
+        drive = self.root.drive or "C:"
+        unsafe_roots = (
+            r"\\server\share\codex-bin",
+            r"\\?\C:\codex-bin",
+            f"{drive}\\codex%bin",
+            f'{drive}\\bad"name',
+            f"{drive}\\bad\nname",
+        )
+
+        for install_root in unsafe_roots:
+            with self.subTest(install_root=install_root):
+                completed = self.invoke_installer(
+                    "-DryRun",
+                    "-InstallRoot",
+                    install_root,
+                    *self.registry_state_arguments({"exists": False}),
+                )
+                self.assertNotEqual(0, completed.returncode)
+                self.assertIn(
+                    "trusted local fixed-drive path",
+                    completed.stderr,
+                )
+
+    def create_junction(self, junction: Path, target: Path) -> None:
+        environment = os.environ.copy()
+        environment["CODEX_TEST_JUNCTION"] = str(junction)
+        environment["CODEX_TEST_TARGET"] = str(target)
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "New-Item -ItemType Junction "
+                    "-Path $env:CODEX_TEST_JUNCTION "
+                    "-Target $env:CODEX_TEST_TARGET | Out-Null"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            check=False,
+        )
+        self.assertEqual(
+            0,
+            completed.returncode,
+            msg=f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}",
+        )
+
+    def test_reparse_install_root_and_source_are_rejected(self) -> None:
+        target = self.root / "junction-target"
+        target.mkdir()
+        source = target / "source-handler.ps1"
+        source.write_text("source", encoding="utf-8")
+        junction = self.root / "junction"
+        self.create_junction(junction, target)
+
+        install_completed = self.invoke_installer(
+            "-DryRun",
+            "-InstallRoot",
+            str(junction / "bin"),
+            *self.registry_state_arguments({"exists": False}),
+        )
+        source_completed = self.invoke_installer(
+            "-DryRun",
+            "-InstallRoot",
+            str(self.install_root),
+            "-SourceHandler",
+            str(junction / "source-handler.ps1"),
+            *self.registry_state_arguments({"exists": False}),
+        )
+
+        self.assertNotEqual(0, install_completed.returncode)
+        self.assertIn("reparse point", install_completed.stderr.lower())
+        self.assertNotEqual(0, source_completed.returncode)
+        self.assertIn("reparse point", source_completed.stderr.lower())
+        self.assertFalse(self.install_root.exists())
+
+    def invoke_file_transaction_probe(
+        self,
+        source: Path,
+        handler: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["CODEX_TEST_INSTALLER"] = str(INSTALLER)
+        environment["CODEX_TEST_SOURCE"] = str(source)
+        environment["CODEX_TEST_HANDLER"] = str(handler)
+        command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:CODEX_TEST_INSTALLER,
+    [ref] $tokens,
+    [ref] $errors
+)
+$functionAst = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Invoke-CodexHandlerFileTransaction"
+}, $true)
+if ($null -eq $functionAst) {
+    throw "Transaction function is missing."
+}
+. ([scriptblock]::Create($functionAst.Extent.Text))
+
+$caughtInjectedFailure = $false
+$failureMessage = $null
+try {
+    Invoke-CodexHandlerFileTransaction `
+        -SourceHandlerPath $env:CODEX_TEST_SOURCE `
+        -HandlerPath $env:CODEX_TEST_HANDLER `
+        -CommitAction { throw "Injected registration failure." }
+}
+catch {
+    $failureMessage = $_.Exception.Message
+    $caughtInjectedFailure = $_.Exception.Message.Contains(
+        "Injected registration failure."
+    )
+}
+
+$handlerDirectory = [IO.Path]::GetDirectoryName($env:CODEX_TEST_HANDLER)
+[object[]] $temporaryFiles = @(
+    Get-ChildItem -LiteralPath $handlerDirectory -Force |
+        Where-Object {
+            $_.Name -like ".codex-location-handler.*"
+        } |
+        ForEach-Object { $_.Name }
+)
+$result = [ordered] @{
+    caughtInjectedFailure = $caughtInjectedFailure
+    failureMessage = $failureMessage
+    handlerExists = [IO.File]::Exists($env:CODEX_TEST_HANDLER)
+    handlerContent = if ([IO.File]::Exists($env:CODEX_TEST_HANDLER)) {
+        [IO.File]::ReadAllText($env:CODEX_TEST_HANDLER)
+    } else {
+        $null
+    }
+    temporaryFiles = $temporaryFiles
+}
+[Console]::Out.WriteLine(($result | ConvertTo-Json -Compress))
+"""
+        registry_before = registry_state_and_hash()
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            check=False,
+        )
+        registry_after = registry_state_and_hash()
+        self.assertEqual(registry_before, registry_after)
+        return completed
+
+    def test_file_transaction_rolls_back_after_commit_failure(self) -> None:
+        for existing_content in ("old handler", None):
+            with self.subTest(existing_content=existing_content):
+                case_root = self.root / (
+                    "existing" if existing_content is not None else "new"
+                )
+                source = case_root / "source.ps1"
+                handler = case_root / "bin" / "codex-location-handler.ps1"
+                source.parent.mkdir(parents=True)
+                handler.parent.mkdir(parents=True)
+                source.write_text("new handler", encoding="utf-8")
+                if existing_content is not None:
+                    handler.write_text(existing_content, encoding="utf-8")
+
+                completed = self.invoke_file_transaction_probe(source, handler)
+
+                self.assertEqual(
+                    0,
+                    completed.returncode,
+                    msg=f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}",
+                )
+                payload = self.parse_payload(completed)
+                self.assertIs(
+                    payload["caughtInjectedFailure"],
+                    True,
+                    msg=payload["failureMessage"],
+                )
+                self.assertEqual(
+                    existing_content is not None,
+                    payload["handlerExists"],
+                )
+                self.assertEqual(existing_content, payload["handlerContent"])
+                self.assertEqual([], payload["temporaryFiles"])
 
     def test_installer_does_not_use_shell_evaluation_or_machine_registry(
         self,
@@ -564,6 +1002,13 @@ class CodexLocationInstallerTests(unittest.TestCase):
         self.assertNotIn("cmd.exe", source)
         self.assertNotIn("hkey_local_machine", source)
         self.assertNotIn("hklm", source)
+        self.assertIn("$pshome", source)
+        self.assertIn(OWNER_NAME.lower(), source)
+        self.assertIn(OWNER_VALUE.lower(), source)
+        self.assertNotIn(
+            "new-item -path $registryproviderpath -force",
+            " ".join(source.split()),
+        )
 
 
 if __name__ == "__main__":
