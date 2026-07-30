@@ -108,13 +108,13 @@ Expected: PASS.
 ### Task 5: Restore The Local Preset
 
 **Files:**
-- Back up: `C:\Users\MECHREVO\.codex\token_pool_settings.json`
-- Modify locally: `C:\Users\MECHREVO\.codex\token_pool_settings.json`
+- Back up: `%USERPROFILE%\.codex\token_pool_settings.json`
+- Modify locally: `%USERPROFILE%\.codex\token_pool_settings.json`
 
 **Step 1: Create a timestamped private backup**
 
 Copy the settings file into a timestamped directory under
-`C:\Users\MECHREVO\.codex\private_backups`.
+`%USERPROFILE%\.codex\private_backups`.
 
 **Step 2: Recover only the affected preset**
 

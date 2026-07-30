@@ -14,7 +14,7 @@
 
 **Files:**
 - Create worktree: `D:\codex\codex-session-manager-windows\.worktrees\clickable-cli-links`
-- Record locally: `C:\Users\MECHREVO\.codex\private_backups\clickable-cli-links-<timestamp>\official-hashes.json`
+- Record locally: `%USERPROFILE%\.codex\private_backups\clickable-cli-links-<timestamp>\official-hashes.json`
 
 **Step 1: Verify the repository is clean**
 
@@ -146,8 +146,8 @@ git commit -m "feat: support a guarded local Codex executable"
 ### Task 3: Prepare an Exact-Version Codex Source Copy
 
 **Files:**
-- Create locally: `C:\Users\MECHREVO\.codex\build\codex-clickable-0.144.3\source`
-- Create locally: `C:\Users\MECHREVO\.codex\build\codex-clickable-0.144.3\target`
+- Create locally: `%USERPROFILE%\.codex\build\codex-clickable-0.144.3\source`
+- Create locally: `%USERPROFILE%\.codex\build\codex-clickable-0.144.3\target`
 - Create: `D:\codex\codex-session-manager-windows\.worktrees\clickable-cli-links\tools\codex-clickable\codex-0.144.3-clickable-links.patch`
 
 **Step 1: Download the pinned source**
@@ -177,8 +177,8 @@ Expected: source package version `0.144.3`.
 ### Task 4: Add Failing Rust Tests for Editor URIs
 
 **Files:**
-- Modify locally: `C:\Users\MECHREVO\.codex\build\codex-clickable-0.144.3\source\codex-rust-v0.144.3\codex-rs\tui\src\markdown_render.rs`
-- Modify locally: `C:\Users\MECHREVO\.codex\build\codex-clickable-0.144.3\source\codex-rust-v0.144.3\codex-rs\tui\src\terminal_hyperlinks.rs`
+- Modify locally: `%USERPROFILE%\.codex\build\codex-clickable-0.144.3\source\codex-rust-v0.144.3\codex-rs\tui\src\markdown_render.rs`
+- Modify locally: `%USERPROFILE%\.codex\build\codex-clickable-0.144.3\source\codex-rust-v0.144.3\codex-rs\tui\src\terminal_hyperlinks.rs`
 
 **Step 1: Add URI-construction tests**
 
@@ -264,8 +264,8 @@ Review it for local paths, credentials, and unrelated source changes.
 ### Task 6: Build and Install the Separate Binary
 
 **Files:**
-- Build locally: `C:\Users\MECHREVO\.codex\build\codex-clickable-0.144.3\target\release\codex.exe`
-- Install locally: `C:\Users\MECHREVO\.codex\bin\codex-clickable.exe`
+- Build locally: `%USERPROFILE%\.codex\build\codex-clickable-0.144.3\target\release\codex.exe`
+- Install locally: `%USERPROFILE%\.codex\bin\codex-clickable.exe`
 
 **Step 1: Run the complete TUI test package**
 
@@ -300,21 +300,21 @@ codex-cli 0.144.3
 
 **Step 4: Install atomically**
 
-Copy to a temporary sibling in `C:\Users\MECHREVO\.codex\bin`, run the health
+Copy to a temporary sibling in `%USERPROFILE%\.codex\bin`, run the health
 check again, then atomically replace only
-`C:\Users\MECHREVO\.codex\bin\codex-clickable.exe`.
+`%USERPROFILE%\.codex\bin\codex-clickable.exe`.
 
 ### Task 7: Enable the Local Override Safely
 
 **Files:**
-- Back up: `C:\Users\MECHREVO\.codex\mobile_portal_settings.json`
-- Modify locally: `C:\Users\MECHREVO\.codex\mobile_portal_settings.json`
+- Back up: `%USERPROFILE%\.codex\mobile_portal_settings.json`
+- Modify locally: `%USERPROFILE%\.codex\mobile_portal_settings.json`
 
 **Step 1: Back up the settings file**
 
 Copy it to a timestamped directory below:
 
-`C:\Users\MECHREVO\.codex\private_backups`
+`%USERPROFILE%\.codex\private_backups`
 
 **Step 2: Add one structured property**
 

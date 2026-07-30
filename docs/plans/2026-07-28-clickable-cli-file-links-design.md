@@ -31,11 +31,11 @@ plain path text. Arbitrary model-provided URI schemes remain blocked.
 
 The patched binary will be installed outside the repository at:
 
-`C:\Users\MECHREVO\.codex\bin\codex-clickable.exe`
+`%USERPROFILE%\.codex\bin\codex-clickable.exe`
 
 The desktop manager will support a generic local `codex_executable` override in:
 
-`C:\Users\MECHREVO\.codex\mobile_portal_settings.json`
+`%USERPROFILE%\.codex\mobile_portal_settings.json`
 
 The manager will use that executable only after a local health check succeeds.
 Otherwise, its existing `shutil.which("codex.cmd")` resolution remains the
