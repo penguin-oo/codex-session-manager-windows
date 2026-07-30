@@ -106,10 +106,12 @@ def cleanup_previous_project_instances(
             continue
         subprocess.run(
             ["taskkill.exe", "/PID", str(clean_pid), "/F", "/T"],
-            capture_output=True,
-            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=8,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
         )
         killed.append(clean_pid)
     return killed
