@@ -49,16 +49,26 @@ Install the handler from this directory:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-codex-location-handler.ps1
 ```
 
-Then set the root-level Codex option:
+For a direct Codex launch, set the root-level Codex option:
 
 ```toml
 file_opener = "explorer"
 ```
 
-Keep the custom executable outside the repository and point the session
-manager's local ignored settings at it. The manager health-checks the override
-and falls back to the official `codex.cmd` when it is unavailable or invalid.
-Existing Codex processes keep their current executable.
+To avoid changing an already-running Codex process, keep the custom executable
+outside the repository and use the session manager's local ignored settings:
+
+```json
+{
+  "codex_executable": "C:\\absolute\\path\\to\\codex-clickable-explorer.exe",
+  "codex_file_opener": "explorer"
+}
+```
+
+The manager health-checks the executable, applies the opener only to new custom
+CLI launches, and falls back to the official `codex.cmd` without the override
+when the executable is unavailable or invalid. Existing Codex processes keep
+their current executable and configuration.
 
 Inspect or remove the current-user protocol registration with:
 

@@ -169,6 +169,30 @@ class DesktopWindowLaunchTests(unittest.TestCase):
 
         self.assertIsNone(executable)
 
+    def test_configured_codex_file_opener_reads_supported_local_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_file.write_text(
+                '{"codex_file_opener":"explorer"}',
+                encoding="utf-8",
+            )
+
+            opener = app.configured_codex_file_opener(settings_file)
+
+        self.assertEqual("explorer", opener)
+
+    def test_configured_codex_file_opener_rejects_unknown_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_file = Path(temp_dir) / "mobile_portal_settings.json"
+            settings_file.write_text(
+                '{"codex_file_opener":"shell"}',
+                encoding="utf-8",
+            )
+
+            opener = app.configured_codex_file_opener(settings_file)
+
+        self.assertIsNone(opener)
+
     def test_codex_executable_health_check_rejects_missing_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             executable = Path(temp_dir) / "missing.exe"
@@ -255,6 +279,11 @@ class DesktopWindowLaunchTests(unittest.TestCase):
                 "codex_executable_is_healthy",
                 return_value=True,
             ),
+            mock.patch.object(
+                app,
+                "configured_codex_file_opener",
+                return_value=None,
+            ),
         ):
             resolved = manager._resolve_terminal_codex_args(
                 ["codex.cmd", "resume", "session-id"]
@@ -262,6 +291,41 @@ class DesktopWindowLaunchTests(unittest.TestCase):
 
         self.assertEqual(
             [str(custom), "resume", "session-id"],
+            resolved,
+        )
+
+    def test_healthy_custom_executable_applies_configured_file_opener(self) -> None:
+        manager = make_manager()
+        custom = Path("C:\\local\\codex-clickable-explorer.exe")
+        with (
+            mock.patch.object(
+                app,
+                "configured_codex_executable",
+                return_value=custom,
+            ),
+            mock.patch.object(
+                app,
+                "codex_executable_is_healthy",
+                return_value=True,
+            ),
+            mock.patch.object(
+                app,
+                "configured_codex_file_opener",
+                return_value="explorer",
+            ),
+        ):
+            resolved = manager._resolve_terminal_codex_args(
+                ["codex.cmd", "resume", "session-id"]
+            )
+
+        self.assertEqual(
+            [
+                str(custom),
+                "-c",
+                'file_opener="explorer"',
+                "resume",
+                "session-id",
+            ],
             resolved,
         )
 

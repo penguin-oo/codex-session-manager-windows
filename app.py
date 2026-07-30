@@ -83,6 +83,9 @@ DEFAULT_LAUNCH_SANDBOX = "danger-full-access"
 DEFAULT_LAUNCH_REASONING_EFFORT = "max"
 DEFAULT_LAUNCH_ADMIN = False
 CODEX_VERSION_PATTERN = re.compile(r"^codex-cli\s+\d+\.\d+\.\d+(?:[-+][^\s]+)?$")
+CODEX_FILE_OPENERS = frozenset(
+    {"vscode", "vscode-insiders", "windsurf", "cursor", "explorer", "none"}
+)
 FALLBACK_MODEL_OPTIONS = (
     DEFAULT_PRIMARY_MODEL,
     "gpt-5.6-luna",
@@ -625,6 +628,22 @@ def configured_codex_executable(
     expanded = os.path.expandvars(raw_path.strip())
     executable = Path(expanded).expanduser()
     return executable if executable.is_absolute() else None
+
+
+def configured_codex_file_opener(
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> str | None:
+    try:
+        payload = json.loads(settings_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_opener = payload.get("codex_file_opener")
+    if not isinstance(raw_opener, str):
+        return None
+    opener = raw_opener.strip().lower()
+    return opener if opener in CODEX_FILE_OPENERS else None
 
 
 @functools.lru_cache(maxsize=16)
@@ -2574,7 +2593,13 @@ class SessionManagerApp:
             return codex_args
         configured = configured_codex_executable()
         if configured is not None and codex_executable_is_healthy(configured):
-            return [str(configured), *codex_args[1:]]
+            opener = configured_codex_file_opener()
+            opener_args = (
+                ["-c", f'file_opener="{opener}"']
+                if opener is not None
+                else []
+            )
+            return [str(configured), *opener_args, *codex_args[1:]]
         resolved = shutil.which("codex.cmd")
         if not resolved:
             return codex_args
