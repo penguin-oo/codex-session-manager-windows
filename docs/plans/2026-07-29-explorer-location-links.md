@@ -550,4 +550,3 @@ After automated and manual verification, merge
 `feature/explorer-location-links` into local `main` without rewriting history.
 Do not push GitHub, synchronize another computer, or build an APK unless the
 user separately requests it.
-
