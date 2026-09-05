@@ -34,8 +34,10 @@ from urllib import request as url_request
 
 APP_TITLE = "Codex+"
 CODEX_HOME = Path(os.environ.get("USERPROFILE", "")) / ".codex"
+CLICKABLE_CLI_SQLITE_DIR_NAME = "cli-clickable-sqlite"
 HISTORY_FILE = CODEX_HOME / "history.jsonl"
 NOTES_FILE = CODEX_HOME / "session_notes.json"
+SETTINGS_FILE = CODEX_HOME / "session_settings.json"
 SESSIONS_DIR = CODEX_HOME / "sessions"
 CONFIG_FILE = CODEX_HOME / "config.toml"
 PORTAL_SETTINGS_FILE = CODEX_HOME / "mobile_portal_settings.json"
@@ -76,7 +78,7 @@ CODEX_API_ENV_KEY_NAMES = (
     OPENAI_COMPAT_ENV_KEY_NAME,
 )
 OPENAI_API_KEY_ENTRY_SHOW = ""
-DEFAULT_PRIMARY_MODEL = "gpt-5.6-sol"
+DEFAULT_PRIMARY_MODEL = "gpt-6-astra"
 DEFAULT_LAUNCH_MODEL = DEFAULT_PRIMARY_MODEL
 DEFAULT_LAUNCH_APPROVAL = "never"
 DEFAULT_LAUNCH_SANDBOX = "danger-full-access"
@@ -96,6 +98,23 @@ FALLBACK_MODEL_OPTIONS = (
     "gpt-5.2",
     "gpt-5",
 )
+
+
+@dataclass(frozen=True)
+class CodexLocalLaunchSettings:
+    executable: Path | None
+    file_opener: str | None
+    sqlite_home: Path
+    sqlite_isolated: bool
+
+
+@dataclass(frozen=True)
+class CodexTerminalLaunch:
+    executable: str
+    uses_custom_executable: bool
+    file_opener: str | None
+    sqlite_home: Path
+    sqlite_isolated: bool
 
 
 NOTE_URL_RE = re.compile(r"https?://[^\s<>'\"，。；、）)]+" )
@@ -613,37 +632,77 @@ def build_source_python_command(executable: str, app_path: str) -> list[str]:
     return [clean_executable, clean_app_path]
 
 
-def configured_codex_executable(
+def load_codex_local_launch_settings(
     settings_file: Path = PORTAL_SETTINGS_FILE,
-) -> Path | None:
+    *,
+    base_home: Path = CODEX_HOME,
+) -> CodexLocalLaunchSettings:
     try:
         payload = json.loads(settings_file.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return None
+        payload = {}
     if not isinstance(payload, dict):
-        return None
+        payload = {}
+
     raw_path = payload.get("codex_executable")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return None
-    expanded = os.path.expandvars(raw_path.strip())
-    executable = Path(expanded).expanduser()
-    return executable if executable.is_absolute() else None
+    executable: Path | None = None
+    if isinstance(raw_path, str) and raw_path.strip():
+        expanded = os.path.expandvars(raw_path.strip())
+        candidate = Path(expanded).expanduser()
+        if candidate.is_absolute():
+            executable = candidate
+
+    raw_opener = payload.get("codex_file_opener")
+    file_opener: str | None = None
+    if isinstance(raw_opener, str):
+        opener = raw_opener.strip().lower()
+        if opener in CODEX_FILE_OPENERS:
+            file_opener = opener
+
+    sqlite_isolated = payload.get("codex_cli_sqlite_isolation") is True
+    normalized_base_home = Path(os.path.abspath(os.fspath(base_home)))
+    sqlite_home = normalized_base_home
+    if sqlite_isolated:
+        raw_sqlite_home = payload.get("codex_cli_sqlite_home")
+        if isinstance(raw_sqlite_home, str) and raw_sqlite_home.strip():
+            expanded_sqlite_home = os.path.expandvars(raw_sqlite_home.strip())
+            configured_sqlite_home = Path(expanded_sqlite_home).expanduser()
+            if not configured_sqlite_home.is_absolute():
+                raise ValueError("Codex CLI SQLite directory must be an absolute path.")
+            sqlite_home = Path(os.path.abspath(os.fspath(configured_sqlite_home)))
+        else:
+            sqlite_home = normalized_base_home / CLICKABLE_CLI_SQLITE_DIR_NAME
+        if os.path.normcase(os.fspath(sqlite_home)) == os.path.normcase(
+            os.fspath(normalized_base_home)
+        ):
+            raise ValueError(
+                "Codex CLI SQLite directory must differ from the normal Codex home."
+            )
+
+    return CodexLocalLaunchSettings(
+        executable=executable,
+        file_opener=file_opener,
+        sqlite_home=sqlite_home,
+        sqlite_isolated=sqlite_isolated,
+    )
+
+
+def configured_codex_executable(
+    settings_file: Path = PORTAL_SETTINGS_FILE,
+) -> Path | None:
+    return load_codex_local_launch_settings(
+        settings_file,
+        base_home=CODEX_HOME,
+    ).executable
 
 
 def configured_codex_file_opener(
     settings_file: Path = PORTAL_SETTINGS_FILE,
 ) -> str | None:
-    try:
-        payload = json.loads(settings_file.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    raw_opener = payload.get("codex_file_opener")
-    if not isinstance(raw_opener, str):
-        return None
-    opener = raw_opener.strip().lower()
-    return opener if opener in CODEX_FILE_OPENERS else None
+    return load_codex_local_launch_settings(
+        settings_file,
+        base_home=CODEX_HOME,
+    ).file_opener
 
 
 @functools.lru_cache(maxsize=16)
@@ -751,7 +810,7 @@ def build_openai_compatible_provider_override_args(
 
 def openai_preset_form_values(preset: dict[str, object]) -> dict[str, object]:
     raw_proxy_preference = str(preset.get("proxy_preference", "")).strip()
-    return {
+    values: dict[str, object] = {
         "openai_base_url": (
             str(preset.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
             or token_pool_settings.DEFAULT_OPENAI_BASE_URL
@@ -769,6 +828,11 @@ def openai_preset_form_values(preset: dict[str, object]) -> dict[str, object]:
             else "direct"
         ),
     }
+    if "models_only_validation" in preset or "skip_validation" in preset:
+        values["models_only_validation"] = bool(
+            preset.get("models_only_validation", preset.get("skip_validation", False))
+        )
+    return values
 
 
 def openai_model_form_state(
@@ -845,6 +909,102 @@ def _resolved_manual_openai_protocol(protocol_override: str, fallback: str) -> s
     return ""
 
 
+def _models_only_validation_value(
+    preset: dict[str, object] | None,
+    fallback: bool = False,
+) -> bool:
+    values = preset if isinstance(preset, dict) else {}
+    return bool(
+        values.get(
+            "models_only_validation",
+            values.get("skip_validation", fallback),
+        )
+    )
+
+
+def _resolve_openai_compatible_input(
+    *,
+    existing: dict[str, object],
+    existing_preset: dict[str, object],
+    base_url: str,
+    api_key: str,
+    model: str,
+    extras: list[str],
+    protocol_override: str,
+    models_only_validation: bool,
+    upstream_proxy_url: str,
+) -> dict[str, object]:
+    """Validate and normalize API form values without persisting anything."""
+    effective_base_url = (
+        base_url.strip()
+        or str(existing_preset.get("openai_base_url", "")).strip()
+        or str(existing.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
+    )
+    effective_api_key = (
+        api_key.strip()
+        or str(existing_preset.get("openai_api_key", "")).strip()
+        or str(existing.get("openai_api_key", "")).strip()
+    )
+    effective_model = (
+        model.strip()
+        or str(existing_preset.get("openai_model", "")).strip()
+        or str(existing.get("openai_model", "")).strip()
+    )
+    effective_upstream_proxy_url = (
+        upstream_proxy_url.strip()
+        or str(existing_preset.get("upstream_proxy_url", "")).strip()
+        or str(existing.get("upstream_proxy_url", "")).strip()
+    )
+
+    resolver = (
+        token_pool_settings.resolve_openai_compatible_models_only_config
+        if models_only_validation
+        else token_pool_settings.resolve_openai_compatible_backend_config
+    )
+    resolved = resolver(
+        effective_base_url,
+        effective_api_key,
+        effective_model,
+        upstream_proxy_url=effective_upstream_proxy_url,
+    )
+    upstream_models = list(resolved.get("openai_models", []) or [])
+    merged = _merge_openai_models(upstream_models, extras, "")
+    resolved_model = str(resolved.get("openai_model", "")).strip()
+    if effective_model and effective_model in merged:
+        selected_model = effective_model
+    elif resolved_model and resolved_model in merged:
+        selected_model = resolved_model
+    elif merged:
+        selected_model = merged[0]
+    else:
+        raise RuntimeError("No models returned by the configured endpoint.")
+    if selected_model not in merged:
+        merged.insert(0, selected_model)
+
+    configured_protocol = _resolved_manual_openai_protocol(
+        protocol_override,
+        str(
+            existing_preset.get(
+                "openai_protocol",
+                existing.get("openai_protocol", ""),
+            )
+        ),
+    )
+    final_protocol = configured_protocol or str(resolved.get("openai_protocol", "")).strip()
+    if models_only_validation and not final_protocol:
+        final_protocol = token_pool_settings.OPENAI_PROTOCOL_RESPONSES
+    return {
+        "openai_base_url": str(resolved.get("openai_base_url", effective_base_url)).strip()
+        or effective_base_url,
+        "openai_api_key": str(resolved.get("openai_api_key", effective_api_key)).strip()
+        or effective_api_key,
+        "openai_model": selected_model,
+        "openai_models": merged,
+        "openai_protocol": final_protocol,
+        "upstream_proxy_url": effective_upstream_proxy_url,
+    }
+
+
 def save_openai_compatible_backend_settings(
     *,
     settings_file: Path = token_pool_settings.DEFAULT_SETTINGS_FILE,
@@ -861,43 +1021,39 @@ def save_openai_compatible_backend_settings(
     proxy_preference: str = "direct",
     protocol_override: str = "",
     disable_image_generation: bool | None = None,
+    models_only_validation: bool | None = None,
 ) -> dict[str, object]:
-    existing = token_pool_settings.load_backend_settings(settings_file)
+    existing = token_pool_settings.load_backend_settings(
+        settings_file,
+        persist_defaults=False,
+    )
     existing_preset = _find_openai_preset(existing, preset_id) if preset_id.strip() and not create_new_preset else {}
     resolved_disable_image_generation = _resolve_disable_image_generation(existing_preset, disable_image_generation)
-    skip_validation = bool(existing_preset.get("skip_validation", False))
+    if models_only_validation is None:
+        models_only_validation = _models_only_validation_value(
+            existing_preset,
+            bool(existing.get("models_only_validation", existing.get("skip_validation", False))),
+        )
     if manual_extra_models is None:
         extra_source = existing_preset.get("openai_manual_extra_models", existing.get("openai_manual_extra_models", []))
         extras = [str(m).strip() for m in extra_source or [] if str(m).strip()]
     else:
         extras = [str(m).strip() for m in manual_extra_models if str(m).strip()]
 
-    if skip_validation:
-        selected_model = model.strip() or str(existing_preset.get("openai_model", existing.get("openai_model", ""))).strip()
-        merged = _merge_openai_models(existing_preset.get("openai_models", existing.get("openai_models", [])), extras, selected_model)
-        final_protocol = _resolved_manual_openai_protocol(
-            protocol_override,
-            str(existing_preset.get("openai_protocol", existing.get("openai_protocol", ""))),
-        )
-        resolved = {
-            "openai_base_url": base_url.strip() or str(existing_preset.get("openai_base_url", existing.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL))),
-            "openai_api_key": api_key.strip() or str(existing_preset.get("openai_api_key", existing.get("openai_api_key", ""))),
-            "openai_model": selected_model,
-            "openai_models": merged,
-            "openai_protocol": final_protocol,
-        }
-    else:
-        resolved = token_pool_settings.resolve_openai_compatible_backend_config(
-            base_url,
-            api_key,
-            model,
-        )
-        upstream_models = list(resolved.get("openai_models", []) or [])
-        merged = _merge_openai_models(upstream_models, extras, "")
-        selected_model = str(resolved.get("openai_model", model))
-        if selected_model not in merged and merged:
-            selected_model = merged[0]
-        final_protocol = protocol_override.strip() if protocol_override and protocol_override.strip() in token_pool_settings.VALID_OPENAI_PROTOCOLS else str(resolved.get("openai_protocol", ""))
+    resolved = _resolve_openai_compatible_input(
+        existing=existing,
+        existing_preset=existing_preset,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        extras=extras,
+        protocol_override=protocol_override,
+        models_only_validation=bool(models_only_validation),
+        upstream_proxy_url=str(existing_preset.get("upstream_proxy_url", existing.get("upstream_proxy_url", ""))),
+    )
+    selected_model = str(resolved["openai_model"])
+    merged = list(resolved.get("openai_models", []) or [])
+    final_protocol = str(resolved.get("openai_protocol", ""))
 
     updated = token_pool_settings.save_backend_settings(
         backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
@@ -911,6 +1067,7 @@ def save_openai_compatible_backend_settings(
         openai_models=merged,
         openai_protocol=final_protocol,
         openai_manual_extra_models=extras,
+        models_only_validation=bool(models_only_validation),
     )
     if preset_id.strip() or preset_name.strip():
         updated = token_pool_settings.save_openai_preset(
@@ -924,8 +1081,8 @@ def save_openai_compatible_backend_settings(
             openai_protocol=str(updated.get("openai_protocol", "")),
             openai_manual_extra_models=updated.get("openai_manual_extra_models", []),
             proxy_preference=proxy_preference,
-            upstream_proxy_url=str(existing_preset.get("upstream_proxy_url", updated.get("upstream_proxy_url", ""))),
-            skip_validation=bool(existing_preset.get("skip_validation", False)),
+            upstream_proxy_url=str(resolved.get("upstream_proxy_url", updated.get("upstream_proxy_url", ""))),
+            models_only_validation=bool(models_only_validation),
             installation_id=str(existing_preset.get("installation_id", "")),
             claude_env=existing_preset.get("claude_env", {}),
             disable_image_generation=resolved_disable_image_generation,
@@ -949,51 +1106,43 @@ def save_openai_compatible_preset_settings(
     proxy_preference: str = "direct",
     protocol_override: str = "",
     disable_image_generation: bool | None = None,
+    models_only_validation: bool | None = None,
 ) -> dict[str, object]:
-    existing = token_pool_settings.load_backend_settings(settings_file)
+    existing = token_pool_settings.load_backend_settings(
+        settings_file,
+        persist_defaults=False,
+    )
     existing_preset = _find_openai_preset(existing, preset_id) if preset_id.strip() and not create_new_preset else {}
     resolved_disable_image_generation = _resolve_disable_image_generation(existing_preset, disable_image_generation)
-    skip_validation = bool(existing_preset.get("skip_validation", False))
+    if models_only_validation is None:
+        models_only_validation = _models_only_validation_value(
+            existing_preset,
+            bool(existing.get("models_only_validation", existing.get("skip_validation", False))),
+        )
     if manual_extra_models is None:
         extra_source = existing_preset.get("openai_manual_extra_models", existing.get("openai_manual_extra_models", []))
         extras = [str(m).strip() for m in extra_source or [] if str(m).strip()]
     else:
         extras = [str(m).strip() for m in manual_extra_models if str(m).strip()]
 
-    if skip_validation:
-        selected_model = model.strip() or str(existing_preset.get("openai_model", existing.get("openai_model", ""))).strip()
-        merged = _merge_openai_models(existing_preset.get("openai_models", existing.get("openai_models", [])), extras, selected_model)
-        final_protocol = _resolved_manual_openai_protocol(
-            protocol_override,
-            str(existing_preset.get("openai_protocol", existing.get("openai_protocol", ""))),
-        )
-        resolved = {
-            "openai_base_url": base_url.strip() or str(existing_preset.get("openai_base_url", existing.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL))),
-            "openai_api_key": api_key.strip() or str(existing_preset.get("openai_api_key", existing.get("openai_api_key", ""))),
-            "openai_model": selected_model,
-            "openai_models": merged,
-            "openai_protocol": final_protocol,
-        }
-    else:
-        resolved = token_pool_settings.resolve_openai_compatible_backend_config(
-            base_url,
-            api_key,
-            model,
-        )
-        upstream_models = list(resolved.get("openai_models", []) or [])
-        merged = _merge_openai_models(upstream_models, extras, "")
-        selected_model = str(resolved.get("openai_model", model))
-        if selected_model not in merged and merged:
-            selected_model = merged[0]
-        final_protocol = (
-            protocol_override.strip()
-            if protocol_override and protocol_override.strip() in token_pool_settings.VALID_OPENAI_PROTOCOLS
-            else str(resolved.get("openai_protocol", ""))
-        )
+    resolved = _resolve_openai_compatible_input(
+        existing=existing,
+        existing_preset=existing_preset,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        extras=extras,
+        protocol_override=protocol_override,
+        models_only_validation=bool(models_only_validation),
+        upstream_proxy_url=str(existing_preset.get("upstream_proxy_url", existing.get("upstream_proxy_url", ""))),
+    )
+    selected_model = str(resolved["openai_model"])
+    merged = list(resolved.get("openai_models", []) or [])
+    final_protocol = str(resolved.get("openai_protocol", ""))
 
     # Auto-detect proxy preference by testing actual connections
     final_proxy_pref = proxy_preference
-    if proxy_preference == "auto" and not skip_validation:
+    if proxy_preference == "auto" and not models_only_validation:
         final_base_url = str(resolved.get("openai_base_url", base_url))
         final_api_key = str(resolved.get("openai_api_key", api_key))
         detected = token_pool_settings.detect_proxy_preference(final_base_url, final_api_key)
@@ -1009,8 +1158,8 @@ def save_openai_compatible_preset_settings(
         openai_protocol=final_protocol,
         openai_manual_extra_models=extras,
         proxy_preference=final_proxy_pref,
-        upstream_proxy_url=str(existing_preset.get("upstream_proxy_url", "")),
-        skip_validation=bool(existing_preset.get("skip_validation", False)),
+        upstream_proxy_url=str(resolved.get("upstream_proxy_url", "")),
+        models_only_validation=bool(models_only_validation),
         installation_id=str(existing_preset.get("installation_id", "")),
         claude_env=existing_preset.get("claude_env", {}),
         disable_image_generation=resolved_disable_image_generation,
@@ -1029,15 +1178,34 @@ def refresh_openai_compatible_models_from_upstream(
     `gpt-5.6-luna`) are appended on top. Network or HTTP errors fall back to the
     current saved settings.
     """
-    settings = token_pool_settings.load_backend_settings(settings_file)
+    settings = token_pool_settings.load_backend_settings(
+        settings_file,
+        persist_defaults=False,
+    )
     if str(settings.get("backend_mode", "")) != token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
         return settings
     base_url = str(settings.get("openai_base_url", "")).strip()
     api_key = str(settings.get("openai_api_key", "")).strip()
     if not base_url or not api_key:
         return settings
+    models_only_validation = bool(
+        settings.get("models_only_validation", settings.get("skip_validation", False))
+    )
     try:
-        upstream_models = token_pool_settings.fetch_openai_compatible_models(base_url, api_key)
+        if models_only_validation:
+            resolved = token_pool_settings.resolve_openai_compatible_models_only_config(
+                base_url,
+                api_key,
+                str(settings.get("openai_model", "")).strip(),
+                upstream_proxy_url=str(settings.get("upstream_proxy_url", "")).strip(),
+            )
+            base_url = str(resolved.get("openai_base_url", base_url)).strip() or base_url
+            upstream_models = list(resolved.get("openai_models", []) or [])
+        else:
+            upstream_models = token_pool_settings.fetch_openai_compatible_models(
+                base_url,
+                api_key,
+            )
     except Exception:
         return settings
     if not upstream_models:
@@ -1054,7 +1222,19 @@ def refresh_openai_compatible_models_from_upstream(
         if extra not in merged:
             merged.append(extra)
     current_model = str(settings.get("openai_model", "")).strip()
-    selected = current_model if current_model in merged else merged[0]
+    if current_model in merged:
+        selected = current_model
+    elif models_only_validation:
+        selected = next(
+            (
+                preferred
+                for preferred in (DEFAULT_PRIMARY_MODEL, "gpt-5.6-sol")
+                if preferred in merged
+            ),
+            merged[0],
+        )
+    else:
+        selected = merged[0]
     return token_pool_settings.save_backend_settings(
         backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
         settings_file=settings_file,
@@ -1067,6 +1247,7 @@ def refresh_openai_compatible_models_from_upstream(
         openai_models=merged,
         openai_protocol=str(settings.get("openai_protocol", "")),
         openai_manual_extra_models=extras,
+        models_only_validation=models_only_validation,
     )
 
 
@@ -1082,15 +1263,19 @@ def apply_backend_mode_settings(
     openai_model: str = "",
     openai_models: list[str] | tuple[str, ...] = (),
     openai_protocol: str = "",
+    models_only_validation: bool | None = None,
 ) -> dict[str, object]:
     clean_mode = str(backend_mode).strip() or token_pool_settings.BACKEND_MODE_CODEX_AUTH
     if clean_mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
-        existing = token_pool_settings.load_backend_settings(settings_file)
+        existing = token_pool_settings.load_backend_settings(
+            settings_file,
+            persist_defaults=False,
+        )
         active_preset_id = str(existing.get("active_openai_preset_id", "")).strip()
         active_preset = _find_openai_preset(existing, active_preset_id) if active_preset_id else {}
-        use_active_skip_preset = (
+        use_active_models_only_preset = (
             isinstance(active_preset, dict)
-            and bool(active_preset.get("skip_validation", False))
+            and _models_only_validation_value(active_preset)
         )
         return save_openai_compatible_backend_settings(
             settings_file=settings_file,
@@ -1100,10 +1285,17 @@ def apply_backend_mode_settings(
             base_url=openai_base_url,
             api_key=openai_api_key,
             model=openai_model,
-            preset_id=active_preset_id if use_active_skip_preset else "",
-            preset_name=str(active_preset.get("name", "")).strip() if use_active_skip_preset else "",
-            proxy_preference=str(active_preset.get("proxy_preference", "direct")) if use_active_skip_preset else "direct",
+            preset_id=active_preset_id if use_active_models_only_preset else "",
+            preset_name=str(active_preset.get("name", "")).strip() if use_active_models_only_preset else "",
+            proxy_preference=str(active_preset.get("proxy_preference", "direct")) if use_active_models_only_preset else "direct",
             protocol_override=openai_protocol,
+            models_only_validation=(
+                models_only_validation
+                if models_only_validation is not None
+                else _models_only_validation_value(active_preset)
+                if use_active_models_only_preset
+                else False
+            ),
         )
     updated = token_pool_settings.save_backend_settings(
         backend_mode=clean_mode,
@@ -2000,6 +2192,7 @@ class SessionManagerApp:
                         prev["ts"] = ts
                         prev["text"] = text
 
+        overrides = mobile_portal.load_session_settings_file(SETTINGS_FILE)
         items: list[SessionItem] = []
         for sid, data in latest.items():
             ts = int(data["ts"])
@@ -2007,6 +2200,7 @@ class SessionManagerApp:
             count = int(data["count"])
             session_file = self._find_session_file(sid)
             details = self._extract_session_details(session_file) if session_file else {}
+            override = overrides.get(sid, {})
             items.append(
                 SessionItem(
                     session_id=sid,
@@ -2014,7 +2208,7 @@ class SessionManagerApp:
                     text=text,
                     note=self.session_notes.get(sid, ""),
                     history_count=count,
-                    cwd=str(details.get("cwd", "")),
+                    cwd=str(override.get("cwd", details.get("cwd", ""))),
                     model=str(details.get("model", "")),
                     approval_policy=str(details.get("approval_policy", "")),
                     sandbox_mode=str(details.get("sandbox_mode", "")),
@@ -2426,7 +2620,7 @@ class SessionManagerApp:
 
     def _build_codex_override_args(self, settings: dict[str, object] | None = None) -> list[str]:
         resolved_settings = settings if settings is not None else self._token_pool_settings()
-        args: list[str] = []
+        args: list[str] = token_pool_settings.build_codex_context_override_args()
         use_launch_defaults = self.use_global_defaults_var.get()
         if use_launch_defaults:
             launch_defaults = default_launch_options()
@@ -2489,11 +2683,7 @@ class SessionManagerApp:
             if (
                 clean_candidate
                 and clean_candidate != "default"
-                and (
-                    clean_candidate == DEFAULT_PRIMARY_MODEL
-                    or not allowed_models
-                    or clean_candidate in allowed_models
-                )
+                and (not allowed_models or clean_candidate in allowed_models)
             ):
                 return clean_candidate
         configured_model = str(resolved_settings.get("openai_model", "")).strip()
@@ -2540,6 +2730,7 @@ class SessionManagerApp:
                 or self._configured_backend_model(resolved_settings)
                 or DEFAULT_PRIMARY_MODEL
             )
+        token_pool_settings.ensure_codex_model_context_metadata([backend_model])
         args.extend(self._build_backend_override_args(backend_model, resolved_settings))
         return args
 
@@ -2564,6 +2755,7 @@ class SessionManagerApp:
                 if selected_model and selected_model != "default"
                 else self._configured_backend_model(resolved_settings) or DEFAULT_PRIMARY_MODEL
             )
+        token_pool_settings.ensure_codex_model_context_metadata([backend_model])
         args.extend(
             self._build_backend_override_args(backend_model, resolved_settings)
         )
@@ -2586,24 +2778,43 @@ class SessionManagerApp:
             escaped.append("'" + a.replace("'", "''") + "'")
         return " ".join(escaped)
 
-    def _resolve_terminal_codex_args(self, codex_args: list[str]) -> list[str]:
+    def _resolve_terminal_codex_launch(self) -> CodexTerminalLaunch:
+        local_settings = load_codex_local_launch_settings()
+        configured = local_settings.executable
+        if configured is not None and codex_executable_is_healthy(configured):
+            return CodexTerminalLaunch(
+                executable=str(configured),
+                uses_custom_executable=True,
+                file_opener=local_settings.file_opener,
+                sqlite_home=local_settings.sqlite_home,
+                sqlite_isolated=local_settings.sqlite_isolated,
+            )
+        return CodexTerminalLaunch(
+            executable=shutil.which("codex.cmd") or "codex.cmd",
+            uses_custom_executable=False,
+            file_opener=None,
+            sqlite_home=local_settings.sqlite_home,
+            sqlite_isolated=local_settings.sqlite_isolated,
+        )
+
+    def _resolve_terminal_codex_args(
+        self,
+        codex_args: list[str],
+        *,
+        codex_launch: CodexTerminalLaunch | None = None,
+    ) -> list[str]:
         if not codex_args:
             return codex_args
         if codex_args[0].lower() != "codex.cmd":
             return codex_args
-        configured = configured_codex_executable()
-        if configured is not None and codex_executable_is_healthy(configured):
-            opener = configured_codex_file_opener()
-            opener_args = (
-                ["-c", f'file_opener="{opener}"']
-                if opener is not None
-                else []
-            )
-            return [str(configured), *opener_args, *codex_args[1:]]
-        resolved = shutil.which("codex.cmd")
-        if not resolved:
-            return codex_args
-        return [resolved, *codex_args[1:]]
+        launch = codex_launch or self._resolve_terminal_codex_launch()
+        resolved = [launch.executable, *codex_args[1:]]
+        if launch.uses_custom_executable and launch.file_opener is not None:
+            resolved.extend(["-c", f'file_opener="{launch.file_opener}"'])
+        if launch.sqlite_isolated:
+            sqlite_home = launch.sqlite_home.as_posix()
+            resolved.extend(["-c", f'sqlite_home="{sqlite_home}"'])
+        return resolved
 
     def _build_proxy_ps_prefix(self, settings: dict[str, object] | None = None) -> str:
         resolved_settings = settings if settings is not None else self._token_pool_settings()
@@ -2955,11 +3166,25 @@ class SessionManagerApp:
         openai_model: str | None = None,
         openai_protocol: str | None = None,
         proxy_preference: str | None = None,
+        upstream_proxy_url: str | None = None,
         disable_image_generation: bool | None = None,
+        models_only_validation: bool | None = None,
     ) -> dict[str, object]:
-        existing = token_pool_settings.load_backend_settings(settings_file)
+        existing = token_pool_settings.load_backend_settings(
+            settings_file,
+            persist_defaults=False,
+        )
         existing_preset = _find_openai_preset(existing, preset_id)
+        if not existing_preset:
+            raise KeyError(f"OpenAI preset not found: {preset_id}")
         resolved_disable_image_generation = _resolve_disable_image_generation(existing_preset, disable_image_generation)
+        if models_only_validation is None:
+            models_only_validation = _models_only_validation_value(existing_preset)
+        legacy_skip_without_network = (
+            "skip_validation" in existing_preset
+            and "models_only_validation" not in existing_preset
+            and bool(models_only_validation)
+        )
         resolved_name = (
             preset_name.strip()
             if preset_name is not None and preset_name.strip()
@@ -3004,59 +3229,72 @@ class SessionManagerApp:
             if raw_proxy_preference in {"auto", "direct", "proxy"}
             else "direct"
         )
-        upstream_proxy_url = str(existing_preset.get("upstream_proxy_url", ""))
-        skip_validation = bool(existing_preset.get("skip_validation", False))
-        previous_proxy_preference = token_pool_settings.get_active_proxy_preference()
-        if skip_validation:
+        effective_upstream_proxy_url = (upstream_proxy_url or "").strip()
+        if legacy_skip_without_network:
             resolved: dict[str, object] = {
                 "openai_base_url": resolved_base_url,
                 "openai_api_key": resolved_api_key,
                 "openai_model": selected_model,
                 "openai_models": candidate_models,
                 "openai_protocol": candidate_protocol,
+                "upstream_proxy_url": effective_upstream_proxy_url,
             }
         else:
-            token_pool_settings.set_active_proxy_preference(candidate_proxy_preference)
-            try:
-                resolved = token_pool_settings.resolve_openai_compatible_backend_config(
-                    resolved_base_url,
-                    resolved_api_key,
-                    selected_model,
-                    upstream_proxy_url=upstream_proxy_url,
-                )
-            except Exception:
-                token_pool_settings.set_active_proxy_preference(previous_proxy_preference)
-                raise
-        try:
-            final_base_url = str(resolved.get("openai_base_url", resolved_base_url))
-            final_api_key = str(resolved.get("openai_api_key", resolved_api_key))
-            final_model = str(resolved.get("openai_model", selected_model))
-            final_models = resolved.get("openai_models", candidate_models)
-            final_protocol = _resolved_manual_openai_protocol(
-                candidate_protocol,
-                str(resolved.get("openai_protocol", candidate_protocol)),
+            resolved = _resolve_openai_compatible_input(
+                existing=existing,
+                existing_preset=existing_preset,
+                base_url=openai_base_url or "",
+                api_key=openai_api_key or "",
+                model=openai_model or "",
+                extras=manual_extra_models,
+                protocol_override=openai_protocol or "",
+                models_only_validation=bool(models_only_validation),
+                upstream_proxy_url=effective_upstream_proxy_url,
             )
-            updated = token_pool_settings.save_and_activate_openai_preset(
-                settings_file=settings_file,
-                preset_id=preset_id.strip(),
-                name=resolved_name,
-                openai_base_url=final_base_url,
-                openai_api_key=final_api_key,
-                openai_model=final_model,
-                openai_models=final_models,
-                openai_protocol=final_protocol,
-                openai_manual_extra_models=manual_extra_models,
-                proxy_preference=candidate_proxy_preference,
-                upstream_proxy_url=upstream_proxy_url,
-                skip_validation=skip_validation,
-                installation_id=str(existing_preset.get("installation_id", "")),
-                claude_env=existing_preset.get("claude_env", {}),
-                disable_image_generation=resolved_disable_image_generation,
-            )
-        except Exception:
-            if not skip_validation:
-                token_pool_settings.set_active_proxy_preference(previous_proxy_preference)
-            raise
+        final_base_url = str(resolved.get("openai_base_url", resolved_base_url))
+        final_api_key = str(resolved.get("openai_api_key", resolved_api_key))
+        final_model = str(resolved.get("openai_model", selected_model))
+        final_models = resolved.get("openai_models", candidate_models)
+        final_protocol = _resolved_manual_openai_protocol(
+            candidate_protocol,
+            str(resolved.get("openai_protocol", candidate_protocol)),
+        )
+        final_upstream_proxy_url = str(
+            resolved.get("upstream_proxy_url", effective_upstream_proxy_url)
+        )
+        updated = token_pool_settings.save_backend_settings(
+            backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
+            settings_file=settings_file,
+            token_dir=Path(str(existing.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR))),
+            proxy_port=int(existing.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+            proxy_api_key=str(existing.get("proxy_api_key", "")),
+            openai_base_url=final_base_url,
+            openai_api_key=final_api_key,
+            openai_model=final_model,
+            openai_models=final_models,
+            openai_protocol=final_protocol,
+            openai_manual_extra_models=manual_extra_models,
+            upstream_proxy_url=final_upstream_proxy_url,
+            models_only_validation=bool(models_only_validation),
+        )
+        updated = token_pool_settings.save_openai_preset(
+            settings_file=settings_file,
+            preset_id=preset_id.strip(),
+            name=resolved_name,
+            openai_base_url=final_base_url,
+            openai_api_key=final_api_key,
+            openai_model=final_model,
+            openai_models=final_models,
+            openai_protocol=final_protocol,
+            openai_manual_extra_models=manual_extra_models,
+            proxy_preference=candidate_proxy_preference,
+            upstream_proxy_url=final_upstream_proxy_url,
+            models_only_validation=bool(models_only_validation),
+            installation_id=str(existing_preset.get("installation_id", "")),
+            claude_env=existing_preset.get("claude_env", {}),
+            disable_image_generation=resolved_disable_image_generation,
+            set_active=True,
+        )
         self.backend_settings = updated
         active_preset = next((item for item in updated.get("openai_presets", []) if isinstance(item, dict) and str(item.get("id", "")).strip() == preset_id.strip()), {})
         _swap_installation_id_for_preset(active_preset)
@@ -3176,6 +3414,7 @@ class SessionManagerApp:
         settings: dict[str, object],
         *,
         session_id: str,
+        codex_launch: CodexTerminalLaunch | None = None,
     ) -> window_runtime.WindowRuntime:
         mode = str(
             settings.get(
@@ -3189,12 +3428,32 @@ class SessionManagerApp:
             if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE
             else ""
         )
-        return window_runtime.prepare_window_runtime(
+        launch = codex_launch or self._resolve_terminal_codex_launch()
+        sqlite_home = launch.sqlite_home if launch.sqlite_isolated else None
+        runtime = window_runtime.prepare_window_runtime(
             base_home=CODEX_HOME,
             isolate_home=isolate_home,
+            sqlite_home=sqlite_home,
             session_id=session_id,
             installation_id=installation_id,
         )
+        selected_model = self.model_var.get().strip()
+        if mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE:
+            backend_model = self._resolve_openai_compatible_launch_model(
+                self._selected_launch_model(),
+                settings=settings,
+            )
+        else:
+            backend_model = (
+                selected_model
+                if selected_model and selected_model != "default"
+                else self._configured_backend_model(settings) or DEFAULT_PRIMARY_MODEL
+            )
+        token_pool_settings.ensure_codex_model_context_metadata(
+            [backend_model],
+            models_cache_file=runtime.codex_home / "models_cache.json",
+        )
+        return runtime
 
     def _runtime_cleanup_command(self) -> list[str | Path]:
         if getattr(sys, "frozen", False):
@@ -3211,10 +3470,15 @@ class SessionManagerApp:
         codex_args: list[str],
         settings: dict[str, object] | None = None,
         runtime: window_runtime.WindowRuntime | None = None,
+        *,
+        codex_launch: CodexTerminalLaunch | None = None,
     ) -> str:
         resolved_settings = settings if settings is not None else self._token_pool_settings()
         cwd_escaped = cwd.replace("'", "''")
-        codex_args = self._resolve_terminal_codex_args(codex_args)
+        codex_args = self._resolve_terminal_codex_args(
+            codex_args,
+            codex_launch=codex_launch,
+        )
         proxy_prefix = self._build_proxy_ps_prefix(resolved_settings)
         clear_api_prefix = build_clear_api_environment_ps_prefix()
         token_pool_prefix = ""
@@ -3432,6 +3696,7 @@ class SessionManagerApp:
         openai_proxy_preference_var = tk.StringVar(value="direct")
         openai_protocol_var = tk.StringVar(value="responses")
         openai_disable_image_generation_var = tk.BooleanVar(value=False)
+        openai_models_only_validation_var = tk.BooleanVar(value=False)
         openai_status_var = tk.StringVar(value="")
 
         token_pool_frame = ttk.LabelFrame(container, text="Backend", padding=10)
@@ -3508,12 +3773,21 @@ class SessionManagerApp:
             variable=openai_disable_image_generation_var,
         ).pack(side=tk.LEFT, padx=(8, 0))
 
+        openai_validation_row = ttk.Frame(token_pool_frame)
+        openai_validation_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Checkbutton(
+            openai_validation_row,
+            text="Only fetch models (do not test a conversation)",
+            variable=openai_models_only_validation_var,
+        ).pack(side=tk.LEFT)
+
         ttk.Label(token_pool_frame, text="OpenAI status", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 0))
         ttk.Label(token_pool_frame, textvariable=openai_status_var, justify=tk.LEFT, wraplength=540).pack(anchor="w", pady=(4, 8))
 
         openai_button_row = ttk.Frame(token_pool_frame)
         openai_button_row.pack(fill=tk.X)
         ttk.Button(openai_button_row, text="Save / Refresh Models", command=lambda: save_openai_compatible_settings_dialog()).pack(side=tk.LEFT)
+        ttk.Button(openai_button_row, text="Fetch Models Only", command=lambda: fetch_openai_compatible_models_only_dialog()).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(openai_button_row, text="Save as Preset", command=lambda: save_openai_compatible_preset_dialog()).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(openai_button_row, text="Apply Preset", command=lambda: apply_openai_preset_dialog()).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(openai_button_row, text="Delete Preset", command=lambda: delete_openai_preset_dialog()).pack(side=tk.LEFT, padx=(8, 0))
@@ -3559,6 +3833,12 @@ class SessionManagerApp:
             openai_preset_name_var.set(str(active_preset.get("name", "")).strip() if active_preset is not None else active_preset_id)
             openai_disable_image_generation_var.set(
                 bool(active_preset.get("disable_image_generation", False)) if active_preset is not None else bool(settings.get("disable_image_generation", False))
+            )
+            openai_models_only_validation_var.set(
+                _models_only_validation_value(
+                    active_preset,
+                    bool(settings.get("models_only_validation", settings.get("skip_validation", False))),
+                )
             )
             openai_models = [str(item).strip() for item in openai_form_values.get("openai_models", []) if str(item).strip()]
             openai_model_values, saved_openai_model = openai_model_form_state(
@@ -3616,6 +3896,9 @@ class SessionManagerApp:
                 raw_proto = str(preset_values["openai_protocol"])
                 openai_protocol_var.set(raw_proto if raw_proto in {"responses", "chat_completions"} else "responses")
                 openai_disable_image_generation_var.set(bool(preset.get("disable_image_generation", False)))
+                openai_models_only_validation_var.set(
+                    bool(preset_values.get("models_only_validation", False))
+                )
 
         openai_preset_box.bind("<<ComboboxSelected>>", update_openai_preset_fields_from_selection)
 
@@ -3635,6 +3918,7 @@ class SessionManagerApp:
                     openai_model=openai_model_var.get(),
                     openai_models=settings.get("openai_models", []),
                     openai_protocol=openai_protocol_var.get().strip(),
+                    models_only_validation=openai_models_only_validation_var.get(),
                 )
             except Exception as exc:
                 messagebox.showerror("Backend Mode", str(exc), parent=dialog)
@@ -3677,6 +3961,7 @@ class SessionManagerApp:
                     proxy_preference=openai_proxy_preference_var.get().strip(),
                     protocol_override=openai_protocol_var.get().strip(),
                     disable_image_generation=openai_disable_image_generation_var.get(),
+                    models_only_validation=openai_models_only_validation_var.get(),
                 )
             except Exception as exc:
                 messagebox.showerror("OpenAI-Compatible API", str(exc), parent=dialog)
@@ -3693,6 +3978,10 @@ class SessionManagerApp:
                     openai_model_var.set(auto_model)
             saved_models = list(updated.get("openai_models", []) or [])
             self.status_var.set(f"Saved OpenAI-compatible backend settings ({len(saved_models)} model(s))")
+
+        def fetch_openai_compatible_models_only_dialog() -> None:
+            openai_models_only_validation_var.set(True)
+            save_openai_compatible_settings_dialog()
 
         def save_openai_compatible_preset_dialog() -> None:
             settings = self._token_pool_settings()
@@ -3715,6 +4004,7 @@ class SessionManagerApp:
                     proxy_preference=openai_proxy_preference_var.get().strip(),
                     protocol_override=openai_protocol_var.get().strip(),
                     disable_image_generation=openai_disable_image_generation_var.get(),
+                    models_only_validation=openai_models_only_validation_var.get(),
                 )
             except Exception as exc:
                 messagebox.showerror("OpenAI-Compatible API", str(exc), parent=dialog)
@@ -3743,6 +4033,7 @@ class SessionManagerApp:
                     openai_protocol=openai_protocol_var.get().strip(),
                     proxy_preference=openai_proxy_preference_var.get().strip(),
                     disable_image_generation=openai_disable_image_generation_var.get(),
+                    models_only_validation=openai_models_only_validation_var.get(),
                 )
             except Exception as exc:
                 messagebox.showerror("OpenAI-Compatible API", str(exc), parent=dialog)
@@ -4331,15 +4622,18 @@ class SessionManagerApp:
             settings = dict(self._token_pool_settings())
             self._ensure_backend_ready(settings)
             codex_args = self._build_codex_resume_args(item, settings)
+            codex_launch = self._resolve_terminal_codex_launch()
             runtime = self._prepare_window_runtime(
                 settings,
                 session_id=item.session_id,
+                codex_launch=codex_launch,
             )
             ps_command = self._build_terminal_ps_command(
                 cwd,
                 codex_args,
                 settings,
                 runtime,
+                codex_launch=codex_launch,
             )
         except window_runtime.SessionAlreadyOpenError:
             messagebox.showinfo(
@@ -4384,12 +4678,18 @@ class SessionManagerApp:
             settings = dict(self._token_pool_settings())
             self._ensure_backend_ready(settings)
             codex_args = self._build_codex_new_args(settings)
-            runtime = self._prepare_window_runtime(settings, session_id="")
+            codex_launch = self._resolve_terminal_codex_launch()
+            runtime = self._prepare_window_runtime(
+                settings,
+                session_id="",
+                codex_launch=codex_launch,
+            )
             ps_command = self._build_terminal_ps_command(
                 target_dir,
                 codex_args,
                 settings,
                 runtime,
+                codex_launch=codex_launch,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             if runtime is not None:

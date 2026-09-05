@@ -1,8 +1,11 @@
 import json
 import hashlib
 import os
+import re
 import secrets
 import shutil
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 from urllib import error as url_error
@@ -15,6 +18,8 @@ DEFAULT_TOKEN_POOL_DIR = USERPROFILE / '.cli-proxy-api'
 DEFAULT_SETTINGS_FILE = CODEX_HOME / 'token_pool_settings.json'
 DEFAULT_MODELS_CACHE_FILE = CODEX_HOME / 'models_cache.json'
 DEFAULT_PROXY_PORT = 8317
+CODEX_CONTEXT_WINDOW = 512_000
+CODEX_AUTO_COMPACT_TOKEN_LIMIT = 460_000
 BACKEND_MODE_CODEX_AUTH = 'codex_auth'
 BACKEND_MODE_TOKEN_POOL = 'built_in_token_pool'
 BACKEND_MODE_OPENAI_COMPATIBLE = 'openai_compatible'
@@ -40,6 +45,93 @@ OPENAI_COMPATIBLE_CODEX_ORIGINATOR = 'codex_exec'
 # Module-level proxy preference set by apply_openai_preset / resolve config.
 # Values: 'direct' or 'proxy'. Default to direct so presets are deterministic.
 _ACTIVE_PROXY_PREFERENCE = 'direct'
+
+
+def build_codex_context_override_args() -> list[str]:
+    """Apply the shared context and compaction limits to every Codex launch."""
+    return [
+        '-c',
+        f'model_context_window={CODEX_CONTEXT_WINDOW}',
+        '-c',
+        f'model_auto_compact_token_limit={CODEX_AUTO_COMPACT_TOKEN_LIMIT}',
+    ]
+
+
+def _current_codex_client_version() -> str:
+    executable = shutil.which('codex.cmd') or shutil.which('codex')
+    if executable:
+        try:
+            result = subprocess.run(
+                [executable, '--version'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                timeout=3,
+                check=False,
+            )
+            match = re.search(r'\b\d+\.\d+\.\d+\b', f'{result.stdout}\n{result.stderr}')
+            if match:
+                return match.group(0)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return '0.148.0'
+
+
+def _prepare_codex_models_cache(payload: dict[str, object]) -> bool:
+    """Keep the synthetic model catalog readable and fresh for Codex's cache loader."""
+    changed = False
+    client_version = _current_codex_client_version()
+    if payload.get('client_version') != client_version:
+        payload['client_version'] = client_version
+        changed = True
+    if 'etag' not in payload:
+        payload['etag'] = None
+        changed = True
+    if 'fetched_at' not in payload:
+        payload['fetched_at'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        changed = True
+    return changed
+
+
+def _touch_codex_models_cache(payload: dict[str, object]) -> None:
+    payload['fetched_at'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def ensure_codex_model_context_metadata(
+    model_ids: Iterable[str],
+    *,
+    models_cache_file: Path = DEFAULT_MODELS_CACHE_FILE,
+) -> bool:
+    """Keep every cached Codex model aligned with the shared context policy."""
+    clean_model_ids = set(_normalize_openai_models([str(model_id).strip() for model_id in model_ids]))
+    if not clean_model_ids or not models_cache_file.exists():
+        return False
+    try:
+        payload = json.loads(models_cache_file.read_text(encoding='utf-8'))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get('models'), list):
+        return False
+
+    changed = _prepare_codex_models_cache(payload)
+    for model in payload['models']:
+        if not isinstance(model, dict):
+            continue
+        if model.get('context_window') != CODEX_CONTEXT_WINDOW:
+            model['context_window'] = CODEX_CONTEXT_WINDOW
+            changed = True
+        if model.get('max_context_window') != CODEX_CONTEXT_WINDOW:
+            model['max_context_window'] = CODEX_CONTEXT_WINDOW
+            changed = True
+    if not changed:
+        return False
+    _touch_codex_models_cache(payload)
+    try:
+        models_cache_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    except OSError:
+        return False
+    return True
 
 
 def set_active_proxy_preference(preference: str) -> None:
@@ -150,6 +242,9 @@ def _normalize_openai_preset(raw: object, fallback_id: str, fallback_name: str) 
     raw_pref = str(values.get('proxy_preference', '')).strip()
     proxy_preference = raw_pref if raw_pref in ('direct', 'proxy', 'auto') else 'direct'
     upstream_proxy_url = str(values.get('upstream_proxy_url', '')).strip()
+    models_only_validation = bool(
+        values.get('models_only_validation', values.get('skip_validation', False))
+    )
     return {
         'id': preset_id,
         'name': name,
@@ -161,7 +256,7 @@ def _normalize_openai_preset(raw: object, fallback_id: str, fallback_name: str) 
         'openai_manual_extra_models': _normalize_openai_models(values.get('openai_manual_extra_models', [])),
         'proxy_preference': proxy_preference,
         'upstream_proxy_url': upstream_proxy_url,
-        'skip_validation': bool(values.get('skip_validation', False)),
+        'models_only_validation': models_only_validation,
         'installation_id': str(values.get('installation_id', '')).strip(),
         'claude_env': _normalize_string_map(values.get('claude_env', {})),
         'disable_image_generation': bool(values.get('disable_image_generation', False)),
@@ -185,7 +280,9 @@ def _openai_preset_from_payload(
             'openai_protocol': payload.get('openai_protocol', ''),
             'openai_manual_extra_models': payload.get('openai_manual_extra_models', []),
             'upstream_proxy_url': payload.get('upstream_proxy_url', ''),
-            'skip_validation': payload.get('skip_validation', False),
+            'models_only_validation': payload.get(
+                'models_only_validation', payload.get('skip_validation', False)
+            ),
             'installation_id': payload.get('installation_id', ''),
             'claude_env': payload.get('claude_env', {}),
             'disable_image_generation': payload.get('disable_image_generation', False),
@@ -233,7 +330,8 @@ def _copy_openai_preset_to_top_level(payload: dict[str, object], preset: dict[st
     raw_pref = str(preset.get('proxy_preference', 'direct')).strip()
     payload['proxy_preference'] = raw_pref if raw_pref in ('direct', 'proxy', 'auto') else 'direct'
     payload['upstream_proxy_url'] = str(preset.get('upstream_proxy_url', '')).strip()
-    payload['skip_validation'] = bool(preset.get('skip_validation', False))
+    payload['models_only_validation'] = bool(preset.get('models_only_validation', False))
+    payload.pop('skip_validation', None)
     payload['installation_id'] = str(preset.get('installation_id', '')).strip()
     payload['claude_env'] = _normalize_string_map(preset.get('claude_env', {}))
     payload['disable_image_generation'] = bool(preset.get('disable_image_generation', False))
@@ -389,7 +487,7 @@ def ensure_openai_compatible_model_metadata(
     if source is None:
         return False
 
-    changed = False
+    changed = _prepare_codex_models_cache(payload)
     for model_id in clean_model_ids:
         existing = existing_by_slug.get(model_id)
         if existing is not None:
@@ -401,6 +499,12 @@ def ensure_openai_compatible_model_metadata(
             if updated_modalities != modalities:
                 existing['input_modalities'] = updated_modalities
                 changed = True
+            if existing.get('context_window') != CODEX_CONTEXT_WINDOW:
+                existing['context_window'] = CODEX_CONTEXT_WINDOW
+                changed = True
+            if existing.get('max_context_window') != CODEX_CONTEXT_WINDOW:
+                existing['max_context_window'] = CODEX_CONTEXT_WINDOW
+                changed = True
             continue
         cloned = json.loads(json.dumps(source, ensure_ascii=False))
         cloned['slug'] = model_id
@@ -410,11 +514,14 @@ def ensure_openai_compatible_model_metadata(
         cloned['supported_in_api'] = True
         cloned['priority'] = int(cloned.get('priority', 1000) or 1000) + 1000
         cloned['input_modalities'] = ['text', 'image']
+        cloned['context_window'] = CODEX_CONTEXT_WINDOW
+        cloned['max_context_window'] = CODEX_CONTEXT_WINDOW
         models.append(cloned)
         existing_by_slug[model_id] = cloned
         changed = True
     if not changed:
         return False
+    _touch_codex_models_cache(payload)
 
     try:
         models_cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -437,6 +544,7 @@ def _build_backend_payload(
     openai_protocol: str,
     openai_manual_extra_models: object = (),
     upstream_proxy_url: str = '',
+    models_only_validation: bool = False,
 ) -> dict[str, object]:
     clean_protocol = _normalize_openai_protocol(openai_protocol)
     return {
@@ -451,6 +559,7 @@ def _build_backend_payload(
         'openai_protocol': clean_protocol,
         'openai_manual_extra_models': _normalize_openai_models(openai_manual_extra_models),
         'upstream_proxy_url': upstream_proxy_url.strip(),
+        'models_only_validation': bool(models_only_validation),
     }
 
 
@@ -459,7 +568,11 @@ def ensure_token_pool_dir(token_dir: Path = DEFAULT_TOKEN_POOL_DIR) -> Path:
     return token_dir
 
 
-def load_backend_settings(settings_file: Path = DEFAULT_SETTINGS_FILE) -> dict[str, object]:
+def load_backend_settings(
+    settings_file: Path = DEFAULT_SETTINGS_FILE,
+    *,
+    persist_defaults: bool = True,
+) -> dict[str, object]:
     def default_payload() -> dict[str, object]:
         return _build_backend_payload(
             backend_mode=BACKEND_MODE_CODEX_AUTH,
@@ -471,6 +584,7 @@ def load_backend_settings(settings_file: Path = DEFAULT_SETTINGS_FILE) -> dict[s
             openai_model='',
             openai_models=[],
             openai_protocol='',
+            models_only_validation=False,
         )
 
     if settings_file.exists():
@@ -500,6 +614,9 @@ def load_backend_settings(settings_file: Path = DEFAULT_SETTINGS_FILE) -> dict[s
                 openai_protocol=str(raw.get('openai_protocol', '')),
                 openai_manual_extra_models=raw.get('openai_manual_extra_models', []),
                 upstream_proxy_url=str(raw.get('upstream_proxy_url', '')),
+                models_only_validation=bool(
+                    raw.get('models_only_validation', raw.get('skip_validation', False))
+                ),
             )
             raw_presets = raw.get('openai_presets', [])
             if raw.get('openai_config_detached_from_preset') and raw_presets:
@@ -522,8 +639,9 @@ def load_backend_settings(settings_file: Path = DEFAULT_SETTINGS_FILE) -> dict[s
         active_openai_preset_id=DEFAULT_OPENAI_PRESET_ID,
         active_wins=False,
     )
-    settings_file.parent.mkdir(parents=True, exist_ok=True)
-    settings_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    if persist_defaults:
+        settings_file.parent.mkdir(parents=True, exist_ok=True)
+        settings_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     return payload
 
 
@@ -540,10 +658,42 @@ def save_backend_settings(
     openai_protocol: str = '',
     openai_manual_extra_models: object = None,
     upstream_proxy_url: str = '',
+    models_only_validation: bool | None = None,
 ) -> dict[str, object]:
     clean_mode = backend_mode.strip() or BACKEND_MODE_CODEX_AUTH
     if clean_mode not in VALID_BACKEND_MODES:
         raise ValueError(f'Unsupported backend mode: {backend_mode}')
+    existing: dict[str, object] = {}
+    if settings_file.exists():
+        try:
+            loaded = json.loads(settings_file.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            existing = loaded
+    if models_only_validation is None:
+        raw_validation = existing.get(
+            'models_only_validation',
+            existing.get('skip_validation'),
+        )
+        if raw_validation is None:
+            active_id = str(existing.get('active_openai_preset_id', '')).strip()
+            raw_presets = existing.get('openai_presets', [])
+            if active_id and isinstance(raw_presets, list):
+                active_preset = next(
+                    (
+                        item
+                        for item in raw_presets
+                        if isinstance(item, dict)
+                        and str(item.get('id', '')).strip() == active_id
+                    ),
+                    {},
+                )
+                raw_validation = active_preset.get(
+                    'models_only_validation',
+                    active_preset.get('skip_validation', False),
+                )
+        models_only_validation = bool(raw_validation)
     payload = _build_backend_payload(
         backend_mode=clean_mode,
         token_dir=str(token_dir),
@@ -556,15 +706,8 @@ def save_backend_settings(
         openai_protocol=openai_protocol,
         openai_manual_extra_models=[] if openai_manual_extra_models is None else openai_manual_extra_models,
         upstream_proxy_url=upstream_proxy_url,
+        models_only_validation=models_only_validation,
     )
-    existing: dict[str, object] = {}
-    if settings_file.exists():
-        try:
-            loaded = json.loads(settings_file.read_text(encoding='utf-8-sig'))
-        except (OSError, ValueError, json.JSONDecodeError):
-            loaded = {}
-        if isinstance(loaded, dict):
-            existing = loaded
     existing_presets = existing.get('openai_presets', [])
     if isinstance(existing_presets, list) and existing_presets:
         _preserve_openai_presets(
@@ -599,7 +742,8 @@ def save_openai_preset(
     openai_manual_extra_models: object = None,
     proxy_preference: str = '',
     upstream_proxy_url: str = '',
-    skip_validation: bool = False,
+    models_only_validation: bool | None = None,
+    skip_validation: bool | None = None,
     installation_id: str = '',
     claude_env: object = None,
     disable_image_generation: bool = False,
@@ -609,6 +753,19 @@ def save_openai_preset(
     payload = load_backend_settings(settings_file)
     preferred_id = _normalize_openai_preset_id(preset_id, openai_preset_id_from_name(name))
     clean_id = _unique_openai_preset_id(payload, preferred_id) if create_new else preferred_id
+
+    if models_only_validation is None:
+        if skip_validation is not None:
+            # Keep the legacy parameter as an explicit compatibility override.
+            models_only_validation = bool(skip_validation)
+        else:
+            existing_preset = _find_openai_preset(payload, clean_id)
+            models_only_validation = bool(
+                existing_preset.get(
+                    'models_only_validation',
+                    existing_preset.get('skip_validation', False),
+                )
+            )
 
     clean_pref = proxy_preference.strip() if proxy_preference.strip() in ('direct', 'proxy', 'auto') else 'direct'
 
@@ -624,7 +781,7 @@ def save_openai_preset(
             'openai_manual_extra_models': [] if openai_manual_extra_models is None else openai_manual_extra_models,
             'proxy_preference': clean_pref,
             'upstream_proxy_url': upstream_proxy_url,
-            'skip_validation': skip_validation,
+            'models_only_validation': models_only_validation,
             'installation_id': installation_id,
             'claude_env': {} if claude_env is None else claude_env,
             'disable_image_generation': disable_image_generation,
@@ -676,7 +833,8 @@ def save_and_activate_openai_preset(
     openai_manual_extra_models: object = None,
     proxy_preference: str = 'direct',
     upstream_proxy_url: str = '',
-    skip_validation: bool = False,
+    models_only_validation: bool | None = None,
+    skip_validation: bool | None = None,
     installation_id: str = '',
     claude_env: object = None,
     disable_image_generation: bool = False,
@@ -686,6 +844,8 @@ def save_and_activate_openai_preset(
         preset_id,
         openai_preset_id_from_name(name),
     )
+    if models_only_validation is None:
+        models_only_validation = bool(skip_validation) if skip_validation is not None else False
     clean_pref = (
         proxy_preference.strip()
         if proxy_preference.strip() in ('direct', 'proxy', 'auto')
@@ -707,7 +867,7 @@ def save_and_activate_openai_preset(
             ),
             'proxy_preference': clean_pref,
             'upstream_proxy_url': upstream_proxy_url,
-            'skip_validation': skip_validation,
+            'models_only_validation': bool(models_only_validation),
             'installation_id': installation_id,
             'claude_env': {} if claude_env is None else claude_env,
             'disable_image_generation': disable_image_generation,
@@ -1436,6 +1596,61 @@ def resolve_openai_compatible_backend_config(
         'openai_model': selected_model,
         'openai_models': models,
         'openai_protocol': protocol,
+    }
+
+
+def resolve_openai_compatible_models_only_config(
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout_seconds: float = 8.0,
+    upstream_proxy_url: str = '',
+) -> dict[str, object]:
+    """Resolve an OpenAI-compatible endpoint using only its model catalog.
+
+    This deliberately performs no POST request and does not infer a protocol.
+    It is used when a provider permits model discovery but rejects conversation
+    probes during preset configuration.
+    """
+    clean_base_url = base_url.strip() or DEFAULT_OPENAI_BASE_URL
+    clean_api_key = api_key.strip()
+    if not clean_api_key:
+        raise ValueError('API key is required.')
+
+    clean_base_url = normalize_openai_base_url(
+        clean_base_url,
+        clean_api_key,
+        timeout_seconds=min(timeout_seconds, 5.0),
+        upstream_proxy_url=upstream_proxy_url,
+    )
+    fetch_kwargs: dict[str, object] = {'timeout_seconds': timeout_seconds}
+    if upstream_proxy_url.strip():
+        fetch_kwargs['upstream_proxy_url'] = upstream_proxy_url
+    models = fetch_openai_compatible_models(
+        clean_base_url,
+        clean_api_key,
+        **fetch_kwargs,
+    )
+    if not models:
+        raise RuntimeError('No models returned by the configured endpoint.')
+
+    selected_model = model.strip()
+    if selected_model not in models:
+        selected_model = next(
+            (
+                preferred
+                for preferred in ('gpt-6-astra', 'gpt-5.6-sol')
+                if preferred in models
+            ),
+            models[0],
+        )
+    return {
+        'openai_base_url': clean_base_url.rstrip('/') or DEFAULT_OPENAI_BASE_URL,
+        'openai_api_key': clean_api_key,
+        'openai_model': selected_model,
+        'openai_models': models,
+        # The caller must preserve the user's configured protocol.
+        'openai_protocol': '',
     }
 
 

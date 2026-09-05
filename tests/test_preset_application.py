@@ -223,7 +223,7 @@ class PresetApplicationTests(unittest.TestCase):
             self.assertEqual(before, settings_file.read_bytes())
             self.assertEqual([], list(settings_file.parent.glob("*.tmp")))
 
-    def test_skip_validation_preset_applies_edits_without_network_validation(
+    def test_models_only_preset_applies_edits_without_conversation_validation(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -248,7 +248,7 @@ class PresetApplicationTests(unittest.TestCase):
                 openai_models=["skip-model"],
                 openai_protocol=token_pool_settings.OPENAI_PROTOCOL_RESPONSES,
                 proxy_preference="direct",
-                skip_validation=True,
+                models_only_validation=True,
                 set_active=False,
             )
             manager = object.__new__(app.SessionManagerApp)
@@ -258,6 +258,17 @@ class PresetApplicationTests(unittest.TestCase):
                     token_pool_settings,
                     "resolve_openai_compatible_backend_config",
                     side_effect=AssertionError("validation must be skipped"),
+                ),
+                mock.patch.object(
+                    token_pool_settings,
+                    "resolve_openai_compatible_models_only_config",
+                    return_value={
+                        "openai_base_url": "https://edited-skip.example.invalid/v1",
+                        "openai_api_key": "edited-skip-key",
+                        "openai_model": "edited-skip-model",
+                        "openai_models": ["edited-skip-model"],
+                        "openai_protocol": "",
+                    },
                 ),
                 mock.patch.object(app, "_swap_installation_id_for_preset"),
                 mock.patch.object(app, "_patch_claude_settings_for_preset"),
@@ -297,7 +308,7 @@ class PresetApplicationTests(unittest.TestCase):
                 preset["openai_protocol"],
             )
             self.assertEqual("proxy", preset["proxy_preference"])
-            self.assertTrue(preset["skip_validation"])
+            self.assertTrue(preset["models_only_validation"])
             self.assertTrue(preset["disable_image_generation"])
 
 

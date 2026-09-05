@@ -103,7 +103,7 @@ class DesktopWindowLaunchTests(unittest.TestCase):
     def test_terminal_command_binds_runtime_and_uses_same_snapshot(self) -> None:
         manager = make_manager()
         manager._token_pool_settings = mock.Mock(side_effect=AssertionError("settings reloaded"))
-        manager._resolve_terminal_codex_args = mock.Mock(side_effect=lambda args: args)
+        manager._resolve_terminal_codex_args = mock.Mock(side_effect=lambda args, **_kwargs: args)
         settings = self.openai_settings()
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -268,21 +268,22 @@ class DesktopWindowLaunchTests(unittest.TestCase):
     def test_healthy_configured_codex_executable_is_selected(self) -> None:
         manager = make_manager()
         custom = Path("C:\\local\\codex-clickable.exe")
+        local_settings = app.CodexLocalLaunchSettings(
+            executable=custom,
+            file_opener=None,
+            sqlite_home=app.CODEX_HOME,
+            sqlite_isolated=False,
+        )
         with (
             mock.patch.object(
                 app,
-                "configured_codex_executable",
-                return_value=custom,
+                "load_codex_local_launch_settings",
+                return_value=local_settings,
             ),
             mock.patch.object(
                 app,
                 "codex_executable_is_healthy",
                 return_value=True,
-            ),
-            mock.patch.object(
-                app,
-                "configured_codex_file_opener",
-                return_value=None,
             ),
         ):
             resolved = manager._resolve_terminal_codex_args(
@@ -297,21 +298,22 @@ class DesktopWindowLaunchTests(unittest.TestCase):
     def test_healthy_custom_executable_applies_configured_file_opener(self) -> None:
         manager = make_manager()
         custom = Path("C:\\local\\codex-clickable-explorer.exe")
+        local_settings = app.CodexLocalLaunchSettings(
+            executable=custom,
+            file_opener="explorer",
+            sqlite_home=app.CODEX_HOME,
+            sqlite_isolated=False,
+        )
         with (
             mock.patch.object(
                 app,
-                "configured_codex_executable",
-                return_value=custom,
+                "load_codex_local_launch_settings",
+                return_value=local_settings,
             ),
             mock.patch.object(
                 app,
                 "codex_executable_is_healthy",
                 return_value=True,
-            ),
-            mock.patch.object(
-                app,
-                "configured_codex_file_opener",
-                return_value="explorer",
             ),
         ):
             resolved = manager._resolve_terminal_codex_args(
@@ -321,10 +323,10 @@ class DesktopWindowLaunchTests(unittest.TestCase):
         self.assertEqual(
             [
                 str(custom),
-                "-c",
-                'file_opener="explorer"',
                 "resume",
                 "session-id",
+                "-c",
+                'file_opener="explorer"',
             ],
             resolved,
         )
@@ -332,11 +334,17 @@ class DesktopWindowLaunchTests(unittest.TestCase):
     def test_unhealthy_configured_codex_executable_falls_back_to_official(self) -> None:
         manager = make_manager()
         custom = Path("C:\\local\\broken.exe")
+        local_settings = app.CodexLocalLaunchSettings(
+            executable=custom,
+            file_opener=None,
+            sqlite_home=app.CODEX_HOME,
+            sqlite_isolated=False,
+        )
         with (
             mock.patch.object(
                 app,
-                "configured_codex_executable",
-                return_value=custom,
+                "load_codex_local_launch_settings",
+                return_value=local_settings,
             ),
             mock.patch.object(
                 app,
@@ -355,10 +363,11 @@ class DesktopWindowLaunchTests(unittest.TestCase):
 
     def test_runtime_isolated_for_non_auth_backends_only(self) -> None:
         manager = make_manager()
+        runtime = make_runtime(Path("D:\\runtime"))
         with mock.patch.object(
             app.window_runtime,
             "prepare_window_runtime",
-            return_value=mock.sentinel.runtime,
+            return_value=runtime,
         ) as prepare:
             auth_result = manager._prepare_window_runtime(
                 {"backend_mode": token_pool_settings.BACKEND_MODE_CODEX_AUTH},
@@ -369,8 +378,8 @@ class DesktopWindowLaunchTests(unittest.TestCase):
                 session_id="custom-session",
             )
 
-        self.assertIs(mock.sentinel.runtime, auth_result)
-        self.assertIs(mock.sentinel.runtime, custom_result)
+        self.assertIs(runtime, auth_result)
+        self.assertIs(runtime, custom_result)
         self.assertFalse(prepare.call_args_list[0].kwargs["isolate_home"])
         self.assertEqual("", prepare.call_args_list[0].kwargs["installation_id"])
         self.assertTrue(prepare.call_args_list[1].kwargs["isolate_home"])
@@ -385,7 +394,8 @@ class DesktopWindowLaunchTests(unittest.TestCase):
         manager._token_pool_settings = mock.Mock(return_value=source_settings)
         manager._ensure_backend_ready = mock.Mock()
         manager._build_codex_new_args = mock.Mock(return_value=["codex.cmd"])
-        manager._prepare_window_runtime = mock.Mock(return_value=mock.sentinel.runtime)
+        runtime = make_runtime(Path("D:\\runtime"))
+        manager._prepare_window_runtime = mock.Mock(return_value=runtime)
         manager._build_terminal_ps_command = mock.Mock(return_value="terminal-command")
         manager._launch_terminal_with_runtime = mock.Mock()
 
@@ -400,17 +410,24 @@ class DesktopWindowLaunchTests(unittest.TestCase):
         self.assertIs(captured, manager._build_codex_new_args.call_args.args[0])
         self.assertIs(captured, manager._prepare_window_runtime.call_args.args[0])
         self.assertIs(captured, manager._build_terminal_ps_command.call_args.args[2])
-        manager._prepare_window_runtime.assert_called_once_with(captured, session_id="")
+        launch = manager._prepare_window_runtime.call_args.kwargs["codex_launch"]
+        self.assertIs(
+            launch,
+            manager._build_terminal_ps_command.call_args.kwargs["codex_launch"],
+        )
+        manager._prepare_window_runtime.assert_called_once_with(
+            captured,
+            session_id="",
+            codex_launch=launch,
+        )
         manager._build_terminal_ps_command.assert_called_once_with(
             "D:\\workspace",
             ["codex.cmd"],
             captured,
-            mock.sentinel.runtime,
+            runtime,
+            codex_launch=launch,
         )
-        manager._launch_terminal_with_runtime.assert_called_once_with(
-            "terminal-command",
-            mock.sentinel.runtime,
-        )
+        manager._launch_terminal_with_runtime.assert_called_once_with("terminal-command", runtime)
 
     def test_duplicate_resume_is_reported_without_launching_terminal(self) -> None:
         manager = make_manager()

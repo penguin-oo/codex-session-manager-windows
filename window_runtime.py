@@ -471,6 +471,7 @@ def prepare_window_runtime(
     base_home: Path,
     *,
     isolate_home: bool,
+    sqlite_home: Path | None = None,
     session_id: str = "",
     installation_id: str = "",
     launch_id: str | None = None,
@@ -480,6 +481,8 @@ def prepare_window_runtime(
 ) -> WindowRuntime:
     base_home = _absolute_path(base_home)
     base_home.mkdir(parents=True, exist_ok=True)
+    sqlite_home_path = _absolute_path(sqlite_home) if sqlite_home is not None else base_home
+    sqlite_home_path.mkdir(parents=True, exist_ok=True)
     runtime_root = base_home / RUNTIME_ROOT_NAME
     runtime_root.mkdir(parents=True, exist_ok=True)
     if _is_reparse_point(runtime_root):
@@ -512,7 +515,7 @@ def prepare_window_runtime(
         runtime_root=runtime_root,
         runtime_dir=runtime_dir,
         codex_home=runtime_dir / "home" if isolate_home else base_home,
-        sqlite_home=base_home,
+        sqlite_home=sqlite_home_path,
         isolated=bool(isolate_home),
         session_id=clean_session_id,
     )

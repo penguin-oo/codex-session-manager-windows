@@ -184,6 +184,24 @@ class WindowRuntimeTests(unittest.TestCase):
             finally:
                 window_runtime.cleanup_window_runtime(runtime.runtime_dir, runtime.runtime_root)
 
+    def test_runtime_can_use_separate_sqlite_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_home = self.make_base_home(Path(temp_dir))
+            sqlite_home = Path(temp_dir) / "legacy-cli-sqlite"
+
+            runtime = window_runtime.prepare_window_runtime(
+                base_home=base_home,
+                sqlite_home=sqlite_home,
+                isolate_home=False,
+                launch_id="launch-separate-sqlite",
+            )
+            try:
+                self.assertEqual(sqlite_home, runtime.sqlite_home)
+                self.assertTrue(sqlite_home.exists())
+                self.assertEqual(base_home, runtime.codex_home)
+            finally:
+                window_runtime.cleanup_window_runtime(runtime.runtime_dir, runtime.runtime_root)
+
     def test_pending_runtime_blocks_duplicate_writable_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base_home = self.make_base_home(Path(temp_dir))

@@ -76,7 +76,7 @@ PROCESS_EXIT_GRACE_SECONDS = 1.0
 PROCESS_STARTUP_NO_OUTPUT_TIMEOUT_SECONDS = 300.0
 PROCESS_MAX_RUNTIME_SECONDS = 0.0
 INCOMPLETE_REPLY_PLACEHOLDER = "This reply ended without a final answer. Please continue or retry."
-DEFAULT_PRIMARY_MODEL = "gpt-5.6-sol"
+DEFAULT_PRIMARY_MODEL = "gpt-6-astra"
 FALLBACK_MODEL_OPTIONS = (
     DEFAULT_PRIMARY_MODEL,
     "gpt-5.6-luna",
@@ -271,6 +271,31 @@ def path_signature(path: Path) -> tuple[int, int] | None:
     return (stat.st_mtime_ns, stat.st_size)
 
 
+def load_session_settings_file(path: Path) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8-sig", errors="ignore")
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for key, value in obj.items():
+        sid = str(key).strip()
+        if not sid or not isinstance(value, dict):
+            continue
+        entry: dict[str, str] = {}
+        for field_name in ("model", "approval_policy", "sandbox_mode", "reasoning_effort", "cwd"):
+            field_value = str(value.get(field_name, "")).strip()
+            if field_value:
+                entry[field_name] = field_value
+        if entry:
+            out[sid] = entry
+    return out
+
+
 def is_primary_session_jsonl_name(file_name: str) -> bool:
     name = str(file_name)
     if not name.endswith(".jsonl"):
@@ -307,6 +332,7 @@ def apply_session_overrides(items: list["SessionItem"], overrides: dict[str, dic
                 approval_policy=str(override.get("approval_policy", item.approval_policy)),
                 sandbox_mode=str(override.get("sandbox_mode", item.sandbox_mode)),
                 reasoning_effort=str(override.get("reasoning_effort", item.reasoning_effort)),
+                cwd=str(override.get("cwd", item.cwd)),
             )
         )
     return updated
@@ -553,7 +579,7 @@ def resolve_launch_model_for_backend(model: str, backend_settings: dict[str, obj
     if (
         clean_model
         and clean_model != "default"
-        and (clean_model == DEFAULT_PRIMARY_MODEL or not allowed_models or clean_model in allowed_models)
+        and (not allowed_models or clean_model in allowed_models)
     ):
         return clean_model
 
@@ -596,8 +622,10 @@ def build_resume_args(
     backend_settings_file: Path = BACKEND_SETTINGS_FILE,
 ) -> list[str]:
     args = [CODEX_BIN, "exec", "--json", "-o", str(output_file), "--skip-git-repo-check"]
+    args.extend(token_pool_settings.build_codex_context_override_args())
     backend_settings = token_pool_settings.load_backend_settings(backend_settings_file)
     resolved_model = resolve_launch_model_for_backend(model, backend_settings)
+    token_pool_settings.ensure_codex_model_context_metadata([resolved_model])
     ensure_openai_compatible_launch_model_metadata(backend_settings, resolved_model)
     if resolved_model and resolved_model != "default":
         args.extend(["-m", resolved_model])
@@ -628,8 +656,10 @@ def build_new_chat_args(
     backend_settings_file: Path = BACKEND_SETTINGS_FILE,
 ) -> list[str]:
     args = [CODEX_BIN, "exec", "--json", "-o", str(output_file)]
+    args.extend(token_pool_settings.build_codex_context_override_args())
     backend_settings = token_pool_settings.load_backend_settings(backend_settings_file)
     resolved_model = resolve_launch_model_for_backend(model, backend_settings)
+    token_pool_settings.ensure_codex_model_context_metadata([resolved_model])
     ensure_openai_compatible_launch_model_metadata(backend_settings, resolved_model)
     if resolved_model and resolved_model != "default":
         args.extend(["-m", resolved_model])
@@ -2018,6 +2048,95 @@ def _resolved_manual_openai_protocol(protocol_override: str, fallback: str) -> s
     return ""
 
 
+def _models_only_validation_value(
+    preset: dict[str, object] | None,
+    fallback: bool = False,
+) -> bool:
+    values = preset if isinstance(preset, dict) else {}
+    return bool(
+        values.get(
+            "models_only_validation",
+            values.get("skip_validation", fallback),
+        )
+    )
+
+
+def _resolve_openai_compatible_input(
+    *,
+    existing: dict[str, object],
+    existing_preset: dict[str, object],
+    base_url: str,
+    api_key: str,
+    model: str,
+    extras: list[str],
+    protocol_override: str,
+    models_only_validation: bool,
+    upstream_proxy_url: str,
+) -> dict[str, object]:
+    """Validate mobile API form values before any settings file is written."""
+    effective_base_url = (
+        base_url.strip()
+        or str(existing_preset.get("openai_base_url", "")).strip()
+        or str(existing.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip()
+    )
+    effective_api_key = (
+        api_key.strip()
+        or str(existing_preset.get("openai_api_key", "")).strip()
+        or str(existing.get("openai_api_key", "")).strip()
+    )
+    effective_model = (
+        model.strip()
+        or str(existing_preset.get("openai_model", "")).strip()
+        or str(existing.get("openai_model", "")).strip()
+    )
+    effective_upstream_proxy_url = (
+        upstream_proxy_url.strip()
+        or str(existing_preset.get("upstream_proxy_url", "")).strip()
+        or str(existing.get("upstream_proxy_url", "")).strip()
+    )
+    resolver = (
+        token_pool_settings.resolve_openai_compatible_models_only_config
+        if models_only_validation
+        else token_pool_settings.resolve_openai_compatible_backend_config
+    )
+    resolved = resolver(
+        effective_base_url,
+        effective_api_key,
+        effective_model,
+        upstream_proxy_url=effective_upstream_proxy_url,
+    )
+    upstream_models = list(resolved.get("openai_models", []) or [])
+    merged = _merge_openai_models(upstream_models, extras, "")
+    resolved_model = str(resolved.get("openai_model", "")).strip()
+    if effective_model and effective_model in merged:
+        selected_model = effective_model
+    elif resolved_model and resolved_model in merged:
+        selected_model = resolved_model
+    elif merged:
+        selected_model = merged[0]
+    else:
+        raise RuntimeError("No models returned by the configured endpoint.")
+    if selected_model not in merged:
+        merged.insert(0, selected_model)
+    configured_protocol = _resolved_manual_openai_protocol(
+        protocol_override,
+        str(existing_preset.get("openai_protocol", existing.get("openai_protocol", ""))),
+    )
+    final_protocol = configured_protocol or str(resolved.get("openai_protocol", "")).strip()
+    if models_only_validation and not final_protocol:
+        final_protocol = token_pool_settings.OPENAI_PROTOCOL_RESPONSES
+    return {
+        "openai_base_url": str(resolved.get("openai_base_url", effective_base_url)).strip()
+        or effective_base_url,
+        "openai_api_key": str(resolved.get("openai_api_key", effective_api_key)).strip()
+        or effective_api_key,
+        "openai_model": selected_model,
+        "openai_models": merged,
+        "openai_protocol": final_protocol,
+        "upstream_proxy_url": effective_upstream_proxy_url,
+    }
+
+
 def _normalize_process_match_text(value: object) -> str:
     return str(value or "").strip().lower().replace("/", "\\")
 
@@ -2130,28 +2249,7 @@ class CodexDataStore:
             NOTES_FILE.write_text(json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_session_settings(self) -> dict[str, dict[str, str]]:
-        if not SETTINGS_FILE.exists():
-            return {}
-        try:
-            raw = SETTINGS_FILE.read_text(encoding="utf-8-sig", errors="ignore")
-            obj = json.loads(raw)
-        except Exception:
-            return {}
-        if not isinstance(obj, dict):
-            return {}
-        out: dict[str, dict[str, str]] = {}
-        for key, value in obj.items():
-            sid = str(key).strip()
-            if not sid or not isinstance(value, dict):
-                continue
-            entry: dict[str, str] = {}
-            for field_name in ("model", "approval_policy", "sandbox_mode", "reasoning_effort"):
-                field_value = str(value.get(field_name, "")).strip()
-                if field_value:
-                    entry[field_name] = field_value
-            if entry:
-                out[sid] = entry
-        return out
+        return load_session_settings_file(SETTINGS_FILE)
 
     def save_session_settings(self, settings: dict[str, dict[str, str]]) -> None:
         with self.settings_lock:
@@ -2732,6 +2830,9 @@ class CodexDataStore:
             "reasoning_effort": reasoning_effort.strip(),
         }
         cleaned = {key: value for key, value in payload.items() if value and value != "default"}
+        existing_cwd = str(settings.get(session_id, {}).get("cwd", "")).strip()
+        if existing_cwd:
+            cleaned["cwd"] = existing_cwd
         if cleaned:
             settings[session_id] = cleaned
         else:
@@ -4023,6 +4124,10 @@ class PortalService:
             "openai_base_url": str(settings.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)).strip(),
             "openai_model": str(settings.get("openai_model", "")).strip(),
             "openai_protocol": str(settings.get("openai_protocol", "")).strip(),
+            "models_only_validation": _models_only_validation_value(
+                None,
+                bool(settings.get("models_only_validation", settings.get("skip_validation", False))),
+            ),
             "openai_models": [str(item).strip() for item in openai_models if str(item).strip()] if isinstance(openai_models, list) else [],
             "openai_model_count": len(openai_models) if isinstance(openai_models, list) else 0,
             "openai_presets": [
@@ -4036,6 +4141,7 @@ class PortalService:
                     "openai_api_key": str(item.get("openai_api_key", "")).strip(),
                     "proxy_preference": str(item.get("proxy_preference", "direct")).strip() if str(item.get("proxy_preference", "direct")).strip() in {"direct", "proxy"} else "direct",
                     "upstream_proxy_url": str(item.get("upstream_proxy_url", "")).strip(),
+                    "models_only_validation": _models_only_validation_value(item),
                     "has_openai_api_key": bool(str(item.get("openai_api_key", "")).strip()),
                 }
                 for item in openai_presets
@@ -4074,90 +4180,80 @@ class PortalService:
         openai_manual_extra_models: list[str] | None = None,
         proxy_preference: str = "",
         upstream_proxy_url: str = "",
+        models_only_validation: bool | None = None,
     ) -> dict[str, object]:
-        current = token_pool_settings.load_backend_settings(self.backend_settings_file)
+        current = token_pool_settings.load_backend_settings(
+            self.backend_settings_file,
+            persist_defaults=False,
+        )
         previous_backend_mode = str(current.get("backend_mode", token_pool_settings.BACKEND_MODE_CODEX_AUTH))
         token_dir_path = Path(token_dir.strip() or str(current.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR)))
-        preset_base_url = ""
-        preset_key = ""
-        preset_model = ""
-        preset_models: list[str] | None = None
-        preset_protocol = ""
-        preset_upstream_proxy_url = ""
-        preset_skip_validation = False
-        preset_installation_id = ""
-        preset_claude_env: object = {}
-        preset_disable_image_generation = False
         clean_preset_id = preset_id.strip()
-        if clean_preset_id:
-            raw_presets = current.get("openai_presets", [])
-            if isinstance(raw_presets, list):
-                for item in raw_presets:
-                    if not isinstance(item, dict):
-                        continue
-                    if str(item.get("id", "")).strip() == clean_preset_id:
-                        preset_base_url = str(item.get("openai_base_url", "")).strip()
-                        preset_key = str(item.get("openai_api_key", "")).strip()
-                        preset_model = str(item.get("openai_model", "")).strip()
-                        raw_preset_models = item.get("openai_models", [])
-                        if isinstance(raw_preset_models, list):
-                            preset_models = [str(model).strip() for model in raw_preset_models if str(model).strip()]
-                        preset_protocol = str(item.get("openai_protocol", "")).strip()
-                        preset_upstream_proxy_url = str(item.get("upstream_proxy_url", "")).strip()
-                        preset_skip_validation = bool(item.get("skip_validation", False))
-                        preset_installation_id = str(item.get("installation_id", "")).strip()
-                        preset_claude_env = item.get("claude_env", {})
-                        preset_disable_image_generation = bool(item.get("disable_image_generation", False))
-                        break
+        existing_preset = _find_openai_preset(current, clean_preset_id) if clean_preset_id else {}
+        if models_only_validation is None:
+            models_only_validation = _models_only_validation_value(
+                existing_preset,
+                bool(current.get("models_only_validation", current.get("skip_validation", False))),
+            )
         resolved_openai_base_url = (
             openai_base_url.strip()
-            or preset_base_url
+            or str(existing_preset.get("openai_base_url", "")).strip()
             or str(current.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL))
         )
-        resolved_openai_api_key = openai_api_key.strip() or preset_key or str(current.get("openai_api_key", ""))
+        resolved_openai_api_key = (
+            openai_api_key.strip()
+            or str(existing_preset.get("openai_api_key", "")).strip()
+            or str(current.get("openai_api_key", ""))
+        )
         resolved_upstream_proxy_url = (
             upstream_proxy_url.strip()
-            or preset_upstream_proxy_url
+            or str(existing_preset.get("upstream_proxy_url", "")).strip()
             or str(current.get("upstream_proxy_url", "")).strip()
         )
-        resolved_openai_models = openai_models if openai_models is not None else (preset_models if preset_models is not None else current.get("openai_models", []))
-        resolved_openai_model = openai_model.strip() or preset_model or str(current.get("openai_model", ""))
-        resolved_openai_protocol = openai_protocol.strip() or preset_protocol or str(current.get("openai_protocol", ""))
-        resolved_manual_extras = openai_manual_extra_models if openai_manual_extra_models is not None else current.get("openai_manual_extra_models", [])
+        resolved_openai_models = (
+            openai_models
+            if openai_models is not None
+            else existing_preset.get("openai_models", current.get("openai_models", []))
+        )
+        resolved_openai_model = (
+            openai_model.strip()
+            or str(existing_preset.get("openai_model", "")).strip()
+            or str(current.get("openai_model", ""))
+        )
+        resolved_openai_protocol = (
+            openai_protocol.strip()
+            or str(existing_preset.get("openai_protocol", "")).strip()
+            or str(current.get("openai_protocol", ""))
+        )
+        resolved_manual_extras = (
+            openai_manual_extra_models
+            if openai_manual_extra_models is not None
+            else existing_preset.get(
+                "openai_manual_extra_models",
+                current.get("openai_manual_extra_models", []),
+            )
+        )
+        extras = [str(item).strip() for item in resolved_manual_extras or [] if str(item).strip()]
         if (
             backend_mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE
-            and resolved_openai_base_url
-            and resolved_openai_api_key
-            and not preset_skip_validation
         ):
-            if resolved_upstream_proxy_url:
-                resolved = token_pool_settings.resolve_openai_compatible_backend_config(
-                    resolved_openai_base_url,
-                    resolved_openai_api_key,
-                    resolved_openai_model,
-                    upstream_proxy_url=resolved_upstream_proxy_url,
-                )
-            else:
-                resolved = token_pool_settings.resolve_openai_compatible_backend_config(
-                    resolved_openai_base_url,
-                    resolved_openai_api_key,
-                    resolved_openai_model,
-                )
+            resolved = _resolve_openai_compatible_input(
+                existing=current,
+                existing_preset=existing_preset,
+                base_url=resolved_openai_base_url,
+                api_key=resolved_openai_api_key,
+                model=resolved_openai_model,
+                extras=extras,
+                protocol_override=resolved_openai_protocol,
+                models_only_validation=bool(models_only_validation),
+                upstream_proxy_url=resolved_upstream_proxy_url,
+            )
             resolved_openai_base_url = str(resolved.get("openai_base_url", resolved_openai_base_url))
             resolved_openai_api_key = str(resolved.get("openai_api_key", resolved_openai_api_key))
             resolved_openai_model = str(resolved.get("openai_model", resolved_openai_model))
             resolved_openai_models = resolved.get("openai_models", resolved_openai_models)
             resolved_openai_protocol = str(resolved.get("openai_protocol", resolved_openai_protocol))
-        elif backend_mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE and preset_skip_validation:
-            resolved_openai_models = _merge_openai_models(
-                resolved_openai_models,
-                resolved_manual_extras,
-                resolved_openai_model,
-            )
-            resolved_openai_protocol = _resolved_manual_openai_protocol(
-                resolved_openai_protocol,
-                preset_protocol or str(current.get("openai_protocol", "")),
-            )
+            resolved_upstream_proxy_url = str(resolved.get("upstream_proxy_url", resolved_upstream_proxy_url))
         updated = token_pool_settings.save_backend_settings(
             backend_mode=backend_mode,
             settings_file=self.backend_settings_file,
@@ -4171,6 +4267,7 @@ class PortalService:
             openai_protocol=resolved_openai_protocol,
             openai_manual_extra_models=resolved_manual_extras,
             upstream_proxy_url=resolved_upstream_proxy_url,
+            models_only_validation=bool(models_only_validation),
         )
         if backend_mode == token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE and (preset_id.strip() or preset_name.strip()):
             updated = token_pool_settings.save_openai_preset(
@@ -4185,10 +4282,10 @@ class PortalService:
                 openai_manual_extra_models=updated.get("openai_manual_extra_models", []),
                 proxy_preference=proxy_preference,
                 upstream_proxy_url=resolved_upstream_proxy_url,
-                skip_validation=preset_skip_validation,
-                installation_id=preset_installation_id,
-                claude_env=preset_claude_env,
-                disable_image_generation=preset_disable_image_generation,
+                models_only_validation=bool(models_only_validation),
+                installation_id=str(existing_preset.get("installation_id", "")),
+                claude_env=existing_preset.get("claude_env", {}),
+                disable_image_generation=bool(existing_preset.get("disable_image_generation", False)),
                 set_active=True,
                 create_new=create_new_preset,
             )
@@ -4233,102 +4330,78 @@ class PortalService:
         openai_protocol: str | None = None,
         proxy_preference: str | None = None,
         upstream_proxy_url: str | None = None,
+        models_only_validation: bool | None = None,
     ) -> dict[str, object]:
-        existing = token_pool_settings.load_backend_settings(self.backend_settings_file)
+        existing = token_pool_settings.load_backend_settings(
+            self.backend_settings_file,
+            persist_defaults=False,
+        )
         existing_preset = _find_openai_preset(existing, preset_id)
-        if bool(existing_preset.get("skip_validation", False)):
-            selected_model = (
-                openai_model.strip()
-                if openai_model is not None
-                else str(existing_preset.get("openai_model", "")).strip()
-            )
-            token_pool_settings.save_openai_preset(
-                settings_file=self.backend_settings_file,
-                preset_id=preset_id.strip(),
-                name=(
-                    preset_name.strip()
-                    if preset_name is not None and preset_name.strip()
-                    else str(existing_preset.get("name", preset_id)).strip() or preset_id.strip()
-                ),
-                openai_base_url=(
-                    openai_base_url.strip()
-                    if openai_base_url is not None and openai_base_url.strip()
-                    else str(existing_preset.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL))
-                ),
-                openai_api_key=(
-                    openai_api_key.strip()
-                    if openai_api_key is not None and openai_api_key.strip()
-                    else str(existing_preset.get("openai_api_key", ""))
-                ),
-                openai_model=selected_model,
-                openai_models=_merge_openai_models(
-                    existing_preset.get("openai_models", []),
-                    existing_preset.get("openai_manual_extra_models", []),
-                    selected_model,
-                ),
-                openai_protocol=_resolved_manual_openai_protocol(
-                    openai_protocol or "",
-                    str(existing_preset.get("openai_protocol", "")),
-                ),
-                openai_manual_extra_models=existing_preset.get("openai_manual_extra_models", []),
-                proxy_preference=(
-                    proxy_preference.strip()
-                    if proxy_preference is not None and proxy_preference.strip()
-                    else str(existing_preset.get("proxy_preference", "direct"))
-                ),
-                upstream_proxy_url=(
-                    upstream_proxy_url.strip()
-                    if upstream_proxy_url is not None and upstream_proxy_url.strip()
-                    else str(existing_preset.get("upstream_proxy_url", ""))
-                ),
-                skip_validation=True,
-                installation_id=str(existing_preset.get("installation_id", "")),
-                claude_env=existing_preset.get("claude_env", {}),
-                disable_image_generation=bool(existing_preset.get("disable_image_generation", False)),
-                set_active=False,
-            )
-        applied = token_pool_settings.apply_openai_preset(preset_id, settings_file=self.backend_settings_file)
-        applied_preset = next((item for item in applied.get("openai_presets", []) if isinstance(item, dict) and str(item.get("id", "")).strip() == preset_id.strip()), {})
-        if bool(applied_preset.get("skip_validation", False)):
-            resolved = dict(applied)
-        else:
-            resolved = token_pool_settings.resolve_openai_compatible_backend_config(
-                str(applied.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)),
-                str(applied.get("openai_api_key", "")),
-                str(applied.get("openai_model", "")),
-                upstream_proxy_url=str(applied.get("upstream_proxy_url", "")),
-            )
+        if not existing_preset:
+            raise KeyError(f"OpenAI preset not found: {preset_id}")
+        if models_only_validation is None:
+            models_only_validation = _models_only_validation_value(existing_preset)
+        extras = [
+            str(item).strip()
+            for item in existing_preset.get("openai_manual_extra_models", []) or []
+            if str(item).strip()
+        ]
+        resolved = _resolve_openai_compatible_input(
+            existing=existing,
+            existing_preset=existing_preset,
+            base_url=openai_base_url or "",
+            api_key=openai_api_key or "",
+            model=openai_model or "",
+            extras=extras,
+            protocol_override=openai_protocol or "",
+            models_only_validation=bool(models_only_validation),
+            upstream_proxy_url=upstream_proxy_url or "",
+        )
+        selected_model = str(resolved.get("openai_model", ""))
+        selected_protocol = str(resolved.get("openai_protocol", ""))
+        selected_base_url = str(resolved.get("openai_base_url", ""))
+        selected_api_key = str(resolved.get("openai_api_key", ""))
+        selected_upstream_proxy_url = str(resolved.get("upstream_proxy_url", ""))
+        selected_proxy_preference = (
+            proxy_preference.strip()
+            if proxy_preference is not None and proxy_preference.strip()
+            else str(existing_preset.get("proxy_preference", "direct"))
+        )
         updated = token_pool_settings.save_backend_settings(
             backend_mode=token_pool_settings.BACKEND_MODE_OPENAI_COMPATIBLE,
             settings_file=self.backend_settings_file,
-            token_dir=Path(str(applied.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR))),
-            proxy_port=int(applied.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
-            proxy_api_key=str(applied.get("proxy_api_key", "")),
-            openai_base_url=str(resolved.get("openai_base_url", applied.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL))),
-            openai_api_key=str(resolved.get("openai_api_key", applied.get("openai_api_key", ""))),
-            openai_model=str(resolved.get("openai_model", applied.get("openai_model", ""))),
-            openai_models=resolved.get("openai_models", applied.get("openai_models", [])),
-            openai_protocol=str(resolved.get("openai_protocol", applied.get("openai_protocol", ""))),
-            openai_manual_extra_models=applied.get("openai_manual_extra_models", []),
-            upstream_proxy_url=str(applied.get("upstream_proxy_url", "")),
+            token_dir=Path(str(existing.get("token_dir", token_pool_settings.DEFAULT_TOKEN_POOL_DIR))),
+            proxy_port=int(existing.get("proxy_port", token_pool_settings.DEFAULT_PROXY_PORT)),
+            proxy_api_key=str(existing.get("proxy_api_key", "")),
+            openai_base_url=selected_base_url,
+            openai_api_key=selected_api_key,
+            openai_model=selected_model,
+            openai_models=resolved.get("openai_models", []),
+            openai_protocol=selected_protocol,
+            openai_manual_extra_models=extras,
+            upstream_proxy_url=selected_upstream_proxy_url,
+            models_only_validation=bool(models_only_validation),
         )
-        preset = next((item for item in updated.get("openai_presets", []) if isinstance(item, dict) and str(item.get("id", "")).strip() == preset_id.strip()), applied_preset)
-        token_pool_settings.save_openai_preset(
+        updated = token_pool_settings.save_openai_preset(
             settings_file=self.backend_settings_file,
             preset_id=preset_id.strip(),
-            name=str(preset.get("name", preset_id)).strip() or preset_id.strip(),
-            openai_base_url=str(updated.get("openai_base_url", token_pool_settings.DEFAULT_OPENAI_BASE_URL)),
-            openai_api_key=str(updated.get("openai_api_key", "")),
-            openai_model=str(updated.get("openai_model", "")),
-            openai_models=updated.get("openai_models", []),
-            openai_protocol=str(updated.get("openai_protocol", "")),
-            openai_manual_extra_models=updated.get("openai_manual_extra_models", []),
-            proxy_preference=str(preset.get("proxy_preference", applied_preset.get("proxy_preference", "direct"))),
-            upstream_proxy_url=str(preset.get("upstream_proxy_url", applied_preset.get("upstream_proxy_url", ""))),
-            skip_validation=bool(applied_preset.get("skip_validation", False)),
-            installation_id=str(applied_preset.get("installation_id", "")),
-            claude_env=applied_preset.get("claude_env", {}),
-            disable_image_generation=bool(applied_preset.get("disable_image_generation", False)),
+            name=(
+                preset_name.strip()
+                if preset_name is not None and preset_name.strip()
+                else str(existing_preset.get("name", preset_id)).strip() or preset_id.strip()
+            ),
+            openai_base_url=selected_base_url,
+            openai_api_key=selected_api_key,
+            openai_model=selected_model,
+            openai_models=resolved.get("openai_models", []),
+            openai_protocol=selected_protocol,
+            openai_manual_extra_models=extras,
+            proxy_preference=selected_proxy_preference,
+            upstream_proxy_url=selected_upstream_proxy_url,
+            models_only_validation=bool(models_only_validation),
+            installation_id=str(existing_preset.get("installation_id", "")),
+            claude_env=existing_preset.get("claude_env", {}),
+            disable_image_generation=bool(existing_preset.get("disable_image_generation", False)),
             set_active=True,
         )
         stop_token_pool_backend()
@@ -4778,6 +4851,8 @@ INDEX_HTML = """<!doctype html>
     .detail-head p { margin: 8px 0 0; color: var(--muted); line-height: 1.45; font-size: 0.88rem; }
     .strip { padding: 12px 16px; border-top: 1px solid var(--line); }
     .field { display: grid; gap: 6px; }
+    .checkline { display: flex; align-items: center; gap: 8px; color: var(--text); }
+    .checkline input { width: auto; padding: 0; }
     .inline { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .messages { overflow: auto; padding-top: 16px; align-content: start; }
     .bubble {
@@ -4884,8 +4959,10 @@ INDEX_HTML = """<!doctype html>
               <div class="field" style="margin-top:10px;"><label for="backendOpenAiApiKey">OpenAI API key</label><input id="backendOpenAiApiKey" type="text" placeholder="Leave blank to keep saved key"></div>
               <div class="field" style="margin-top:10px;"><label for="backendProxyPreference">API proxy mode</label><select id="backendProxyPreference"><option value="direct">Direct, do not use proxy</option><option value="proxy">Use configured proxy</option></select></div>
               <div class="field" style="margin-top:10px;"><label for="backendUpstreamProxyUrl">Upstream proxy URL</label><input id="backendUpstreamProxyUrl" type="text" placeholder="Optional, e.g. http://127.0.0.1:7898"></div>
+              <div class="field" style="margin-top:10px;"><label class="checkline"><input id="backendModelsOnlyValidation" type="checkbox"> Only fetch models (do not test a conversation)</label></div>
               <div class="toolbar" style="justify-content:flex-end; margin-top:12px;">
                 <button id="refreshBackend">Refresh</button>
+                <button id="fetchBackendModelsOnly">Fetch Models Only</button>
                 <button class="primary" id="saveBackendPreset">Save preset</button>
                 <button id="applyBackendPreset">Apply preset</button>
                 <button class="danger" id="deleteBackendPreset">Delete preset</button>
@@ -5106,7 +5183,7 @@ INDEX_HTML = """<!doctype html>
           <p>${esc(item.cwd || "-")}</p>
           <div class="session-meta">
             <span class="pill">${timeText(item.ts)}</span>
-            <span class="pill">${esc(item.model || "gpt-5.6-sol")}</span>
+            <span class="pill">${esc(item.model || DEFAULT_PRIMARY_MODEL)}</span>
           </div>
           ${item.note ? `<div class="note">${esc(item.note)}</div>` : ""}
         </article>`).join("");
@@ -5143,6 +5220,7 @@ INDEX_HTML = """<!doctype html>
       document.getElementById("backendOpenAiApiKey").value = backend.openai_api_key || "";
       document.getElementById("backendProxyPreference").value = backend.proxy_preference || "direct";
       document.getElementById("backendUpstreamProxyUrl").value = backend.upstream_proxy_url || "";
+      document.getElementById("backendModelsOnlyValidation").checked = Boolean(backend.models_only_validation);
       const presetOptions = presets.length ? presets : [{ id: "", name: "No presets" }];
       document.getElementById("backendPresetSelect").innerHTML = presetOptions.map((preset) => `<option value="${esc(preset.id || "")}">${esc(preset.name || preset.id || "No presets")}</option>`).join("");
       document.getElementById("backendPresetSelect").value = backend.active_openai_preset_id || "";
@@ -5157,15 +5235,27 @@ INDEX_HTML = """<!doctype html>
       document.getElementById("backendOpenAiApiKey").value = preset ? (preset.openai_api_key || "") : "";
       if (preset && preset.proxy_preference) document.getElementById("backendProxyPreference").value = preset.proxy_preference;
       document.getElementById("backendUpstreamProxyUrl").value = preset ? (preset.upstream_proxy_url || "") : "";
+      document.getElementById("backendModelsOnlyValidation").checked = Boolean(preset && preset.models_only_validation);
     }
 
     async function refreshBackendPanel() {
-      state.bootstrap.backend = await api("/api/backend");
-      renderBackendPanel();
+      return refreshBackendModels();
     }
 
-    async function saveBackendPreset() {
-      const body = {
+    async function refreshBackendModels() {
+      const modelsOnly = document.getElementById("backendModelsOnlyValidation").checked;
+      state.bootstrap.backend = await api("/api/backend", {
+        method: "POST",
+        body: JSON.stringify(backendFormBody({ models_only_validation: modelsOnly }))
+      });
+      renderBackendPanel();
+      setStatus(modelsOnly
+        ? "Models loaded without testing a conversation."
+        : "Models refreshed and connection validated.");
+    }
+
+    function backendFormBody(overrides = {}) {
+      return {
         backend_mode: document.getElementById("backendModeSelect").value,
         token_dir: document.getElementById("backendTokenDir").value,
         proxy_port: Number(document.getElementById("backendProxyPort").value || 8317),
@@ -5176,7 +5266,18 @@ INDEX_HTML = """<!doctype html>
         preset_name: document.getElementById("backendPresetName").value,
         proxy_preference: document.getElementById("backendProxyPreference").value,
         upstream_proxy_url: document.getElementById("backendUpstreamProxyUrl").value,
+        models_only_validation: document.getElementById("backendModelsOnlyValidation").checked,
+        ...overrides,
       };
+    }
+
+    async function fetchBackendModelsOnly() {
+      document.getElementById("backendModelsOnlyValidation").checked = true;
+      return refreshBackendModels();
+    }
+
+    async function saveBackendPreset() {
+      const body = backendFormBody();
       state.bootstrap.backend = await api("/api/backend", { method: "POST", body: JSON.stringify(body) });
       renderBackendPanel();
       setStatus("Backend preset saved.");
@@ -5185,15 +5286,10 @@ INDEX_HTML = """<!doctype html>
     async function applyBackendPreset() {
       const presetId = document.getElementById("backendPresetSelect").value;
       if (!presetId) return setStatus("Select a backend preset first.");
-      state.bootstrap.backend = await api("/api/backend", { method: "POST", body: JSON.stringify({
+      state.bootstrap.backend = await api("/api/backend", { method: "POST", body: JSON.stringify(backendFormBody({
         preset_action: "apply",
         preset_id: presetId,
-        openai_base_url: document.getElementById("backendOpenAiBaseUrl").value,
-        openai_api_key: document.getElementById("backendOpenAiApiKey").value,
-        preset_name: document.getElementById("backendPresetName").value,
-        proxy_preference: document.getElementById("backendProxyPreference").value,
-        upstream_proxy_url: document.getElementById("backendUpstreamProxyUrl").value,
-      }) });
+      })) });
       renderBackendPanel();
       await refreshBootstrap();
       setStatus(`Backend preset applied: ${presetId}`);
@@ -5251,7 +5347,7 @@ INDEX_HTML = """<!doctype html>
         clearSession();
         return payload;
       }
-      document.getElementById("detailHead").innerHTML = `<h2>${esc(item.text || item.session_id)}</h2><p>${esc(item.cwd || "-")}<br>${esc(item.session_id)}<br>Model: ${esc(item.model || "gpt-5.6-sol")} | Approval: ${esc(item.approval_policy || "-")} | Sandbox: ${esc(item.sandbox_mode || "-")} | Reasoning: ${esc(item.reasoning_effort || "max")}</p>`;
+      document.getElementById("detailHead").innerHTML = `<h2>${esc(item.text || item.session_id)}</h2><p>${esc(item.cwd || "-")}<br>${esc(item.session_id)}<br>Model: ${esc(item.model || DEFAULT_PRIMARY_MODEL)} | Approval: ${esc(item.approval_policy || "-")} | Sandbox: ${esc(item.sandbox_mode || "-")} | Reasoning: ${esc(item.reasoning_effort || "max")}</p>`;
       document.getElementById("noteInput").value = item.note || "";
       document.getElementById("noteBox").hidden = false;
       document.getElementById("composerSettings").hidden = false;
@@ -5435,7 +5531,8 @@ INDEX_HTML = """<!doctype html>
       document.getElementById("backendPresetSelect").addEventListener("change", () => {
         fillBackendPresetFields(selectedBackendPreset());
       });
-      document.getElementById("refreshBackend").addEventListener("click", () => refreshBackendPanel().catch((e) => setStatus(e.message)));
+      document.getElementById("refreshBackend").addEventListener("click", () => refreshBackendModels().catch((e) => setStatus(e.message)));
+      document.getElementById("fetchBackendModelsOnly").addEventListener("click", () => fetchBackendModelsOnly().catch((e) => setStatus(e.message)));
       document.getElementById("saveBackendPreset").addEventListener("click", () => saveBackendPreset().catch((e) => setStatus(e.message)));
       document.getElementById("applyBackendPreset").addEventListener("click", () => applyBackendPreset().catch((e) => setStatus(e.message)));
       document.getElementById("deleteBackendPreset").addEventListener("click", () => deleteBackendPreset().catch((e) => setStatus(e.message)));
@@ -5791,6 +5888,11 @@ class PortalHandler(BaseHTTPRequestHandler):
                         openai_protocol=str(payload.get("openai_protocol", "")),
                         proxy_preference=str(payload.get("proxy_preference", "")),
                         upstream_proxy_url=str(payload.get("upstream_proxy_url", "")),
+                        models_only_validation=(
+                            bool(payload.get("models_only_validation"))
+                            if "models_only_validation" in payload
+                            else None
+                        ),
                     )
                 elif action == "delete":
                     result = self.portal.delete_openai_backend_preset(str(payload.get("preset_id", "")))
@@ -5810,6 +5912,11 @@ class PortalHandler(BaseHTTPRequestHandler):
                         openai_manual_extra_models=payload.get("openai_manual_extra_models") if isinstance(payload.get("openai_manual_extra_models"), list) else None,
                         proxy_preference=str(payload.get("proxy_preference", "")),
                         upstream_proxy_url=str(payload.get("upstream_proxy_url", "")),
+                        models_only_validation=(
+                            bool(payload.get("models_only_validation"))
+                            if "models_only_validation" in payload
+                            else None
+                        ),
                     )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
